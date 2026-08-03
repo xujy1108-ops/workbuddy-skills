@@ -78,7 +78,7 @@ def run_video_analysis(
         }
 
     out_tokens = usage.get("output_tokens", 0)
-    if finish_reason == "length" or out_tokens >= max_tok - 20:
+    if finish_reason == "length":
         raise RuntimeError(
             f"模型输出被截断（finish_reason={finish_reason}, output_tokens={out_tokens}, "
             f"max_tokens={max_tok}）。请调大 MAX_TOKENS 后重试。"
@@ -128,7 +128,7 @@ def run_text_analysis(
         }
 
     out_tokens = usage.get("output_tokens", 0)
-    if finish_reason == "length" or out_tokens >= max_tok - 20:
+    if finish_reason == "length":
         raise RuntimeError(
             f"模型输出被截断（finish_reason={finish_reason}, output_tokens={out_tokens}, "
             f"max_tokens={max_tok}）。请调大 MAX_TOKENS 后重试。"

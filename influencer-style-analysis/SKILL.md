@@ -1,6 +1,6 @@
 ---
 name: influencer-style-analysis
-description: "达人风格识别技能。通过抖音主页链接或 sec_user_id，经 TikHub API 拉取达人数据（简介、视频列表），筛选视频并使用 Doubao 多模态大模型直接看视频分析口吻语气，输出人设定位、内容风格标签和风格摘要的 JSON。当用户提到达人分析、达人风格、风格识别、创作者风格、达人画像、influencer profiler 等关键词时触发此技能。"
+description: "达人风格识别技能。通过抖音主页链接或 sec_user_id，经 TikHub API 拉取达人数据（简介、视频列表），筛选视频并使用 Doubao 多模态大模型直接看视频分析达人风格，输出包含人设定位、受众洞察、多模态风格、流量逻辑、商业逻辑、脚本生成指南的结构化 JSON。当用户提到达人分析、达人风格、风格识别、创作者风格、达人画像、influencer profiler 等关键词时触发此技能。"
 agent_created: true
 ---
 
@@ -8,7 +8,7 @@ agent_created: true
 
 ## Overview
 
-通过抖音达人主页链接，经 TikHub API 拉取达人数据（简介、视频列表），筛选出可分析的视频，使用 Doubao 多模态大模型（doubao-seed-2-1-pro）直接看视频分析达人风格，输出包含人设定位和内容风格标签的结构化 JSON。
+通过抖音达人主页链接，经 TikHub API 拉取达人数据（简介、视频列表），筛选出可分析的视频，使用 Doubao 多模态大模型（doubao-seed-2-1-pro）直接看视频分析达人风格，输出包含人设定位、受众洞察、多模态风格、流量逻辑、商业逻辑和脚本生成指南的结构化 JSON。
 
 ## 架构概览
 
@@ -30,15 +30,22 @@ TikHub API 拉取达人作品列表
     │
     ▼
 Doubao 多模态 LLM 分析（逐个视频，方案A）
-    ├── 看视频：口吻、语气、语速、停顿、情绪、画面风格
+    ├── 看视频：口吻、语气、语速节奏、情绪、画面风格、视觉元素
     └── 读文本：bio → 人设定位
     │
     ▼
-JSON 输出
-    ├── persona_positioning（人设定位）
-    ├── content_style（内容风格 + 8 类标签）
-    ├── influencer_profile_text（≤200 字摘要）
-    └── analysis_mode（multimodal_video）
+LLM 二次合并（多视频时）
+    └── 综合多次分析结果 → 归纳最终风格画像
+    │
+    ▼
+JSON 输出（7 大维度）
+    ├── basic_positioning（基础定位）
+    ├── audience_insight（受众洞察）
+    ├── multimodal_style（多模态风格）
+    ├── traffic_logic（流量逻辑）
+    ├── commercial_logic（商业逻辑）
+    ├── taboos_and_risks（禁忌与风险）
+    └── ai_scripting_guide（脚本生成指南）
 ```
 
 ## 触发条件
@@ -92,11 +99,16 @@ JSON 输出
 
 - **模型**：doubao-seed-2-1-pro（通过 inferera OpenAI 兼容接口）
 - **API 地址**：`https://api.inferera.com/v1/chat/completions`
-- **输入**：系统 prompt（风格分析指令）+ 用户文本（bio）+ video_url
+- **输入**：系统 prompt（风格分析指令）+ 用户文本（bio + nickname）+ video_url
 - **参数**：max_tokens=8192, temperature=0.3, timeout=300s
-- **分析内容**：
-  - 看视频：口吻、语气、语速、停顿、情绪、画面风格、剪辑节奏
-  - 读文本：人设定位、选题方向、受众
+- **分析维度**（7 大模块）：
+  - **基础定位**：人设一句话、核心赛道
+  - **受众洞察**：人口统计特征、心理诉求
+  - **多模态风格**：语速动态描述、语气情绪、视觉符号、开放式风格标签
+  - **流量逻辑**：开头抓眼球 + 结尾留白策略
+  - **商业逻辑**：信任构建、适配品类、植入风格
+  - **禁忌与风险**：内容红线
+  - **脚本生成指南**：供下游 LLM 生成脚本的结构化指令
 
 **逐个视频调用（方案A）**：遍历选出的视频 URL，逐个调用大模型分析。全部成功后通过 LLM 二次合并为最终结果。单个失败则跳过继续，全部失败则报错中止。
 
@@ -166,20 +178,15 @@ result = run_influencer_profiler("https://www.douyin.com/user/MS4w...")
 print(result.text)  # JSON 字符串
 ```
 
-## 8 类内容风格标签
+## 分析设计原则
 
-LLM 从以下 8 个标签中最多选 3 个（按匹配度排序）：
+1. **拒绝僵化标签**：禁止使用空泛枚举标签，必须用动态语言描述语速节奏、情绪基调和视觉符号
+2. **解耦流量与商业**：严格区分"流量互动逻辑"与"商业变现逻辑"，禁止混淆
+3. **克制推断边界**：基于视频样本分析，不过度推断具体转化率或强行适配不相关品类
+4. **多模态视角**：必须提取画面中的标志性视觉元素（穿搭、道具、机位、特效）
+5. **开放式标签**：style_tags 根据达人实际特征动态提取，不限于固定枚举
 
-| 标签 | 说明 |
-|------|------|
-| 亲切唠嗑 | 像朋友聊天，自然随性 |
-| 激情造势 | 语速快、情绪足 |
-| 专业沉稳 | 用词严谨，干货/测评专用 |
-| 幽默吐槽 | 诙谐玩梗，轻松有笑点 |
-| 温柔舒缓 | 语调柔和 |
-| 利落酷飒 | 短句干脆，气场强 |
-| 朴实接地气 | 大白话，真诚不花哨 |
-| 悬念吊胃口 | 停顿造势，勾起好奇 |
+分析维度详见 `references/style-dimensions.md`。
 
 ## 扩展指南
 
@@ -189,15 +196,11 @@ LLM 从以下 8 个标签中最多选 3 个（按匹配度排序）：
 2. 在 `scripts/agents/influencer_profiler.py` 的 `_merge_with_tikhub()` 中增加平台分支
 3. 输入 JSON 增加 `platform` 字段标识来源
 
-### 调整风格标签
-
-修改 `scripts/agents/influencer_profiler.py` 中的 `_STYLE_LABELS` 变量。标签定义详见 `references/style-dimensions.md`。
-
 ## 注意事项
 
 - TikHub API 有调用频率限制，注意控速
 - 视频筛选按 `data_size` 升序排列，优先分析小文件以减少处理时间
 - 视频链接优先选 `api.amemv.com` 域名，该域名通常稳定可访问
 - 所有视频分析均失败时直接报错中止，不做文本兜底
-- `influencer_profile_text` 字段硬限制 200 字，超长自动截断
+- 各字符串和数组字段有硬限制，超长自动截断（详见 `references/json-schema.md`）
 - 需要配置的 API Key：`TIKHUB_API_TOKEN`、`DOUBAO_API_KEY`
