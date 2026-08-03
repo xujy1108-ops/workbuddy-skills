@@ -587,8 +587,12 @@ function writeToBitable(results) {
     });
 
     const resp = JSON.parse(output);
-    const created = resp?.data?.records || resp?.data?.items || [];
-    const count = Array.isArray(created) ? created.length : (resp?.data?.record_count || results.length);
+    const recordIds = resp?.data?.record_id_list || [];
+    const count = recordIds.length;
+    if (count === 0) {
+      log(`   ⚠️ 写入返回 0 条，原始响应: ${output.substring(0, 500)}`);
+      log(`   ⚠️ Payload 大小: ${payloadJson.length} 字节`);
+    }
     log(`   ✅ 成功写入 ${count} 条记录`);
     return { success: count, failed: 0, errors: [] };
   } catch (error) {
