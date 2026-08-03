@@ -569,7 +569,6 @@ function writeToBitable(results) {
       '--table-id', BITABLE_TABLE_ID,
       '--json', `@./${fileName}`,
       '--as', 'user',
-      '--yes',
       '--format', 'json'
     ], {
       encoding: 'utf-8',
@@ -584,9 +583,10 @@ function writeToBitable(results) {
     });
 
     const resp = JSON.parse(output);
-    const created = resp?.data?.records || resp?.data || [];
-    log(`   ✅ 成功写入 ${created.length} 条记录`);
-    return { success: created.length, failed: 0, errors: [] };
+    const created = resp?.data?.records || resp?.records || resp?.data?.items || [];
+    const count = Array.isArray(created) ? created.length : (resp?.data?.record_count || results.length);
+    log(`   ✅ 成功写入 ${count} 条记录`);
+    return { success: count, failed: 0, errors: [] };
   } catch (error) {
     log(`   ❌ 写入飞书多维表格失败: ${error.message.substring(0, 300)}`);
     // 写入失败时把 payload 文件路径告诉用户，方便手动重试
@@ -603,10 +603,10 @@ function sendFeishuNotification(summary, quotaExhausted) {
   log('🔹 发送飞书结果通知...');
 
   try {
-    // 获取当前用户 open_id
-    const meOutput = runLarkCli(['contact', '+me', '--format', 'json']);
-    const meData = JSON.parse(meOutput);
-    const myOpenId = meData?.data?.user?.open_id || meData?.data?.open_id || '';
+    // 从 auth status 获取当前用户 open_id
+    const authOutput = runLarkCli(['auth', 'status']);
+    const authData = JSON.parse(authOutput);
+    const myOpenId = authData?.identities?.user?.openId || '';
 
     if (!myOpenId) {
       log('   ⚠️ 无法获取当前用户 open_id，跳过飞书通知');
@@ -644,9 +644,8 @@ function sendFeishuNotification(summary, quotaExhausted) {
     const msgText = lines.join('\n');
     const content = JSON.stringify({ text: msgText });
     runLarkCli([
-      'im', '+send',
-      '--receive-id-type', 'open_id',
-      '--receive-id', myOpenId,
+      'im', '+messages-send',
+      '--user-id', myOpenId,
       '--msg-type', 'text',
       '--content', content,
       '--as', 'user',

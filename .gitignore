@@ -12,3 +12,6 @@ package-lock.json
 *.log
 *.tmp
 *.bak
+
+# 环境变量（含密钥）
+.env
