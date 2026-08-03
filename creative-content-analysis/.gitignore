@@ -1,0 +1,17 @@
+# 环境变量
+.env
+
+# 打包文件
+*.zip
+
+# 临时文件
+script_*.txt
+video_temp.mp4
+bitable_payload_*.json
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
