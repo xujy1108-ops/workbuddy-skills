@@ -565,44 +565,35 @@ function writeToBitable(results) {
   });
 
   const payload = { create_records: createRecords };
-  const tmpFile = path.join(os.tmpdir(), `bitable_payload_${Date.now()}.json`);
-  fs.writeFileSync(tmpFile, JSON.stringify(payload), 'utf-8');
+  const payloadJson = JSON.stringify(payload);
 
   try {
-    // lark-cli 的 --json @file 需要相对路径，切换到 tmpdir 执行
-    const fileName = path.basename(tmpFile);
     const output = execFileSync(LARK_CLI, [
       'base', '+record-batch-create',
       '--base-token', BITABLE_BASE_TOKEN,
       '--table-id', BITABLE_TABLE_ID,
-      '--json', `@./${fileName}`,
+      '--json', payloadJson,
       '--as', 'user',
       '--format', 'json'
     ], {
       encoding: 'utf-8',
       timeout: 60000,
-      cwd: os.tmpdir(),
       env: {
         ...process.env,
         LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1',
         LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1'
       },
-      maxBuffer: 10 * 1024 * 1024
+      maxBuffer: 50 * 1024 * 1024
     });
 
     const resp = JSON.parse(output);
-    const created = resp?.data?.records || resp?.records || resp?.data?.items || [];
+    const created = resp?.data?.records || resp?.data?.items || [];
     const count = Array.isArray(created) ? created.length : (resp?.data?.record_count || results.length);
     log(`   ✅ 成功写入 ${count} 条记录`);
     return { success: count, failed: 0, errors: [] };
   } catch (error) {
-    log(`   ❌ 写入飞书多维表格失败: ${error.message.substring(0, 300)}`);
-    // 写入失败时把 payload 文件路径告诉用户，方便手动重试
-    log(`   📄 Payload 文件: ${tmpFile}`);
+    log(`   ❌ 写入飞书多维表格失败: ${error.message.substring(0, 500)}`);
     return { success: 0, failed: results.length, errors: [error.message] };
-  } finally {
-    // 清理临时文件
-    try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
   }
 }
 
