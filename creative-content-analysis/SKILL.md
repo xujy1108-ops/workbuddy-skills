@@ -44,9 +44,9 @@ node scripts/run_workflow.js
 1. **自动查重** — 用 lark-cli 从飞书多维表格拉取已有素材 ID
 2. **生成关键词** — DeepSeek 生成 2 个抖音搜索关键词
 3. **搜索抖音** — TikHub API 搜索视频
-4. **过滤去重** — 过滤时长 > 5 分钟、去除已有素材
+4. **过滤去重** — 过滤时长 > 5 分钟、点赞 < 2000、去除已有素材
 5. **提取脚本** — 豆包模型转录视频台词（Promise.all 并行，并发 3）
-6. **过滤禁止内容** — 跳过催收、医疗、上学等敏感场景
+6. **过滤无效内容** — 跳过全程未开口说话的视频、跳过催收/医疗/上学等敏感场景
 7. **分析创意** — DeepSeek 输出内容方向、素材逻辑、借鉴点、植入建议
 8. **自动写入飞书** — lark-cli 将结果写入多维表格（含更新时间字段）
 9. **余额不足通知** — 如果 API 余额耗尽，自动给飞书发消息
@@ -93,7 +93,7 @@ JSON 输出到 stdout，进度日志输出到 stderr。
     }
   ],
   "skipped": [
-    { "aweme_id": "...", "reason": "duration_exceeded|duplicate|forbidden_content|quota_exhausted|..." }
+    { "aweme_id": "...", "reason": "duration_exceeded|low_digg_count|duplicate|no_speech|forbidden_content|quota_exhausted|..." }
   ],
   "failed": [
     { "aweme_id": "...", "error": "错误信息" }
@@ -144,7 +144,7 @@ Step 4 的视频脚本提取 + 创意分析使用 `Promise.all` 并行执行（�
 - 搜索关键词
 - 搜索到的视频总数
 - **成功**：N 条（已写入表格）— 列出标题 + 链接
-- **被放弃**：M 条 — 列出原因（时长超限 / 重复 / 禁止内容 / 余额不足未开始）
+- **被放弃**：M 条 — 列出原因（时长超限 / 点赞不足 / 重复 / 全程未开口 / 禁止内容 / 余额不足未开始）
 - **执行失败**：K 条 — 列出错误信息
 - 飞书写入结果
 - 如果 `quota_exhausted: true`，标注"⚠️ API 余额不足，工作流提前终止"

@@ -40,6 +40,7 @@ const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro';
 const DOUBAO_MODEL = process.env.DOUBAO_MODEL || 'doubao-seed-2-1-pro';
 
 const MAX_DURATION_MS = 300000; // 5 分钟
+const MIN_DIGG_COUNT = 2000; // 最低点赞数
 const FORBIDDEN_KEYWORDS = ['催收', '医疗', '看病', '住院', '手术', '上学', '学费', '开学'];
 
 // 飞书多维表格配置
@@ -181,7 +182,7 @@ async function searchDouyin(keyword) {
     body: JSON.stringify({
       keyword,
       cursor: 0,
-      sort_type: '0',
+      sort_type: '1',
       publish_time: '0',
       filter_duration: '0',
       content_type: '0',
@@ -322,6 +323,30 @@ function getDownloadUrl(aweme) {
 // 检查脚本是否包含禁止内容
 function containsForbiddenContent(script) {
   return FORBIDDEN_KEYWORDS.some(keyword => script.includes(keyword));
+}
+
+// 检查是否全程未开口说话（无台词/无对话）
+function isNoSpeechScript(script) {
+  const trimmed = script.trim();
+  if (!trimmed || trimmed.length < 5) return true;
+
+  // 常见的"无台词"描述
+  const noSpeechKeywords = [
+    '无台词', '没有说话', '无对话', '无旁白', '全程没有', '未说话',
+    '没有开口', '没有台词', '没有任何对话', '没有对白', '无对白',
+    '纯音乐', '只有音乐', '没有声音', '静音', '无声音',
+    '视频中没有任何', '视频没有说话', '该视频没有'
+  ];
+  if (noSpeechKeywords.some(kw => trimmed.includes(kw))) return true;
+
+  // 如果内容全是括号内的动作描述，没有【人物】格式的台词
+  const dialogueLines = trimmed.split('\n').filter(line => {
+    const t = line.trim();
+    return t && !t.startsWith('（') && !t.startsWith('(') && t.includes('】');
+  });
+  if (dialogueLines.length === 0) return true;
+
+  return false;
 }
 
 // 检测 API 余额不足错误
@@ -634,6 +659,13 @@ async function main() {
       continue;
     }
 
+    // 点赞数过滤
+    const diggCount = aweme.statistics?.digg_count || 0;
+    if (diggCount < MIN_DIGG_COUNT) {
+      skipped.push({ aweme_id: awemeId, reason: 'low_digg_count', digg_count: diggCount });
+      continue;
+    }
+
     // 获取下载 URL
     const downloadUrl = getDownloadUrl(aweme);
     if (!downloadUrl) {
@@ -676,6 +708,12 @@ async function main() {
         // 提取脚本
         const script = await extractVideoScript(candidate.download_url);
         log(`   [${candidate.aweme_id}] 脚本长度: ${script.length} 字`);
+
+        // 检查全程未开口说话
+        if (isNoSpeechScript(script)) {
+          log(`   [${candidate.aweme_id}] ⏭️  跳过: 全程未开口说话`);
+          return { status: 'skipped', aweme_id: candidate.aweme_id, desc: candidate.desc, reason: 'no_speech' };
+        }
 
         // 检查禁止内容
         if (containsForbiddenContent(script)) {
