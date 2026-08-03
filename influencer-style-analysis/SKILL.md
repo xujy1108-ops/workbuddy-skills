@@ -1,142 +1,219 @@
 ---
 name: influencer-style-analysis
-description: "达人风格分析与采集技能。通过关键词搜索平台达人，采集其内容素材，从视觉/视频风格、内容/文案风格、运营/行为风格三个维度进行全维度分析，输出结构化 JSON 报告。当前支持抖音渠道，后续将扩展小红书、视频号等平台。当用户提到达人分析、达人风格、风格采集、创作者风格分析、达人画像、素材风格分析等关键词时触发此技能。"
+description: "达人风格识别技能。通过抖音主页链接或 sec_user_id，经 TikHub API 拉取达人数据（简介、视频列表、音频），使用多模态 LLM 听音频分析口吻语气，输出人设定位、内容风格标签和风格摘要的 JSON。当用户提到达人分析、达人风格、风格识别、创作者风格、达人画像、influencer profiler 等关键词时触发此技能。"
 agent_created: true
 ---
 
-# Influencer Style Analysis（达人风格获取）
+# Influencer Style Analysis（达人风格识别）
 
 ## Overview
 
-通过关键词搜索平台达人，采集其内容素材并进行全维度风格分析，最终输出结构化 JSON 报告。分析覆盖三大维度：视觉/视频风格、内容/文案风格、运营/行为风格。
+通过抖音达人主页链接，经 TikHub API 拉取达人数据（简介、最近视频标题、最新视频音频），使用多模态 LLM（Gemini 2.5 Flash）直接听 mp3 音频分析达人风格，输出包含人设定位和内容风格标签的结构化 JSON。
 
-当前支持抖音渠道，后续将扩展小红书、视频号等平台。
+## 架构概览
 
-## 支持平台
-
-| 平台 | 状态 | 标识 |
-|------|------|------|
-| 抖音 | ✅ 已支持 | `douyin` |
-| 小红书 | 🚧 规划中 | `xiaohongshu` |
-| 视频号 | 🚧 规划中 | `channels` |
+```
+用户输入（抖音主页链接）
+    │
+    ▼
+TikHub API 拉取达人数据
+    ├── bio（达人简介）
+    ├── recent_videos（最近 10 条视频标题）
+    └── latest_audio_url（最新视频音频链接）
+    │
+    ▼
+音频处理
+    ├── download_audio（下载 mp3）
+    └── prepare_audio_for_profiler（截取前 60 秒）
+    │
+    ▼
+多模态 LLM 分析
+    ├── 听音频：口吻、语气、语速、停顿、情绪
+    └── 读文本：bio + 视频标题 → 人设定位
+    │
+    ▼
+JSON 输出
+    ├── persona_positioning（人设定位）
+    ├── content_style（内容风格 + 8 类标签）
+    ├── influencer_profile_text（≤200 字摘要）
+    └── analysis_mode（multimodal_audio|text_fallback|text_only）
+```
 
 ## 触发条件
 
 当用户出现以下意图时触发：
-- "分析达人风格"、"达人风格采集"
-- "搜索达人并分析"、"创作者风格分析"
-- "达人画像"、"素材风格分析"
-- "找达人"、"搜达人风格"
+- "分析达人风格"、"达人风格识别"
+- "创作者风格分析"、"达人画像"
+- "influencer profiler"、"达人风格"
+- 提供抖音主页链接要求分析
 
 ## 工作流程
 
-### Step 1: 接收关键词并搜索达人
+### Step 1: 接收输入
 
-1. 从用户输入中提取搜索关键词
-2. 确认目标平台（默认抖音，用户可指定其他平台）
-3. 调用 `scripts/` 中的采集脚本搜索匹配达人
-4. 返回达人列表供用户确认或自动选择
+输入形式（三选一）：
 
-**示例：**
-- 用户输入："分析抖音上关于'美妆'的达人风格"
-- 提取关键词：`美妆`，平台：`douyin`
+1. **抖音主页链接**（最常用）：
+   ```
+   {"douyin_profile_url": "https://www.douyin.com/user/MS4wLjABAAAA..."}
+   ```
+   或直接传入链接字符串。
 
-### Step 2: 采集达人内容素材
+2. **sec_user_id**：
+   ```
+   {"sec_user_id": "MS4wLjABAAAA..."}
+   ```
 
-1. 根据达人 ID，调用采集脚本获取达人近期内容素材
-2. 采集内容包括：视频/图文列表、互动数据（点赞/评论/转发）、文案内容、发布时间等
-3. 默认采集最近 20-30 条内容，确保分析样本充足
+3. **手动提供数据**（跳过 TikHub）：
+   ```
+   {
+     "bio": "达人简介",
+     "recent_videos": [{"title": "视频标题", "description": "描述"}],
+     "latest_audio_url": "https://...",
+     "audio_transcript": "音频转写文本（兜底）"
+   }
+   ```
 
-**采集数据字段：**
-- 内容 ID、标题、链接
-- 发布时间
-- 互动数据：点赞数、评论数、转发数、收藏数
-- 文案内容
-- 视频/图片 URL（用于视觉分析）
+### Step 2: TikHub 拉取达人数据
 
-### Step 3: 多维度风格分析
+调用 `scripts/tools/tikhub.py` 的 `fetch_influencer_from_douyin()`：
+- 从主页链接解析 sec_user_id
+- 调用 TikHub API 拉取达人最近 10 条视频
+- 提取：bio（简介）、recent_videos（视频标题列表）、latest_audio_url（最新视频音频链接）、author_nickname
 
-对采集到的素材进行三大维度分析。详细分析框架参见 `references/style-dimensions.md`。
+**前置条件**：需配置 `TIKHUB_API_TOKEN` 环境变量。
 
-#### 维度一：视觉/视频风格
+### Step 3: 音频处理
 
-分析达人的视觉呈现特征：
-- **拍摄手法**：运镜方式（推拉摇移）、景别使用、机位角度
-- **剪辑风格**：转场频率、节奏快慢、特效使用
-- **视觉调性**：色彩偏好、滤镜风格、画面明暗
-- **画面节奏**：信息密度、镜头时长、动态/静态比例
+调用 `scripts/tools/audio.py`：
 
-#### 维度二：内容/文案风格
+1. `download_audio(audio_url)` — 下载 mp3
+2. `prepare_audio_for_profiler(audio_bytes)` — 截取前 60 秒（默认），加速多模态分析
+   - 依赖 pydub + ffmpeg
+   - 未安装时自动降级为使用完整音频
 
-分析达人的内容表达特征：
-- **文案调性**：专业/轻松/感性/幽默/理性
-- **选题方向**：内容主题分布、选题偏好
-- **叙事结构**：开篇方式（hook）、正文结构、结尾模式
-- **用词偏好**：高频词汇、行业术语、口语化程度
+### Step 4: 多模态 LLM 分析
 
-#### 维度三：运营/行为风格
+调用 `scripts/providers/multimodal.py` 的 `run_multimodal()`：
 
-分析达人的运营行为特征：
-- **发布频率**：日均/周均发布量、发布间隔
-- **发布时间**：活跃时段分布、规律性
-- **内容主题分布**：各类型内容占比
-- **粉丝互动**：回复评论习惯、互动引导方式、粉丝画像推测
+- **模型**：Gemini 2.5 Flash（默认，通过 AiHubMix OpenAI 兼容接口）
+- **输入**：系统 prompt（风格分析指令）+ 用户文本（bio + 视频标题）+ 音频 mp3
+- **分析内容**：
+  - 听音频：口吻、语气、语速、停顿、情绪
+  - 读文本：人设定位、选题方向、受众
 
-### Step 4: 生成 JSON 报告
+**三种分析模式**（按优先级自动选择）：
 
-将分析结果输出为结构化 JSON。JSON schema 定义参见 `references/json-schema.md`。
+| 模式 | 条件 | 说明 |
+|------|------|------|
+| `multimodal_audio` | 有音频 mp3 | 最佳：直接听音频分析风格 |
+| `text_fallback` | 无音频但有转写文本 | 兜底：根据文本分析 |
+| `text_only` | 无音频无转写 | 仅根据 bio + 视频标题分析 |
 
-核心结构：
+### Step 5: 输出 JSON
+
+LLM 输出 JSON，经 `_compact_result()` 硬截断超长字段后返回。
+
+输出结构详见 `references/json-schema.md`。
+
+## 代码结构
+
 ```
-{
-  "search_keyword": "搜索关键词",
-  "platform": "douyin",
-  "creators": [
-    {
-      "creator_info": { ... },
-      "style_profile": {
-        "visual_style": { ... },
-        "content_style": { ... },
-        "operational_style": { ... }
-      },
-      "top_content": [ ... ],
-      "overall_assessment": { ... }
-    }
-  ]
-}
+scripts/
+├── agents/
+│   ├── __init__.py
+│   ├── base.py                    # AgentSpec, AgentResult, run_agent
+│   └── influencer_profiler.py     # 主入口：run_influencer_profiler()
+├── providers/
+│   ├── __init__.py
+│   └── multimodal.py              # 多模态 LLM 调用（OpenAI 兼容接口）
+├── tools/
+│   ├── __init__.py
+│   ├── tikhub.py                  # TikHub API 抖音数据拉取
+│   └── audio.py                   # 音频下载、截取、转写
+├── config/
+│   ├── __init__.py
+│   └── settings.py                # 环境变量配置（.env）
+├── requirements.txt
+└── .env.example
 ```
 
-## 使用现有 Python 采集代码
+## 运行方式
 
-用户已有现成的 Python 采集代码。将代码放入 `scripts/` 目录后：
+### 环境准备
 
-1. 确认脚本的输入参数（关键词、达人 ID、采集数量等）
-2. 确认脚本的输出格式（返回的数据结构）
-3. 在工作流程中调用对应脚本
+1. 安装依赖：
+   ```bash
+   pip install -r scripts/requirements.txt
+   ```
+2. 安装 ffmpeg（音频截取需要）：
+   ```bash
+   brew install ffmpeg
+   ```
+3. 复制 `.env.example` 为 `.env` 并填写 API Key：
+   ```bash
+   cp scripts/.env.example scripts/.env
+   ```
 
-**代码集成步骤：**
-1. 将用户的 Python 代码复制到 `scripts/` 目录
-2. 确认依赖项并在使用前安装
-3. 在工作流中按 Step 1-4 的顺序调用
-4. 如果脚本输出格式与 JSON schema 不匹配，编写适配层转换
+### 调用入口
+
+```python
+import sys
+sys.path.insert(0, "scripts")
+
+from agents.influencer_profiler import run_influencer_profiler
+
+# 方式 1：传入 JSON 字符串
+result = run_influencer_profiler('{"douyin_profile_url": "https://www.douyin.com/user/MS4w..."}')
+
+# 方式 2：直接传入主页链接
+result = run_influencer_profiler("https://www.douyin.com/user/MS4w...")
+
+# 方式 3：手动提供数据
+result = run_influencer_profiler(json.dumps({
+    "bio": "达人简介",
+    "recent_videos": [{"title": "标题", "description": "描述"}],
+}))
+
+print(result.text)  # JSON 字符串
+```
+
+## 8 类内容风格标签
+
+LLM 从以下 8 个标签中最多选 3 个（按匹配度排序）：
+
+| 标签 | 说明 |
+|------|------|
+| 亲切唠嗑 | 像朋友聊天，自然随性 |
+| 激情造势 | 语速快、情绪足 |
+| 专业沉稳 | 用词严谨，干货/测评专用 |
+| 幽默吐槽 | 诙谐玩梗，轻松有笑点 |
+| 温柔舒缓 | 语调柔和 |
+| 利落酷飒 | 短句干脆，气场强 |
+| 朴实接地气 | 大白话，真诚不花哨 |
+| 悬念吊胃口 | 停顿造势，勾起好奇 |
 
 ## 扩展指南
 
 ### 新增平台支持
 
-当需要扩展到新平台时：
-1. 在 `scripts/` 中新增该平台的采集脚本
-2. 在 SKILL.md 的支持平台表格中更新状态
-3. 在 `references/style-dimensions.md` 中补充平台特有维度（如有）
-4. JSON 输出结构保持一致，`platform` 字段标识来源平台
+1. 在 `scripts/tools/` 中新增平台数据拉取脚本（参照 `tikhub.py`）
+2. 在 `scripts/agents/influencer_profiler.py` 的 `_merge_with_tikhub()` 中增加平台分支
+3. 输入 JSON 增加 `platform` 字段标识来源
 
-### 调整分析维度
+### 调整风格标签
 
-各维度的详细分析框架在 `references/style-dimensions.md` 中定义，可根据需求增减分析项。修改后无需改动 SKILL.md 主体流程。
+修改 `scripts/agents/influencer_profiler.py` 中的 `_STYLE_LABELS` 变量。标签定义详见 `references/style-dimensions.md`。
+
+### 调整音频截取时长
+
+修改 `.env` 中的 `INFLUENCER_AUDIO_MAX_SECONDS`（默认 60 秒）。
 
 ## 注意事项
 
-- 采集数据时遵守平台 API 调用频率限制，避免触发风控
-- JSON 输出中的达人 ID、内容 ID 保持平台原始格式
-- 评分采用 0-100 分制，60 为及格线
-- 分析样本不足（<10 条内容）时在 `overall_assessment` 中标注数据局限性
+- TikHub API 有调用频率限制，注意控速
+- 多模态模型需支持音频输入（默认 Gemini 2.5 Flash）
+- 音频截取依赖 pydub + ffmpeg，未安装时自动降级为完整音频
+- `influencer_profile_text` 字段硬限制 200 字，超长自动截断
+- 无音频且无转写文本时降级为 `text_only` 模式，分析质量会下降
+- 需要配置的 API Key：`TIKHUB_API_TOKEN`、`MULTIMODAL_API_KEY`（或 `ANTHROPIC_API_KEY`）

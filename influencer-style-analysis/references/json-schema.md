@@ -1,6 +1,6 @@
 # JSON 输出结构定义
 
-达人风格分析的 JSON 输出结构。所有字段均使用英文键名，值可为中文。
+`influencer_profiler` 的 JSON 输出结构。LLM 生成后经 `_compact_result()` 硬截断超长字段。
 
 ---
 
@@ -8,191 +8,97 @@
 
 ```json
 {
-  "search_keyword": "string — 用户输入的搜索关键词",
-  "platform": "string — 平台标识：douyin | xiaohongshu | channels",
-  "analysis_date": "string — 分析日期，ISO 8601 格式 YYYY-MM-DD",
-  "total_creators": "number — 本次搜索匹配到的达人数量",
-  "creators": [
-    {
-      "creator_info": {
-        "creator_id": "string — 平台原始达人 ID",
-        "creator_name": "string — 达人昵称",
-        "creator_handle": "string — 达人账号（如 @xxx）",
-        "avatar_url": "string — 头像 URL",
-        "profile_url": "string — 主页链接",
-        "follower_count": "number — 粉丝数",
-        "following_count": "number — 关注数",
-        "total_likes": "number — 总获赞数",
-        "verified": "boolean — 是否认证",
-        "verified_label": "string — 认证标签（如无则为 null）",
-        "category": "string — 账号分类（如 美妆/穿搭/美食）",
-        "location": "string — 所在地（如无则为 null）"
-      },
-      "sample_info": {
-        "total_posts_analyzed": "number — 本次分析的素材数量",
-        "date_range_start": "string — 采集素材最早日期",
-        "date_range_end": "string — 采集素材最晚日期",
-        "data_sufficient": "boolean — 样本是否充足（>=10 条为 true）"
-      },
-      "style_profile": {
-        "visual_style": {
-          "score": "number — 维度总分 0-100",
-          "level": "string — 优秀|良好|及格|偏弱|缺失",
-          "shooting_techniques": {
-            "camera_movement": ["string — 运镜方式列表"],
-            "shot_sizes": ["string — 景别使用列表"],
-            "angles": ["string — 机位角度列表"],
-            "composition": ["string — 构图方式列表"],
-            "score": "number — 子项评分 0-100"
-          },
-          "editing_style": {
-            "transition_frequency": "string — 转场频率描述（高/中/低）",
-            "avg_transitions_per_minute": "number — 每分钟平均转场次数",
-            "rhythm": "string — 节奏描述（快/中/慢）",
-            "effects_usage": ["string — 常用特效列表"],
-            "sound_visual_sync": "string — 声画配合描述",
-            "score": "number — 子项评分 0-100"
-          },
-          "visual_tone": {
-            "color_preference": "string — 色彩偏好描述",
-            "primary_colors": ["string — 主色调列表（如 hex 或色名）"],
-            "filter_style": "string — 滤镜风格描述",
-            "brightness": "string — 画面明暗描述（高调/低调/中间调）",
-            "subtitle_style": "string — 字幕/文字风格描述",
-            "score": "number — 子项评分 0-100"
-          },
-          "pacing": {
-            "information_density": "string — 信息密度描述（高/中/低）",
-            "avg_shot_duration_sec": "number — 平均单镜头时长（秒）",
-            "dynamic_static_ratio": "string — 动静比例描述",
-            "score": "number — 子项评分 0-100"
-          }
-        },
-        "content_style": {
-          "score": "number — 维度总分 0-100",
-          "level": "string — 优秀|良好|及格|偏弱|缺失",
-          "copy_tone": {
-            "primary_tone": "string — 主基调（专业/轻松/感性/幽默/理性/励志）",
-            "emotional_tendency": "string — 情感倾向描述",
-            "approachability": "string — 亲和力描述",
-            "score": "number — 子项评分 0-100"
-          },
-          "topic_direction": {
-            "main_topics": [
-              {
-                "topic": "string — 主题名称",
-                "proportion": "number — 占比 0-1"
-              }
-            ],
-            "content_angles": ["string — 选题角度列表"],
-            "trend_tracking": "string — 热点追踪能力描述",
-            "originality": "string — 原创性描述",
-            "score": "number — 子项评分 0-100"
-          },
-          "narrative_structure": {
-            "hook_type": "string — 开篇方式（提问/悬念/冲突/直入/数据冲击）",
-            "body_structure": "string — 正文结构（总分总/并列/递进/对比/时间线）",
-            "ending_pattern": "string — 结尾模式（总结/互动/预告/号召/情感升华）",
-            "avg_duration_sec": "number — 平均视频时长（秒）",
-            "avg_copy_length": "number — 平均文案字数",
-            "score": "number — 子项评分 0-100"
-          },
-          "word_preferences": {
-            "top_keywords": ["string — 高频词汇 Top 10"],
-            "industry_terms": ["string — 行业术语列表"],
-            "colloquial_level": "string — 口语化程度（高/中/低）",
-            "trend_words_usage": "string — 流行语使用情况描述",
-            "score": "number — 子项评分 0-100"
-          }
-        },
-        "operational_style": {
-          "score": "number — 维度总分 0-100",
-          "level": "string — 优秀|良好|及格|偏弱|缺失",
-          "posting_frequency": {
-            "daily_avg": "number — 日均发布量",
-            "weekly_avg": "number — 周均发布量",
-            "avg_interval_hours": "number — 平均发布间隔（小时）",
-            "trend": "string — 更新趋势（上升/下降/稳定）",
-            "score": "number — 子项评分 0-100"
-          },
-          "posting_time": {
-            "active_hours": ["string — 活跃时段列表（如 18:00-22:00）"],
-            "regularity": "string — 时间规律性描述",
-            "best_performance_hour": "string — 最佳表现时段",
-            "score": "number — 子项评分 0-100"
-          },
-          "content_theme_distribution": {
-            "themes": [
-              {
-                "theme": "string — 主题名称",
-                "proportion": "number — 占比 0-1",
-                "avg_engagement": "number — 该主题平均互动量"
-              }
-            ],
-            "exploration_tendency": "string — 探索新主题倾向描述",
-            "score": "number — 子项评分 0-100"
-          },
-          "fan_interaction": {
-            "reply_habit": "string — 回复评论习惯描述",
-            "interaction_methods": ["string — 互动引导方式列表"],
-            "estimated_fan_profile": "string — 推测的粉丝画像",
-            "community_operation": "string — 社群运营情况描述",
-            "score": "number — 子项评分 0-100"
-          }
-        }
-      },
-      "top_content": [
-        {
-          "content_id": "string — 内容 ID",
-          "title": "string — 标题",
-          "url": "string — 链接",
-          "publish_time": "string — 发布时间 ISO 8601",
-          "duration_sec": "number — 视频时长（秒），图文为 null",
-          "likes": "number — 点赞数",
-          "comments": "number — 评论数",
-          "shares": "number — 转发数",
-          "collects": "number — 收藏数",
-          "views": "number — 播放量",
-          "copy_text": "string — 文案内容",
-          "style_tags": ["string — 风格标签列表"],
-          "engagement_rate": "number — 互动率 0-1"
-        }
-      ],
-      "overall_assessment": {
-        "overall_score": "number — 综合评分 0-100",
-        "overall_level": "string — 优秀|良好|及格|偏弱|缺失",
-        "style_summary": "string — 风格概述（2-3 句话总结达人风格特征）",
-        "distinctive_features": ["string — 鲜明风格特征列表"],
-        "content_strengths": ["string — 内容优势列表"],
-        "improvement_suggestions": ["string — 改进建议列表"],
-        "data_limitations": "string — 数据局限性说明（样本不足时标注）"
-      }
-    }
-  ]
+  "persona_positioning": {
+    "summary": "string — 人设一句话，<=30 字",
+    "target_audience": "string — 受众描述，<=15 字",
+    "core_topics": ["string — 最多 3 个核心选题，每个 <=8 字"]
+  },
+  "content_style": {
+    "style_labels": ["string — 最多 3 个风格标签，从 8 类枚举中选用"],
+    "style_summary": "string — 口吻+节奏+风格综合描述，<=50 字",
+    "speech_pace": "string — 语速：快 | 中 | 慢",
+    "tone": "string — 语气描述，<=12 字",
+    "taboos": ["string — 忌写法，最多 2 条，每条 <=12 字"]
+  },
+  "influencer_profile_text": "string — 供下游 script_scorer 使用的人设+风格+语气节奏摘要，<=200 字，口语化简单说明",
+  "analysis_mode": "string — 分析模式：multimodal_audio | text_fallback | text_only",
+  "author_nickname": "string — 达人昵称（可选，来自 TikHub）"
 }
 ```
 
 ---
 
-## 字段约定
+## 字段说明
 
-| 规则 | 说明 |
-|------|------|
-| 数值型字段 | 无数据时填 `null`，不填 0 |
-| 列表型字段 | 无数据时填空数组 `[]` |
-| 评分字段 | 统一 0-100 分制，保留一位小数 |
-| 日期字段 | ISO 8601 格式（`YYYY-MM-DD` 或 `YYYY-MM-DDTHH:mm:ss`） |
-| 占比字段 | 0-1 之间的小数（如 0.35 表示 35%） |
-| 互动率 | (点赞+评论+转发+收藏) / 播放量，0-1 之间 |
+### persona_positioning（人设定位）
 
-## 权重配置
+| 字段 | 类型 | 限制 | 说明 |
+|------|------|------|------|
+| summary | string | <=30 字 | 人设一句话总结 |
+| target_audience | string | <=15 字 | 目标受众 |
+| core_topics | string[] | 最多 3 个，每个 <=8 字 | 核心内容选题方向 |
 
-默认三维度等权重，可在 `overall_assessment.overall_score` 计算时调整：
+### content_style（内容风格）
 
-| 维度 | 默认权重 |
-|------|----------|
-| 视觉/视频风格 | 33.3% |
-| 内容/文案风格 | 33.3% |
-| 运营/行为风格 | 33.4% |
+| 字段 | 类型 | 限制 | 说明 |
+|------|------|------|------|
+| style_labels | string[] | 最多 3 个 | 从 8 类枚举标签中选用，按匹配度排序 |
+| style_summary | string | <=50 字 | 口吻+节奏+风格综合描述 |
+| speech_pace | string | 枚举 | 语速：快/中/慢 |
+| tone | string | <=12 字 | 语气描述 |
+| taboos | string[] | 最多 2 条，每条 <=12 字 | 内容忌讳/避免写法 |
 
-如有特殊需求，可在 SKILL.md 的注意事项中定义权重调整规则。
+### influencer_profile_text（风格摘要）
+
+| 属性 | 值 |
+|------|-----|
+| 类型 | string |
+| 最大长度 | 200 字 |
+| 用途 | 供下游 `script_scorer` 使用的达人风格画像 |
+| 格式 | 口语化简单说明，不要分点罗列 |
+| 截断 | 超过 200 字时自动截断并标记 `_profile_text_truncated: true` |
+
+### analysis_mode（分析模式）
+
+| 模式 | 触发条件 | 分析质量 |
+|------|----------|----------|
+| `multimodal_audio` | 有音频 mp3 | 最佳：直接听音频分析口吻语气 |
+| `text_fallback` | 无音频但有转写文本 | 中等：根据文本推断 |
+| `text_only` | 无音频无转写 | 基础：仅根据 bio + 视频标题 |
+
+---
+
+## 输出示例
+
+```json
+{
+  "persona_positioning": {
+    "summary": "美妆测评达人，主打平价好物挖掘",
+    "target_audience": "18-30 岁女性",
+    "core_topics": ["平价美妆", "产品测评", "化妆教程"]
+  },
+  "content_style": {
+    "style_labels": ["亲切唠嗑", "朴实接地气"],
+    "style_summary": "像闺蜜分享好物，语速适中偏快，自然不造作",
+    "speech_pace": "中",
+    "tone": "亲切真诚",
+    "taboos": ["避免硬广感", "忌过度包装"]
+  },
+  "influencer_profile_text": "美妆测评达人，主打平价好物挖掘，目标受众 18-30 岁女性。风格亲切唠嗑、朴实接地气，像闺蜜分享好物一样自然真诚，语速适中偏快。核心选题：平价美妆、产品测评、化妆教程。内容忌硬广感和过度包装。",
+  "analysis_mode": "multimodal_audio",
+  "author_nickname": "小美爱分享"
+}
+```
+
+---
+
+## 硬截断规则
+
+`_compact_result()` 对以下字段强制截断：
+
+| 字段 | 最大长度 | 截断标记 |
+|------|----------|----------|
+| influencer_profile_text | 200 字 | `_profile_text_truncated: true` |
+| content_style.style_summary | 50 字 | - |
+| persona_positioning.summary | 30 字 | - |
+| content_style.tone | 12 字 | - |
