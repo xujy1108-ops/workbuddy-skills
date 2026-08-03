@@ -109,7 +109,7 @@ def _pick_video_url(play_addr: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def parse_influencer_bundle(payload: dict[str, Any], limit: int = 3) -> dict[str, Any]:
+def parse_influencer_bundle(payload: dict[str, Any], limit: int = 2) -> dict[str, Any]:
     """
     从 TikHub 响应提取 influencer_profiler 所需字段。
     - bio: aweme_list[0].author.signature
@@ -169,7 +169,7 @@ def fetch_influencer_from_douyin(
     *,
     profile_url: Optional[str] = None,
     sec_user_id: Optional[str] = None,
-    video_count: int = 3,
+    video_count: int = 2,
 ) -> dict[str, Any]:
     """主页链接或 sec_user_id → 达人基础数据 bundle。"""
     user_id = (sec_user_id or "").strip()
