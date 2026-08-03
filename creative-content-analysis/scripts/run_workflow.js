@@ -471,6 +471,7 @@ function writeToBitable(results) {
     return {
       '素材id': `dy_${r.aweme_id}`,
       '素材渠道': '抖音',
+      '关键词': r.keyword || '',
       '素材链接': r.video_url,
       '素材脚本文案': r.script,
       '内容方向': analysis['内容方向'] || '',
@@ -522,11 +523,9 @@ function writeToBitable(results) {
   }
 }
 
-// 余额不足时发送飞书通知
+// 发送飞书通知（每次运行结束都发，含成功/失败/放弃统计）
 function sendFeishuNotification(summary, quotaExhausted) {
-  if (!quotaExhausted) return;
-
-  log('🔹 发送飞书余额不足通知...');
+  log('🔹 发送飞书结果通知...');
 
   try {
     // 获取当前用户 open_id
@@ -539,19 +538,35 @@ function sendFeishuNotification(summary, quotaExhausted) {
       return;
     }
 
-    const msgText = [
-      '⚠️ 度小满创意分析通知',
-      '',
-      'AIHubMix API 余额不足，工作流已提前终止。',
-      '',
-      '📊 执行结果：',
-      `- ✅ 成功处理：${summary.total_success} 条`,
-      `- ⏭️ 被放弃：${summary.total_skipped} 条`,
-      `- ❌ 执行失败：${summary.total_failed} 条`,
-      '',
-      '已成功处理的素材已写入飞书多维表格。请及时充值 API 余额后重新运行。'
-    ].join('\n');
+    const lines = [
+      '📊 度小满创意分析 - 执行结果通知',
+      ''
+    ];
 
+    if (summary.keywords && summary.keywords.length > 0) {
+      lines.push(`🔑 搜索关键词：${summary.keywords.join('、')}`);
+      lines.push('');
+    }
+
+    lines.push('📈 执行结果：');
+    lines.push(`- ✅ 成功处理：${summary.total_success} 条`);
+    lines.push(`- ⏭️ 被放弃：${summary.total_skipped} 条`);
+    lines.push(`- ❌ 执行失败：${summary.total_failed} 条`);
+
+    if (summary.bitable_success !== undefined) {
+      lines.push(`- 📝 飞书写入：${summary.bitable_success} 条`);
+    }
+
+    if (quotaExhausted) {
+      lines.push('');
+      lines.push('⚠️ AIHubMix API 余额不足，工作流已提前终止！');
+      lines.push('已成功处理的素材已写入飞书多维表格，请及时充值后重新运行。');
+    } else {
+      lines.push('');
+      lines.push('✅ 工作流已正常完成。');
+    }
+
+    const msgText = lines.join('\n');
     const content = JSON.stringify({ text: msgText });
     runLarkCli([
       'im', '+send',
@@ -627,7 +642,10 @@ async function main() {
   const allAweme = [];
   for (const keyword of keywords) {
     const results = await searchDouyin(keyword);
-    allAweme.push(...results);
+    // 每条视频标注它来自哪个搜索关键词
+    for (const aweme of results) {
+      allAweme.push({ aweme, keyword });
+    }
   }
   log(`   共搜索到 ${allAweme.length} 条视频\n`);
 
@@ -636,7 +654,7 @@ async function main() {
   const skipped = [];
   const candidates = [];
 
-  for (const aweme of allAweme) {
+  for (const { aweme, keyword } of allAweme) {
     const awemeId = aweme.aweme_id;
     const duration = aweme.video?.duration;
     const materialId = `dy_${awemeId}`;
@@ -677,7 +695,8 @@ async function main() {
       aweme_id: awemeId,
       desc: aweme.desc || '',
       download_url: downloadUrl,
-      duration: duration
+      duration: duration,
+      keyword: keyword
     });
   }
 
@@ -731,7 +750,8 @@ async function main() {
           desc: candidate.desc,
           video_url: `https://www.douyin.com/video/${candidate.aweme_id}`,
           script,
-          analysis
+          analysis,
+          keyword: candidate.keyword
         };
       } catch (error) {
         // 余额不足 — 设置标志，剩余任务将跳过
@@ -760,7 +780,8 @@ async function main() {
         desc: r.desc,
         video_url: r.video_url,
         script: r.script,
-        analysis: r.analysis
+        analysis: r.analysis,
+        keyword: r.keyword
       });
     } else if (r.status === 'skipped') {
       skipped.push({ aweme_id: r.aweme_id, reason: r.reason });
@@ -779,12 +800,14 @@ async function main() {
     log('🔹 Step 5: 跳过飞书写入（--skip-bitable）');
   }
 
-  // 余额不足时发送飞书通知
+  // 每次运行结束都发送飞书通知
   sendFeishuNotification(
     {
       total_success: results.length,
       total_skipped: skipped.length,
-      total_failed: failedItems.length
+      total_failed: failedItems.length,
+      bitable_success: bitableResult.success,
+      keywords: keywords
     },
     state.quotaExhausted
   );

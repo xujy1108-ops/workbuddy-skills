@@ -15,6 +15,7 @@
 |--------|---------|------|----------|
 | 素材id | `fldwVHl75N` | text | `dy_` + aweme_id |
 | 素材渠道 | `fldmmIORlA` | select | `抖音`（选项已存在） |
+| 关键词 | — | text | 搜索该素材时使用的关键词 |
 | 素材链接 | `fld1Z0XXyY` | text | `https://www.douyin.com/video/` + aweme_id |
 | 素材脚本文案 | `fldtV7VsGp` | text | video_script.js 提取的完整台词 |
 | 内容方向 | `fldjSH90xr` | text | 分析结果的"内容方向"字段 |
@@ -56,6 +57,7 @@ lark-cli base +record-batch-create \
     {
       "素材id": "dy_7604166385288092755",
       "素材渠道": "抖音",
+      "关键词": "朋友借钱不还怎么办",
       "素材链接": "https://www.douyin.com/video/7604166385288092755",
       "素材脚本文案": "脚本内容...",
       "内容方向": "内容方向...",
