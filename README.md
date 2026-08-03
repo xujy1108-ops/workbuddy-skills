@@ -8,6 +8,7 @@
 |-------|------|------|
 | `creative-content-analysis` | 度小满品牌创意素材自动分析（抖音） | 自建 |
 | `lark-unified` | 飞书统一 CLI 工具集 | Marketplace 安装 |
+| `feishu-bitable-sync` | 视频号广告数据同步到飞书多维表格 | 自建 |
 
 ## 目录结构
 
@@ -21,6 +22,13 @@
 │   ├── SKILL.md
 │   ├── scripts/
 │   └── references/
+├── feishu-bitable-sync/
+│   ├── SKILL.md
+│   ├── scripts/
+│   │   ├── sync_to_feishu.mjs
+│   │   └── config.example.json
+│   └── references/
+│       └── setup_guide.md
 ├── .gitignore
 └── README.md
 ```
