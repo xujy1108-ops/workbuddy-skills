@@ -34,27 +34,19 @@ class Settings(BaseSettings):
     http_proxy: Optional[str] = Field(default=None, alias="HTTP_PROXY")
     https_proxy: Optional[str] = Field(default=None, alias="HTTPS_PROXY")
 
-    # 多模态（influencer_profiler 听 mp3，OpenAI 兼容 / AiHubMix）
-    multimodal_api_key: Optional[str] = Field(default=None, alias="MULTIMODAL_API_KEY")
-    multimodal_base_url: str = Field(
-        default="https://aihubmix.com/v1",
-        alias="MULTIMODAL_BASE_URL",
+    # Doubao / inferera（influencer_profiler 视频分析，OpenAI 兼容）
+    doubao_api_key: Optional[str] = Field(default=None, alias="DOUBAO_API_KEY")
+    doubao_base_url: str = Field(
+        default="https://api.inferera.com/v1",
+        alias="DOUBAO_BASE_URL",
     )
-    multimodal_model: str = Field(
-        default="gemini-2.5-flash",
-        alias="MULTIMODAL_MODEL",
+    doubao_model: str = Field(
+        default="doubao-seed-2-1-pro",
+        alias="DOUBAO_MODEL",
     )
-
-    whisper_model: str = Field(default="small", alias="WHISPER_MODEL")
 
     # TikHub（influencer_profiler 拉取抖音达人数据）
     tikhub_api_token: Optional[str] = Field(default=None, alias="TIKHUB_API_TOKEN")
-
-    # influencer_profiler：送多模态前只保留前 N 秒（听口吻够用，显著提速）
-    influencer_audio_max_seconds: int = Field(
-        default=60,
-        alias="INFLUENCER_AUDIO_MAX_SECONDS",
-    )
 
 
 @lru_cache

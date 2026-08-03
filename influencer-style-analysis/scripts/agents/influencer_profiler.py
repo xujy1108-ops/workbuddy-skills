@@ -1,14 +1,16 @@
-"""达人风格识别：TikHub 拉取抖音数据 + 多模态听 mp3 分析。"""
+"""达人风格识别：TikHub 拉取抖音数据 + Doubao 多模态看视频分析。"""
 
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Optional
 
 from agents.base import AgentResult, AgentSpec
-from providers.multimodal import run_multimodal
-from tools.audio import download_audio, prepare_audio_for_profiler
+from providers.multimodal import run_video_analysis
 from tools.tikhub import fetch_influencer_from_douyin
+
+logger = logging.getLogger(__name__)
 
 _STYLE_LABELS = """
 ## 内容风格标签（8 选，最多选 3 个）
@@ -43,30 +45,28 @@ _OUTPUT_SCHEMA = """
     "taboos": ["忌写法，最多2条，每条≤12字"]
   },
   "influencer_profile_text": "供 script_scorer 使用：人设+风格标签+语气节奏，**≤200字**，简单说明，不要分点罗列",
-  "analysis_mode": "multimodal_audio|text_fallback|text_only",
+  "analysis_mode": "multimodal_video",
   "author_nickname": "达人昵称，可选"
 }
 """
 
 SPEC = AgentSpec(
     name="influencer_profiler",
-    description="识别达人风格：TikHub 拉取抖音主页 + 多模态听 mp3",
+    description="识别达人风格：TikHub 拉取抖音主页 + Doubao 多模态看视频",
     instructions=f"""你是抖音达人风格分析专家。
 
 ## 输入形式
-用户消息为 JSON 文本；若附带音频，请**直接听音频**分析口吻、语气、语速、停顿、情绪，**不要**逐字复述全文。
+用户消息为 JSON 文本；附带视频，请**直接看视频**分析口吻、语气、语速、停顿、情绪、画面风格，**不要**逐字复述全文。
 
 ### 文本字段（通常由系统自动从 TikHub 填充）
 - bio：达人个人简介
-- recent_videos：最近最多 10 条视频的 title、description
 
-### 音频
-- 已附 mp3：分析 content_style 时必须以听感为主
-- audio_transcript：仅在没有音频时的兜底文本
+### 视频
+- 已附视频链接：分析 content_style 时必须以**视频观感**为主（口吻、画面、节奏、剪辑风格）
 
 ## 分析要求
-1. **persona_positioning**：依据 bio + recent_videos，字段宜短。
-2. **content_style**：有音频时依据**听感**；选 8 类风格标签中**最多 3 个**（原样写入 style_labels），style_summary ≤50 字。
+1. **persona_positioning**：依据 bio + 视频内容，字段宜短。
+2. **content_style**：有视频时依据**观感**；选 8 类风格标签中**最多 3 个**（原样写入 style_labels），style_summary ≤50 字。
 3. **influencer_profile_text**：整段 **≤200 字**，口语化简单说明，给后续脚本打分用；不要证据罗列、不要复述口播稿。
 4. **禁止**输出 evidence、长列表、markdown 分点。
 
@@ -75,7 +75,7 @@ SPEC = AgentSpec(
 {_OUTPUT_SCHEMA}
 
 使用简体中文。只输出 JSON，**禁止**用 ```json 或 ``` 包裹。""",
-    max_tokens=4096,
+    max_tokens=8192,
 )
 
 
@@ -115,26 +115,19 @@ def _parse_input(user_input: str) -> dict[str, Any]:
     douyin_profile_url = (data.get("douyin_profile_url") or "").strip() or None
     sec_user_id = (data.get("sec_user_id") or "").strip() or None
     bio = (data.get("bio") or "").strip()
-    recent_videos = data.get("recent_videos") or []
 
-    has_manual = bool(bio or recent_videos)
+    has_manual = bool(bio)
     has_douyin = bool(douyin_profile_url or sec_user_id)
 
     if not has_manual and not has_douyin:
         raise ValueError(
-            "至少提供 douyin_profile_url / sec_user_id，或手动提供 bio / recent_videos"
+            "至少提供 douyin_profile_url / sec_user_id，或手动提供 bio"
         )
-
-    if recent_videos and not isinstance(recent_videos, list):
-        raise ValueError("recent_videos 必须是数组")
 
     return {
         "douyin_profile_url": douyin_profile_url,
         "sec_user_id": sec_user_id,
         "bio": bio,
-        "recent_videos": recent_videos[:10] if recent_videos else [],
-        "latest_audio_url": (data.get("latest_audio_url") or "").strip() or None,
-        "audio_transcript": (data.get("audio_transcript") or "").strip() or None,
     }
 
 
@@ -151,42 +144,32 @@ def _merge_with_tikhub(data: dict[str, Any]) -> dict[str, Any]:
     merged = {
         **data,
         "bio": data.get("bio") or fetched.get("bio") or "",
-        "recent_videos": data.get("recent_videos") or fetched.get("recent_videos") or [],
-        "latest_audio_url": data.get("latest_audio_url") or fetched.get("latest_audio_url"),
+        "video_urls": fetched.get("video_urls") or [],
         "_tikhub_meta": {
             "sec_user_id": fetched.get("sec_user_id"),
             "author_nickname": fetched.get("author_nickname"),
-            "video_count_fetched": fetched.get("video_count_fetched"),
+            "video_count": fetched.get("video_count"),
             "douyin_profile_url": fetched.get("douyin_profile_url"),
         },
     }
 
-    if not merged["bio"] and not merged["recent_videos"]:
-        raise ValueError("TikHub 拉取成功但未解析到简介或视频标题")
+    if not merged["bio"] and not merged.get("video_urls"):
+        raise ValueError("TikHub 拉取成功但未解析到简介或视频")
 
     return merged
 
 
-def _build_text_payload(data: dict[str, Any], *, mode: str, transcript: Optional[str] = None) -> str:
+def _build_text_payload(data: dict[str, Any]) -> str:
     payload: dict[str, Any] = {
-        "bio": data["bio"],
-        "recent_videos": data["recent_videos"],
-        "analysis_mode": mode,
+        "bio": data.get("bio") or "",
+        "analysis_mode": "multimodal_video",
     }
     if data.get("_tikhub_meta"):
         payload["data_source"] = data["_tikhub_meta"]
-
-    if transcript:
-        payload["audio_transcript_fallback"] = transcript
-        payload["note"] = (
-            "无音频文件，请根据 audio_transcript_fallback 分析 content_style，"
-            "并在 analysis_mode 填 text_fallback。"
-        )
-    else:
-        payload["note"] = (
-            "请根据 bio、recent_videos 分析 persona_positioning；"
-            "根据所附 mp3 听感分析 content_style，analysis_mode 填 multimodal_audio。"
-        )
+    payload["note"] = (
+        "请根据 bio、视频内容分析 persona_positioning；"
+        "根据视频观感分析 content_style，analysis_mode 填 multimodal_video。"
+    )
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -220,7 +203,7 @@ def _ensure_complete_json(result: AgentResult) -> AgentResult:
         json.loads(cleaned)
     except json.JSONDecodeError as exc:
         hint = "模型输出不完整"
-        if out_tokens >= 900:
+        if out_tokens >= 1800:
             hint += f"（已用 {out_tokens} output tokens，可能触达 max_tokens 上限）"
         raise RuntimeError(
             f"{hint}，请重试或调大 MAX_TOKENS。解析错误: {exc}"
@@ -271,41 +254,33 @@ def _compact_result(result: AgentResult) -> AgentResult:
 
 
 def run_influencer_profiler(user_input: str) -> AgentResult:
-    """TikHub 拉取达人数据 → 多模态听 mp3 分析。"""
+    """TikHub 拉取达人数据 → 遍历视频逐个调 Doubao 多模态分析 → 用第一个成功结果。"""
     data = _merge_with_tikhub(_parse_input(user_input))
-    audio_url = data.get("latest_audio_url")
-    transcript = data.get("audio_transcript")
+    video_urls: list[str] = data.get("video_urls") or []
 
-    if audio_url:
-        audio_bytes, _audio_meta = prepare_audio_for_profiler(download_audio(audio_url))
-        user_text = _build_text_payload(data, mode="multimodal_audio")
-        result = run_multimodal(
-            agent_name=SPEC.name,
-            system=SPEC.instructions,
-            user_text=user_text,
-            audio_bytes=audio_bytes,
-            audio_format="mp3",
-            max_tokens=SPEC.max_tokens,
-        )
-        return _compact_result(_ensure_complete_json(result))
+    if not video_urls:
+        raise ValueError("没有可以分析的视频")
 
-    if transcript:
-        user_text = _build_text_payload(data, mode="text_fallback", transcript=transcript)
-        result = run_multimodal(
-            agent_name=SPEC.name,
-            system=SPEC.instructions,
-            user_text=user_text,
-            audio_bytes=None,
-            max_tokens=SPEC.max_tokens,
-        )
-        return _compact_result(_ensure_complete_json(result))
+    user_text = _build_text_payload(data)
 
-    user_text = _build_text_payload(data, mode="text_only")
-    result = run_multimodal(
-        agent_name=SPEC.name,
-        system=SPEC.instructions,
-        user_text=user_text,
-        audio_bytes=None,
-        max_tokens=SPEC.max_tokens,
+    last_error: Optional[Exception] = None
+    for i, video_url in enumerate(video_urls):
+        try:
+            logger.info("视频 %d/%d 分析中: %s", i + 1, len(video_urls), video_url[:80])
+            result = run_video_analysis(
+                agent_name=SPEC.name,
+                system=SPEC.instructions,
+                user_text=user_text,
+                video_url=video_url,
+                max_tokens=SPEC.max_tokens or 8192,
+            )
+            return _compact_result(_ensure_complete_json(result))
+        except Exception as exc:
+            last_error = exc
+            logger.warning("视频 %d/%d 分析失败: %s", i + 1, len(video_urls), exc)
+            continue
+
+    raise RuntimeError(
+        f"所有视频分析均失败（共 {len(video_urls)} 个），请稍后重试。"
+        f"最后错误: {last_error}"
     )
-    return _compact_result(_ensure_complete_json(result))

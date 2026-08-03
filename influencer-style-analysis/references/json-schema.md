@@ -1,6 +1,6 @@
 # JSON 输出结构定义
 
-`influencer_profiler` 的 JSON 输出结构。LLM 生成后经 `_compact_result()` 硬截断超长字段。
+`influencer_profiler` 的 JSON 输出结构。LLM 生成后经 `_ensure_complete_json()` 校验完整性 + `_compact_result()` 硬截断超长字段。
 
 ---
 
@@ -21,7 +21,7 @@
     "taboos": ["string — 忌写法，最多 2 条，每条 <=12 字"]
   },
   "influencer_profile_text": "string — 供下游 script_scorer 使用的人设+风格+语气节奏摘要，<=200 字，口语化简单说明",
-  "analysis_mode": "string — 分析模式：multimodal_audio | text_fallback | text_only",
+  "analysis_mode": "string — 分析模式：multimodal_video",
   "author_nickname": "string — 达人昵称（可选，来自 TikHub）"
 }
 ```
@@ -60,11 +60,9 @@
 
 ### analysis_mode（分析模式）
 
-| 模式 | 触发条件 | 分析质量 |
-|------|----------|----------|
-| `multimodal_audio` | 有音频 mp3 | 最佳：直接听音频分析口吻语气 |
-| `text_fallback` | 无音频但有转写文本 | 中等：根据文本推断 |
-| `text_only` | 无音频无转写 | 基础：仅根据 bio + 视频标题 |
+| 模式 | 触发条件 | 说明 |
+|------|----------|------|
+| `multimodal_video` | 默认模式 | Doubao 多模态大模型直接看视频分析口吻、语气、画面风格 |
 
 ---
 
@@ -85,7 +83,7 @@
     "taboos": ["避免硬广感", "忌过度包装"]
   },
   "influencer_profile_text": "美妆测评达人，主打平价好物挖掘，目标受众 18-30 岁女性。风格亲切唠嗑、朴实接地气，像闺蜜分享好物一样自然真诚，语速适中偏快。核心选题：平价美妆、产品测评、化妆教程。内容忌硬广感和过度包装。",
-  "analysis_mode": "multimodal_audio",
+  "analysis_mode": "multimodal_video",
   "author_nickname": "小美爱分享"
 }
 ```

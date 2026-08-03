@@ -1,19 +1,9 @@
 from __future__ import annotations
 
 from agents.base import AgentSpec, AgentResult, run_agent
-from agents.executor import SPEC as EXECUTOR_SPEC
-from agents.researcher import SPEC as RESEARCHER_SPEC
-from agents.reviewer import SPEC as REVIEWER_SPEC
 from agents.influencer_profiler import SPEC as INFLUENCER_PROFILER_SPEC
-from agents.script_scorer import SPEC as SCRIPT_SCORER_SPEC
-from agents.writer import SPEC as WRITER_SPEC
 
 AGENT_REGISTRY: dict[str, AgentSpec] = {
-    RESEARCHER_SPEC.name: RESEARCHER_SPEC,
-    WRITER_SPEC.name: WRITER_SPEC,
-    REVIEWER_SPEC.name: REVIEWER_SPEC,
-    EXECUTOR_SPEC.name: EXECUTOR_SPEC,
-    SCRIPT_SCORER_SPEC.name: SCRIPT_SCORER_SPEC,
     INFLUENCER_PROFILER_SPEC.name: INFLUENCER_PROFILER_SPEC,
 }
 
