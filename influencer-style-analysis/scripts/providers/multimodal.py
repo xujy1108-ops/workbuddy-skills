@@ -91,3 +91,53 @@ def run_video_analysis(
         usage=usage,
         raw=response,
     )
+
+
+def run_text_analysis(
+    *,
+    agent_name: str,
+    system: str,
+    user_text: str,
+    max_tokens: int = 8192,
+) -> AgentResult:
+    """调用 Doubao Chat Completions（纯文本，无视频），用于合并多次视频分析结果。"""
+    settings = get_settings()
+    model = settings.doubao_model
+    client = _create_client()
+    max_tok = max_tokens or 8192
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ],
+        max_tokens=max_tok,
+        temperature=0.3,
+    )
+
+    choice = response.choices[0]
+    text = (choice.message.content or "").strip()
+    finish_reason = getattr(choice, "finish_reason", None)
+
+    usage: dict[str, int] = {}
+    if response.usage:
+        usage = {
+            "input_tokens": response.usage.prompt_tokens or 0,
+            "output_tokens": response.usage.completion_tokens or 0,
+        }
+
+    out_tokens = usage.get("output_tokens", 0)
+    if finish_reason == "length" or out_tokens >= max_tok - 20:
+        raise RuntimeError(
+            f"模型输出被截断（finish_reason={finish_reason}, output_tokens={out_tokens}, "
+            f"max_tokens={max_tok}）。请调大 MAX_TOKENS 后重试。"
+        )
+
+    return AgentResult(
+        agent=agent_name,
+        text=text,
+        model=model,
+        usage=usage,
+        raw=response,
+    )

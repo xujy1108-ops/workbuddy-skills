@@ -7,7 +7,7 @@ import logging
 from typing import Any, Optional
 
 from agents.base import AgentResult, AgentSpec
-from providers.multimodal import run_video_analysis
+from providers.multimodal import run_text_analysis, run_video_analysis
 from tools.tikhub import fetch_influencer_from_douyin
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,27 @@ SPEC = AgentSpec(
 使用简体中文。只输出 JSON，**禁止**用 ```json 或 ``` 包裹。""",
     max_tokens=8192,
 )
+
+_MERGE_SYSTEM_PROMPT = f"""你是抖音达人风格分析专家。
+
+## 任务
+同一个达人的多个视频已分别完成风格分析。现在需要你综合所有分析结果，归纳出一份最终的风格画像。
+
+## 合并规则
+1. **persona_positioning**：综合所有分析结果，取共识方向，字段宜短。
+2. **content_style**：
+   - style_labels：在所有结果出现的标签中，取出现频率最高的 ≤3 个
+   - speech_pace：取众数（多数视频的语速）
+   - style_summary：综合所有视频的风格特征，≤50 字
+   - tone：综合所有分析的语气描述，≤12 字
+3. **influencer_profile_text**：整段 ≤200 字，综合所有视频分析得出的达人画像
+4. **禁止**输出 evidence、长列表、markdown 分点。
+
+{_STYLE_LABELS}
+
+{_OUTPUT_SCHEMA}
+
+使用简体中文。只输出 JSON，**禁止**用 ```json 或 ``` 包裹。"""
 
 
 def _coerce_input_dict(user_input: str) -> dict[str, Any]:
@@ -253,8 +274,37 @@ def _compact_result(result: AgentResult) -> AgentResult:
     )
 
 
+def _merge_multiple_analyses(
+    results: list[AgentResult], bio: str, meta: dict[str, Any]
+) -> AgentResult:
+    """将多次视频分析结果通过 LLM 二次合并为最终 JSON。"""
+    analyses_text: list[str] = []
+    for i, r in enumerate(results):
+        analyses_text.append(f"### 视频 {i + 1} 分析结果\n{r.text}")
+
+    merge_input = json.dumps(
+        {
+            "bio": bio,
+            "video_count": len(results),
+            "analyses": "\n\n".join(analyses_text),
+            "data_source": meta,
+            "note": "请综合以上多个视频的分析结果，合并为一份最终的风格画像 JSON。",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    result = run_text_analysis(
+        agent_name=SPEC.name,
+        system=_MERGE_SYSTEM_PROMPT,
+        user_text=merge_input,
+        max_tokens=SPEC.max_tokens or 8192,
+    )
+    return _compact_result(_ensure_complete_json(result))
+
+
 def run_influencer_profiler(user_input: str) -> AgentResult:
-    """TikHub 拉取达人数据 → 遍历视频逐个调 Doubao 多模态分析 → 用第一个成功结果。"""
+    """TikHub 拉取达人数据 → 遍历全部视频逐个调 Doubao 多模态分析 → LLM 二次合并。"""
     data = _merge_with_tikhub(_parse_input(user_input))
     video_urls: list[str] = data.get("video_urls") or []
 
@@ -263,7 +313,9 @@ def run_influencer_profiler(user_input: str) -> AgentResult:
 
     user_text = _build_text_payload(data)
 
+    success_results: list[AgentResult] = []
     last_error: Optional[Exception] = None
+
     for i, video_url in enumerate(video_urls):
         try:
             logger.info("视频 %d/%d 分析中: %s", i + 1, len(video_urls), video_url[:80])
@@ -274,13 +326,26 @@ def run_influencer_profiler(user_input: str) -> AgentResult:
                 video_url=video_url,
                 max_tokens=SPEC.max_tokens or 8192,
             )
-            return _compact_result(_ensure_complete_json(result))
+            validated = _compact_result(_ensure_complete_json(result))
+            success_results.append(validated)
+            logger.info("视频 %d/%d 分析成功", i + 1, len(video_urls))
         except Exception as exc:
             last_error = exc
             logger.warning("视频 %d/%d 分析失败: %s", i + 1, len(video_urls), exc)
             continue
 
-    raise RuntimeError(
-        f"所有视频分析均失败（共 {len(video_urls)} 个），请稍后重试。"
-        f"最后错误: {last_error}"
+    if not success_results:
+        raise RuntimeError(
+            f"所有视频分析均失败（共 {len(video_urls)} 个），请稍后重试。"
+            f"最后错误: {last_error}"
+        )
+
+    if len(success_results) == 1:
+        return success_results[0]
+
+    logger.info("合并 %d 个视频分析结果...", len(success_results))
+    return _merge_multiple_analyses(
+        results=success_results,
+        bio=data.get("bio") or "",
+        meta=data.get("_tikhub_meta") or {},
     )
