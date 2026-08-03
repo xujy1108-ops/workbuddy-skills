@@ -84,25 +84,47 @@ const VIDEO_SCRIPT_PROMPT = `你是专业的视频脚本转录助手。请将视
 3. 保留所有口语和语气词，不要遗漏任何内容
 4. 按时间顺序输出
 5. 如果有画面动作描述需要，可在台词间用（动作描述）补充
-6. 输出格式：【人物】台词内容`;
+6. 输出格式：【人物】台词内容
+
+转录完成后，在最后一行输出以下分隔符和JSON元信息（用于后续达人匹配分析）：
+---META---
+{"表现形式": "口播/剧情/AI生成/其他", "语速": "快/中/慢", "说话风格": "亲切/激情/稳重/幽默/利落/温柔等"}
+
+说明：
+- 表现形式：口播（单人面对镜头说话）、剧情（有角色和情节的演绎）、AI生成（AI数字人或动画）、其他
+- 语速：根据视频中说话的快慢判断
+- 说话风格：可多选，用逗号分隔`;
 
 const ANALYSIS_PROMPT = `# 角色
 你是一位资深短视频编导，擅长拆解爆款素材的叙事逻辑，并为品牌广告提供可落地的植入策略。
 
 # 任务
-分析用户提供的脚本素材，完成四项输出，直接输出JSON。
+分析用户提供的脚本素材，完成五项输出，直接输出JSON。
 
 # 输出格式
 {
   "内容方向": "用一句大白话总结整个脚本的叙事逻辑和核心主张，让观众一听就懂",
   "素材逻辑分析": "从叙事视角、双方行为画像、核心结论三个维度综合分析，一段话写清楚，直接给结论",
   "对度小满的借鉴": "从情绪借势、反向论证、核心策略三个维度综合分析，一段话写清楚核心策略",
-  "植入修改建议": "包含植入锚点、修改后话术（用引号标出）、植入逻辑三个要素，一段话写清楚"
+  "植入修改建议": "包含植入锚点、修改后话术（用引号标出）、植入逻辑三个要素，一段话写清楚",
+  "适配达人": {
+    "表现形式": "口播/剧情/AI生成/其他",
+    "语速与风格": "语速快慢+说话风格，如：快、犀利",
+    "口吻": "老登说教/犀利点评/真挚分享等",
+    "推荐达人类型": "基于以上三点推导，2-3个类型，如：财经、职场、母婴亲子"
+  }
 }
+
+# 适配达人分析要求
+- 表现形式：如输入中已提供「视频表现特征」，直接引用；否则从脚本结构推断（单人长段=口播，多人对话=剧情）
+- 语速与风格：如输入中已提供「视频表现特征」，直接引用；否则从脚本语言密度和标点推断
+- 口吻：从脚本内容的说话态度和立场判断，如说教、点评、分享、吐槽等
+- 推荐达人类型：综合表现形式、语速风格、口吻三个维度，推导什么类型的达人适合演绎这类脚本
 
 # 约束条件
 - 内容方向，总字数在30字以内
-- 植入话术单独不计入总字数，其余三项总字数控制在100字以内
+- 适配达人的推荐达人类型控制在20字以内，其余3个子项各15字以内
+- 植入话术单独不计入总字数，素材逻辑分析、对度小满的借鉴、植入修改建议三项总字数控制在100字以内
 - 不要分点罗列，每项一段话连贯输出
 - 语言精炼直接，不给铺垫过程
 - 植入顺着原素材情绪走，不自夸不生硬
@@ -117,7 +139,13 @@ const ANALYSIS_PROMPT = `# 角色
   "内容方向": "不想既丢钱又丢朋友，就记住：没做好送钱的准备，一分都别借。",
   "素材逻辑分析": "被借钱者受害者视角，借钱方占便宜、试探底线、施压人情，被借方羞耻绑架、承担风险、人财两空。核心结论：借钱＝拿钱买仇人，赠予心态才可例外。",
   "对度小满的借鉴": "借势熟人借贷伤感情高风险的情绪，反向论证正规平台是正向替代方案。核心策略：品牌接住观众'不伤感情+不求人'的需求，成为两难后的最优解。",
-  "植入修改建议": "在'找银行借钱要付利息'处接入'找银行借钱要付利息，但银行还不一定借给你；找度小满，明码标价，利息清楚，到账快，不欠人情不伤感情。那你说，你为啥还要找朋友开口？'核心逻辑：把'向朋友借'的熟人借贷痛点转化为'用正规平台'的解决方案。"
+  "植入修改建议": "在'找银行借钱要付利息'处接入'找银行借钱要付利息，但银行还不一定借给你；找度小满，明码标价，利息清楚，到账快，不欠人情不伤感情。那你说，你为啥还要找朋友开口？'核心逻辑：把'向朋友借'的熟人借贷痛点转化为'用正规平台'的解决方案。",
+  "适配达人": {
+    "表现形式": "口播",
+    "语速与风格": "中速、犀利、利落",
+    "口吻": "犀利点评",
+    "推荐达人类型": "财经、职场、情感观点"
+  }
 }`;
 
 // ==============================
@@ -227,7 +255,7 @@ async function searchDouyin(keyword) {
   return awemeList;
 }
 
-// Step 3: 提取视频脚本
+// Step 3: 提取视频脚本（同时获取视频表现特征元信息）
 async function extractVideoScript(videoUrl) {
   const response = await fetch(`${AIHUBMIX_BASE_URL}/chat/completions`, {
     method: 'POST',
@@ -242,7 +270,7 @@ async function extractVideoScript(videoUrl) {
         {
           role: 'user',
           content: [
-            { type: 'text', text: '请转录这个视频中的全部台词内容，标注说话人。完整输出，不要省略。' },
+            { type: 'text', text: '请转录这个视频中的全部台词内容，标注说话人。完整输出，不要省略。转录完成后输出视频表现特征元信息。' },
             { type: 'video_url', video_url: { url: videoUrl } }
           ]
         }
@@ -259,16 +287,47 @@ async function extractVideoScript(videoUrl) {
   }
 
   const data = await response.json();
-  return data.choices[0].message.content;
+  const content = data.choices[0].message.content.trim();
+
+  // 解析 ---META--- 分隔符，分离脚本和元信息
+  const metaSeparator = '---META---';
+  const metaIdx = content.lastIndexOf(metaSeparator);
+  let script = content;
+  let meta = {};
+
+  if (metaIdx !== -1) {
+    script = content.substring(0, metaIdx).trim();
+    const metaJsonStr = content.substring(metaIdx + metaSeparator.length).trim();
+    try {
+      const parsed = JSON.parse(metaJsonStr);
+      meta = {
+        表现形式: parsed.表现形式 || '',
+        语速: parsed.语速 || '',
+        说话风格: parsed.说话风格 || ''
+      };
+    } catch (e) {
+      log(`   ⚠️ 视频元信息JSON解析失败，仅使用脚本`);
+    }
+  }
+
+  return { script, meta };
 }
 
 // Step 4: 分析创意价值
-async function analyzeCreative(title, script) {
+async function analyzeCreative(title, script, meta) {
+  let metaSection = '';
+  if (meta && meta.表现形式) {
+    metaSection = '\n\n# 视频表现特征（由视频模型观察得出，分析「适配达人」时请参考）\n'
+      + `- 表现形式：${meta.表现形式}\n`
+      + `- 语速：${meta.语速}\n`
+      + `- 说话风格：${meta.说话风格}`;
+  }
+
   const userInput = `# 输入
 
 脚本标题：${title}
 脚本内容：
-${script}`;
+${script}${metaSection}`;
 
   const response = await fetch(`${AIHUBMIX_BASE_URL}/chat/completions`, {
     method: 'POST',
@@ -452,6 +511,21 @@ function fetchExistingIds() {
   }
 }
 
+// 格式化「适配达人」分析结果为飞书表格可写入的多行文本
+function formatAdaptation(adaptation) {
+  if (!adaptation) return '';
+  if (typeof adaptation === 'string') return adaptation;
+  if (typeof adaptation === 'object') {
+    const parts = [];
+    if (adaptation['表现形式']) parts.push(`表现形式：${adaptation['表现形式']}`);
+    if (adaptation['语速与风格']) parts.push(`语速与风格：${adaptation['语速与风格']}`);
+    if (adaptation['口吻']) parts.push(`口吻：${adaptation['口吻']}`);
+    if (adaptation['推荐达人类型']) parts.push(`推荐达人类型：${adaptation['推荐达人类型']}`);
+    return parts.join('\n');
+  }
+  return '';
+}
+
 // Step 3 自动化：构建 payload 并写入多维表格
 function writeToBitable(results) {
   if (results.length === 0) {
@@ -477,6 +551,7 @@ function writeToBitable(results) {
       '内容方向': analysis['内容方向'] || '',
       '内容分析': analysis['素材逻辑分析'] || '',
       '广告可借鉴点': adInsight,
+      '适配达人': formatAdaptation(analysis['适配达人']),
       '更新时间': todayStr
     };
   });
@@ -724,8 +799,8 @@ async function main() {
       log(`   [${i + 1}/${candidates.length}] 处理: ${candidate.aweme_id} — ${candidate.desc.substring(0, 50)}`);
 
       try {
-        // 提取脚本
-        const script = await extractVideoScript(candidate.download_url);
+        // 提取脚本 + 视频表现特征
+        const { script, meta } = await extractVideoScript(candidate.download_url);
         log(`   [${candidate.aweme_id}] 脚本长度: ${script.length} 字`);
 
         // 检查全程未开口说话
@@ -740,8 +815,8 @@ async function main() {
           return { status: 'skipped', aweme_id: candidate.aweme_id, desc: candidate.desc, reason: 'forbidden_content' };
         }
 
-        // 分析创意
-        const analysis = await analyzeCreative(candidate.desc, script);
+        // 分析创意（传入视频表现特征）
+        const analysis = await analyzeCreative(candidate.desc, script, meta);
         log(`   [${candidate.aweme_id}] ✅ 分析完成`);
 
         return {
