@@ -8,6 +8,7 @@
 script_*.txt
 video_temp.mp4
 bitable_payload_*.json
+.recent_keywords.json
 
 # 系统文件
 .DS_Store

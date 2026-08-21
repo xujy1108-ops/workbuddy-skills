@@ -1,0 +1,13 @@
+# 环境变量（含密钥）
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 步骤输出文件
+step2_materials.json
+step3_directions.json
+step5_outlines.json
+step6_scripts.json
+style.json

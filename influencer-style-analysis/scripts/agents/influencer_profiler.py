@@ -33,6 +33,7 @@ _SYSTEM_PROMPT = """# Role
 {
   "basic_positioning": {
     "nickname": "达人昵称",
+    "": "达人类型，这个类型需要给到"
     "core_persona": "人设一句话总结，需突出差异化与记忆点，<=40字",
     "content_tracks": [
       "核心赛道1（<=10字）",
