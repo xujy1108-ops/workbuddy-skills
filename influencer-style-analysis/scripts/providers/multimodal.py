@@ -1,4 +1,7 @@
-"""经 inferera OpenAI 兼容接口调用 Doubao 多模态模型（发送 video_url 分析视频）。"""
+"""经 inferera OpenAI 兼容接口调用多模态模型（发送 video_url 分析视频）。
+
+模型：qwen3-vl-plus（与 creative-content-analysis 的转录模型一致，走同一 AIHubMix/inferera 网关）。
+"""
 
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def _create_client() -> OpenAI:
     settings = get_settings()
-    api_key = settings.doubao_api_key or settings.anthropic_api_key
+    api_key = settings.video_api_key or settings.anthropic_api_key
     proxy = settings.https_proxy or settings.http_proxy
     http_client = (
         httpx.Client(proxy=proxy, timeout=300.0)
@@ -25,7 +28,7 @@ def _create_client() -> OpenAI:
     )
     return OpenAI(
         api_key=api_key,
-        base_url=settings.doubao_base_url.rstrip("/"),
+        base_url=settings.video_base_url.rstrip("/"),
         http_client=http_client,
     )
 
@@ -46,11 +49,11 @@ def run_video_analysis(
     max_tokens: int = 8192,
 ) -> AgentResult:
     """
-    调用 Doubao 多模态 Chat Completions，发送 video_url 让大模型直接看视频分析。
+    调用多模态 Chat Completions，发送 video_url 让大模型直接看视频分析。
     失败时直接抛异常，由调用方决定是否尝试下一个视频。
     """
     settings = get_settings()
-    model = settings.doubao_model
+    model = settings.video_model
     client = _create_client()
     max_tok = max_tokens or 8192
 
@@ -100,9 +103,9 @@ def run_text_analysis(
     user_text: str,
     max_tokens: int = 8192,
 ) -> AgentResult:
-    """调用 Doubao Chat Completions（纯文本，无视频），用于合并多次视频分析结果。"""
+    """调用 Chat Completions（纯文本，无视频），用于合并多次视频分析结果。"""
     settings = get_settings()
-    model = settings.doubao_model
+    model = settings.video_model
     client = _create_client()
     max_tok = max_tokens or 8192
 

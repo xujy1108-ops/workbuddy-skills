@@ -1,6 +1,6 @@
 ---
 name: influencer-style-analysis
-description: "达人风格识别技能。通过抖音主页链接或 sec_user_id，经 TikHub API 拉取达人数据（简介、视频列表），筛选视频并使用 Doubao 多模态大模型直接看视频分析达人风格，输出包含人设定位、受众洞察、多模态风格、流量逻辑、商业逻辑、脚本生成指南的结构化 JSON。当用户提到达人分析、达人风格、风格识别、创作者风格、达人画像、influencer profiler 等关键词时触发此技能。"
+description: "达人风格识别技能。通过抖音主页链接或 sec_user_id，经 TikHub API 拉取达人数据（简介、视频列表），筛选视频并使用千问多模态大模型直接看视频分析达人风格，输出包含基础定位（含达人自身画像）、受众洞察的结构化 JSON。当用户提到达人分析、达人风格、风格识别、创作者风格、达人画像、influencer profiler 等关键词时触发此技能。"
 agent_created: true
 ---
 
@@ -8,7 +8,7 @@ agent_created: true
 
 ## Overview
 
-通过抖音达人主页链接，经 TikHub API 拉取达人数据（简介、视频列表），筛选出可分析的视频，使用 Doubao 多模态大模型（doubao-seed-2-1-pro）直接看视频分析达人风格，输出包含人设定位、受众洞察、多模态风格、流量逻辑、商业逻辑和脚本生成指南的结构化 JSON。
+通过抖音达人主页链接，经 TikHub API 拉取达人数据（简介、视频列表），筛选出可分析的视频，使用千问多模态大模型（qwen3-vl-plus）直接看视频分析达人风格（与 creative-content-analysis 同网关同模型），输出包含基础定位（含达人自身画像）、受众洞察的结构化 JSON。
 
 ## 架构概览
 
@@ -29,23 +29,20 @@ TikHub API 拉取达人作品列表
     └── 从 url_list 中选 api.amemv.com 域名链接（兜底取最后一个）
     │
     ▼
-Doubao 多模态 LLM 分析（逐个视频，方案A）
-    ├── 看视频：口吻、语气、语速节奏、情绪、画面风格、视觉元素
-    └── 读文本：bio → 人设定位
+千问多模态 LLM 分析（逐个视频，方案A）
+    ├── 看视频：口吻、语气、语速节奏、情绪、画面风格、视觉元素、达人外貌/年龄/穿搭
+    └── 读文本：bio → 人设定位、职业身份、资产层次
     │
     ▼
 LLM 二次合并（多视频时）
     └── 综合多次分析结果 → 归纳最终风格画像
     │
     ▼
-JSON 输出（7 大维度）
-    ├── basic_positioning（基础定位）
-    ├── audience_insight（受众洞察）
-    ├── multimodal_style（多模态风格）
-    ├── traffic_logic（流量逻辑）
-    ├── commercial_logic（商业逻辑）
-    ├── taboos_and_risks（禁忌与风险）
-    └── ai_scripting_guide（脚本生成指南）
+JSON 输出（2 大维度）
+    ├── basic_positioning（基础定位 + 达人自身画像）
+    │   ├── nickname, influencer_type, core_persona, content_tracks[]
+    │   └── influencer_demographic（年龄/性别/职业/career_identity职业身份核实/外貌/讲话/资产/语速/情绪/视觉/标签）
+    └── audience_insight（受众洞察）
 ```
 
 ## 触发条件
@@ -57,6 +54,19 @@ JSON 输出（7 大维度）
 - 提供抖音主页链接要求分析
 
 ## 工作流程
+
+### Step 0: 询问人工补充信息（每次分析前必做）
+
+开始分析前，**必须先问用户是否有需要人工补充的信息**，给出以下模板让用户填写（用户没有要补的就回"无"，直接进入 Step 1）：
+
+```
+1. 达人职业：
+2. 资产层次：
+3. 其他补充：
+```
+
+- **「其他补充」是兜底项**：凡不属于「达人职业」「资产层次」的信息（拍摄方式、出镜人数、单人/双人共说台词、机位、真实身份背景、从业经历等）统一写在这里
+- 用户补充的内容**优先级最高**：产出时以人工补充为准，覆盖模型从 bio / 视频推断的结果
 
 ### Step 1: 接收输入
 
@@ -72,6 +82,29 @@ JSON 输出（7 大维度）
    ```json
    {"sec_user_id": "MS4wLjABAAAA..."}
    ```
+
+**带人工补充信息时**，在入参中加 `manual_supplement`：
+
+```json
+{
+  "douyin_profile_url": "https://www.douyin.com/user/MS4w...",
+  "manual_supplement": {
+    "occupation": "金融助贷从业者",
+    "asset_level": "高",
+    "other": "拍摄方式：两个人（一男一女）都面向镜头，共说台词"
+  }
+}
+```
+
+`manual_supplement` 也支持传纯字符串（整体归入 other），或用扁平写法 `manual_occupation` / `manual_asset_level` / `manual_other`。
+
+**程序化强制覆盖规则**（不依赖模型自觉，人工补充优先）：
+
+| 人工字段 | 覆盖的产出字段 |
+|---|---|
+| `occupation` | `influencer_demographic.occupation`；同时 `career_identity` 置为 `{status: 有明确证据, description: 人工职业, evidence: 人工补充（用户提供）}` |
+| `asset_level` | `influencer_demographic.asset_level`（加"人工补充："前缀便于溯源） |
+| `other` | 追加到 `influencer_demographic.visual_symbols` 末尾，保证不丢失；同时注入 prompt，要求模型把其中与呈现相关的内容融入 `appearance` / `speech_style` |
 
 ### Step 2: TikHub 拉取达人数据
 
@@ -93,22 +126,18 @@ JSON 输出（7 大维度）
 5. 找不到 `api.amemv.com` 时，取 `url_list` 最后一个链接兜底
 6. **筛选结果为 0 个时，中断流程**，提示用户"没有可以分析的视频"
 
-### Step 4: Doubao 多模态 LLM 分析
+### Step 4: 千问多模态 LLM 分析
 
-调用 `scripts/providers/multimodal.py` 的 `run_video_analysis()`：
+调用 `scripts/providers/multimodal.py` 的 `run_video_analysis()`（内置分阶段耗时日志：TikHub/视频分析/合并）：
 
-- **模型**：doubao-seed-2-1-pro（通过 inferera OpenAI 兼容接口）
+- **模型**：qwen3-vl-plus（通过 inferera OpenAI 兼容接口；2026-09-09 实测单视频分析 ~15s，doubao-seed-2-1-pro 需数分钟）
 - **API 地址**：`https://api.inferera.com/v1/chat/completions`
 - **输入**：系统 prompt（风格分析指令）+ 用户文本（bio + nickname）+ video_url
 - **参数**：max_tokens=8192, temperature=0.3, timeout=300s
-- **分析维度**（7 大模块）：
-  - **基础定位**：人设一句话、核心赛道
+- **分析维度**（2 大模块）：
+  - **基础定位**：人设一句话、核心赛道、达人类型（格式"一级-二级"，依据《达人类型基础标准（终版）》，无匹配输出"无匹配-需补充"）；下属 `influencer_demographic` 子对象提取达人自身画像（年龄/性别/职业/外貌/讲话风格/资产层次/语速/情绪/视觉符号/风格标签）。
+  - **career_identity（职业身份核实，下游 script-creation 策略匹配的硬门槛）**：status（有明确证据=bio自述或口述明确提及职业/经营/从业经历；有间接线索=仅画面场景推断；无法判断=均无信息）+ description（职业经历描述，无证据写'未发现'）+ evidence（判定依据）。禁止编造，宁可'无法判断'不可拔高
   - **受众洞察**：人口统计特征、心理诉求
-  - **多模态风格**：语速动态描述、语气情绪、视觉符号、开放式风格标签
-  - **流量逻辑**：开头抓眼球 + 结尾留白策略
-  - **商业逻辑**：信任构建、适配品类、植入风格
-  - **禁忌与风险**：内容红线
-  - **脚本生成指南**：供下游 LLM 生成脚本的结构化指令
 
 **逐个视频调用（方案A）**：遍历选出的视频 URL，逐个调用大模型分析。全部成功后通过 LLM 二次合并为最终结果。单个失败则跳过继续，全部失败则报错中止。
 
@@ -128,7 +157,7 @@ scripts/
 │   └── influencer_profiler.py     # 主入口：run_influencer_profiler()
 ├── providers/
 │   ├── __init__.py
-│   └── multimodal.py              # Doubao 多模态调用（inferera OpenAI 兼容）
+│   └── multimodal.py              # 千问多模态调用（inferera OpenAI 兼容）
 ├── tools/
 │   ├── __init__.py
 │   └── tikhub.py                  # TikHub API 抖音数据拉取 + 视频筛选
@@ -157,9 +186,9 @@ scripts/
 | 变量 | 说明 |
 |------|------|
 | `TIKHUB_API_TOKEN` | TikHub API 令牌（拉取抖音达人数据） |
-| `DOUBAO_API_KEY` | Doubao/inferera API Key（视频分析） |
-| `DOUBAO_BASE_URL` | 接口地址，默认 `https://api.inferera.com/v1` |
-| `DOUBAO_MODEL` | 模型名，默认 `doubao-seed-2-1-pro` |
+| `VIDEO_API_KEY` | inferera API Key（视频分析，缺省回退 ANTHROPIC_API_KEY） |
+| `VIDEO_BASE_URL` | 接口地址，默认 `https://api.inferera.com/v1` |
+| `VIDEO_MODEL` | 模型名，默认 `qwen3-vl-plus` |
 
 ### 调用入口
 
@@ -181,9 +210,9 @@ print(result.text)  # JSON 字符串
 ## 分析设计原则
 
 1. **拒绝僵化标签**：禁止使用空泛枚举标签，必须用动态语言描述语速节奏、情绪基调和视觉符号
-2. **解耦流量与商业**：严格区分"流量互动逻辑"与"商业变现逻辑"，禁止混淆
-3. **克制推断边界**：基于视频样本分析，不过度推断具体转化率或强行适配不相关品类
-4. **多模态视角**：必须提取画面中的标志性视觉元素（穿搭、道具、机位、特效）
+2. **克制推断边界**：基于视频样本分析，不过度推断或强行适配不相关品类
+3. **多模态视角**：必须提取画面中的标志性视觉元素（穿搭、道具、机位、特效），并提取达人本人的外貌特征（年龄感、长相风格、穿搭层次）
+4. **达人自身画像**：从 bio + 视频可视化信息推断达人的年龄区间、职业身份、外貌特征、讲话风格、资产层次，不预设任何职业分类
 5. **开放式标签**：style_tags 根据达人实际特征动态提取，不限于固定枚举
 
 分析维度详见 `references/style-dimensions.md`。
@@ -198,9 +227,11 @@ print(result.text)  # JSON 字符串
 
 ## 注意事项
 
+- **千问内容审核拦截（data_inspection_failed）**：qwen3-vl-plus 对个别视频会报 `400 InternalError.Algo.DataInspectionFailed`，默认"最小2个视频"可能全被拦截。处理方式：用 `fetch_influencer_from_douyin(video_count=5)` 多取候选，逐个分析、失败跳过、成功 2 个即停，再走 LLM 合并（参考 `scripts/_run_analysis_retry.py`）
+- **勿复用 scripts 目录下的 analysis_result*.json 旧缓存**：这些是历史分析残留，可能是其他达人的结果，每次分析以本次运行输出为准
 - TikHub API 有调用频率限制，注意控速
 - 视频筛选按 `data_size` 升序排列，优先分析小文件以减少处理时间
 - 视频链接优先选 `api.amemv.com` 域名，该域名通常稳定可访问
 - 所有视频分析均失败时直接报错中止，不做文本兜底
 - 各字符串和数组字段有硬限制，超长自动截断（详见 `references/json-schema.md`）
-- 需要配置的 API Key：`TIKHUB_API_TOKEN`、`DOUBAO_API_KEY`
+- 需要配置的 API Key：`TIKHUB_API_TOKEN`、`ANTHROPIC_API_KEY`（或 `VIDEO_API_KEY`）

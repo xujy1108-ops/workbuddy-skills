@@ -34,15 +34,15 @@ class Settings(BaseSettings):
     http_proxy: Optional[str] = Field(default=None, alias="HTTP_PROXY")
     https_proxy: Optional[str] = Field(default=None, alias="HTTPS_PROXY")
 
-    # Doubao / inferera（influencer_profiler 视频分析，OpenAI 兼容）
-    doubao_api_key: Optional[str] = Field(default=None, alias="DOUBAO_API_KEY")
-    doubao_base_url: str = Field(
+    # 视频多模态分析（inferera OpenAI 兼容网关；qwen3-vl-plus，与 creative-content-analysis 一致）
+    video_api_key: Optional[str] = Field(default=None, alias="VIDEO_API_KEY")
+    video_base_url: str = Field(
         default="https://api.inferera.com/v1",
-        alias="DOUBAO_BASE_URL",
+        alias="VIDEO_BASE_URL",
     )
-    doubao_model: str = Field(
-        default="doubao-seed-2-1-pro",
-        alias="DOUBAO_MODEL",
+    video_model: str = Field(
+        default="qwen3-vl-plus",
+        alias="VIDEO_MODEL",
     )
 
     # TikHub（influencer_profiler 拉取抖音达人数据）
