@@ -676,7 +676,12 @@ async function main() {
       const heat = it.digg_count ? `赞${it.digg_count}` : (it.heat ? `热度${it.heat}` : '');
       log(`  ${i + 1}. ${it.topic}${heat ? ` (${heat})` : ''} score=${score}`);
     });
-    summary[ch] = items.slice(0, 5).map(it => ({ topic: it.topic, source: it.source, heat: it.heat, digg_count: it.digg_count, url: it.url }));
+    summary[ch] = items.slice(0, opts.top).map(it => ({
+      topic: it.topic, source: it.source, platform: it.platform,
+      heat: it.heat, digg_count: it.digg_count, url: it.url,
+      category: it.hot_word_type || it.category || '',  // 抖音类目（时政/财经/社会/科技/娱乐...）
+      creator: it.creator || '', heat_text: it.heat_text || ''
+    }));
   }
 
   log('\n============================================');

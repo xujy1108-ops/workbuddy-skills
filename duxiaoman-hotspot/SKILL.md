@@ -79,6 +79,7 @@ agent_created: true
 | `HOTSPOT_BASE_TOKEN` | 热点素材表 Base Token | `STMrbQgqma35dksI3WsclJlNnlc` |
 | `HOTSPOT_TABLE_ID` | 热点素材表 Table ID | `tblDpxkM7psozqeO` |
 | `DEEPSEEK_MODEL` | AI 判断模型 | `deepseek-v4-pro` |
+| `JUDGE_CONCURRENCY` | AI 判断并发数（2026-09-09 由串行改为并发限流，失败自动重试1次） | `6` |
 
 复制 `.env.example` 为 `.env` 填入实际密钥即可。
 
