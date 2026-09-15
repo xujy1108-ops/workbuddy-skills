@@ -45,7 +45,13 @@ CONTENT_STANDARD_DOC_URL = "https://kwza968lz1u.feishu.cn/docx/ZdJMd6L1uo7lkwxSg
 SOP_HOTSPOT_DOC_URL = "https://kwza968lz1u.feishu.cn/docx/OBkUdT47XoctsxxHBExce92Xn1c"
 SOP_NONHOTSPOT_DOC_URL = "https://kwza968lz1u.feishu.cn/docx/D3DQdyllxoEIgyxhHi4cyYzfnng"
 
-# 口播脚本评分标准文档（写稿后评分依据：第0条合规红线一票否决 + 8 维度各 0-2 分）
+# 策略库文档（SOP 顶部「素材取用流程」四步的取用对象：库内档位的台词公式／案例原句／角色定位等语料）
+# 按 track 分线注入：蹭热点方向 → 策略库-热点；其他方向 → 策略库-非热点
+LIBRARY_HOTSPOT_DOC_URL = "https://kwza968lz1u.feishu.cn/docx/SHdXdI0KQoJbfwxNq4mcePL5nxb"
+LIBRARY_NONHOTSPOT_DOC_URL = "https://kwza968lz1u.feishu.cn/docx/BBx1dVk5aoNIn6xgON2cppNKnkb"
+
+# 口播脚本评分标准文档（生成期**不打分**：注入用途为 ① 第0条红线一票否决依据；
+# ② 四类时间窗／链路四步／"传动"等定义源。其「使用规则」节规定 0/1/2 只对人工修改后版本打）
 SCORING_STANDARD_DOC_URL = "https://kwza968lz1u.feishu.cn/docx/WxwmdfYIeowjPLxvznWcfS7Nnle"
 
 

@@ -5,9 +5,13 @@
 __pycache__/
 *.pyc
 
-# 步骤输出文件
-step2_materials.json
-step3_directions.json
-step5_outlines.json
-step6_scripts.json
+# 步骤输出文件（含 _v2/_v3/_4A5A/_345 等带后缀变体）
+step2_materials*.json
+step3_directions*.json
+step5_outlines*.json
+step6_scripts*.json
+final_output*.json
 style.json
+
+# 场景标签维护脚本的输出产物
+scene_tag_mapping.json
