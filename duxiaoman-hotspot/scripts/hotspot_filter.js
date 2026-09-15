@@ -4,12 +4,23 @@
  * 度小满热点筛选 + 入表脚本（hotspot_filter.js）
  *
  * 流程：采集热点（复用 hotspot_collect.js）→ AI 判断是否符合度小满时事政策热点
- *       → 对符合的热点生成植入策略 → 按素材表 7 字段写入飞书多维表格
+ *       → 选语义锚点 + 数转折跳数 → 定植入方式 + 生成植入策略
+ *       → 按素材表 11 字段写入飞书多维表格
  *
  * 判断标准（度小满需求文档第二部分）：
  *   1. 和金融经济、民生经济相关；排除娱乐/网络游戏&赛事/汽车/美妆/时尚等非金融经济领域
  *   2. 和普罗大众相关且和钱直接/间接相关（养老/公积金/社保/国补/投资新政策等）；
  *      排除美国伊朗打仗、日韩摩擦等与普通人无关的宏大叙事
+ *
+ * 转折判据（2026-09-15 新增）：
+ *   锚点 = 热点与「借钱」共用的语义公共项，候选池：钱/收入/支出/借贷/征信/被骗
+ *   跳数 = 从热点到「借钱需求」的显式转折次数，**不算到品牌名**（度小满＝借钱渠道，同义替换不计跳）
+ *   植入方式由跳数决定：0 跳→直接阐述 / 1 跳→隐喻植入 / ≥2 跳→仅蹭热度（不生成植入策略）
+ *
+ * 到期复查（2026-09-15 新增，汰换=状态复查而非删除）：
+ *   时事政策 +7 天（查有无新进展：细则/执行日，有则续期）
+ *   头部达人 +7 天（查是否仍在讲同一话题）
+ *   平台热榜 +3 天（冷却淘汰，到期直接下线）
  *
  * 使用方法：
  *   node hotspot_filter.js [--input <collect.json>] [--channels ...] [--top 20] [--dry-run] [--debug]
@@ -81,13 +92,65 @@ function preFilter(item) {
   return { pass: true };
 }
 
+// ============ 转折判据：语义锚点 + 跳数 → 植入方式 ============
+// 锚点候选池（与飞书「语义锚点」字段的 select 选项严格一致，AI 只能从这里选）
+const ANCHOR_POOL = ['钱', '收入', '支出', '借贷', '征信', '被骗'];
+
+// 锚点别名归一（AI 偶尔写成同义词，按最长优先映射回候选池；'钱' 兜底放最后）
+const ANCHOR_ALIASES = [
+  ['借贷', '借贷'], ['贷款', '借贷'], ['借钱', '借贷'], ['信贷', '借贷'], ['融资', '借贷'],
+  ['征信', '征信'], ['信用记录', '征信'], ['信用', '征信'],
+  ['被骗', '被骗'], ['受骗', '被骗'], ['诈骗', '被骗'], ['反诈', '被骗'], ['骗子', '被骗'],
+  ['收入', '收入'], ['工资', '收入'], ['收益', '收入'], ['利息', '收入'], ['养老金', '收入'], ['补贴', '收入'],
+  ['支出', '支出'], ['消费', '支出'], ['花费', '支出'], ['开销', '支出'], ['月供', '支出'], ['还款', '支出'],
+  ['钱', '钱'], ['资金', '钱'], ['现金', '钱'], ['资产', '钱']
+];
+
+function normalizeAnchor(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '钱';
+  if (ANCHOR_POOL.includes(s)) return s;
+  for (const [alias, canonical] of ANCHOR_ALIASES) {
+    if (s.includes(alias)) return canonical;
+  }
+  return '钱';
+}
+
+// 跳数 → 植入方式（由规则硬判定，覆盖 AI 的自我判断，避免口径漂移）
+function placementFromHops(hops) {
+  if (hops <= 0) return '直接阐述';
+  if (hops === 1) return '隐喻植入';
+  return '仅蹭热度';
+}
+
+// 热点类型（决定到期复查口径）：时事政策 / 头部达人 / 平台热榜
+function classifyHotspotType(item) {
+  const p = item.platform || '';
+  if (p === 'gov' || p === 'gov_jiedu' || p === 'gov_zhengce') return '时事政策';
+  if (p === 'douyin_creator') return '头部达人';
+  const s = p + (item.source || '');
+  if (s.includes('政策') || s.includes('解读') || s.includes('文件') || s.includes('gov')) return '时事政策';
+  if (s.includes('达人') || s.includes('创作者') || s.includes('creator')) return '头部达人';
+  return '平台热榜';
+}
+
+// 到期复查间隔（天）：热榜短、政策与达人长
+const REVIEW_DAYS = { '平台热榜': 3, '时事政策': 7, '头部达人': 7 };
+
+function reviewDate(hotspotType, from) {
+  const days = REVIEW_DAYS[hotspotType] || 3;
+  const d = new Date(from.getTime() + days * 86400000);
+  return d.toISOString().substring(0, 10); // yyyy-MM-dd，飞书 datetime 字段接受
+}
+// =============================================================
+
 // ============ AI 判断 prompt（度小满时事政策热点 + 植入策略） ============
 const JUDGE_SYSTEM = '你是度小满金融信息流的资深选题编辑，只输出 JSON，不输出任何额外说明文字。';
 
 const JUDGE_PROMPT = `# 角色
-你是度小满的金融热点选题编辑，负责判断互联网热点是否适合做"度小满"品牌内容植入，并为符合的热点设计植入策略。
+你是度小满的金融热点选题编辑。你要做四件事：① 判断热点是否符合度小满；② 选出热点与「借钱」共用的语义锚点；③ 数出从热点到「借钱需求」的转折跳数；④ 按跳数给出植入方式与植入策略。
 
-# 判断标准（必须同时满足两条硬条件）
+# 第一步：符合度判断（两条硬条件必须同时满足）
 1. 领域：必须是金融经济、民生经济相关。排除娱乐、网络游戏及赛事、汽车、美妆、时尚等非金融经济领域。
 2. 受众与相关性：必须和普罗大众相关，且和"钱"直接或间接相关——如养老、公积金、社保、国补、投资市场新政策、借贷、利率、税收、消费补贴等与大众息息相关的经济内容。
    - 排除宏大叙事：美国伊朗打仗、日本韩国摩擦等与普通人钱袋子无关的国际政治内容不要。
@@ -96,21 +159,46 @@ const JUDGE_PROMPT = `# 角色
 1. 涉及具体个人（明星/网红/企业家本人）或具体公司品牌的热点不要——蹭此类热点会产生舆情。
 2. 涉及看病治病、小孩上学、结婚彩礼的相关热点或政策不要——借贷产品不允许给这些需求提供借贷。
 
-# 推理路径示例（符合时应这样思考植入策略）
-示例一：
-- 热点：国家推行数字人民币升级2.0版本
-- 判断：金融经济相关（钱币使用方式）+ 普罗大众相关（每个人都要用）+ 和钱直接相关 ✓ 符合
-- 植入策略：数字人民币存放在这里的钱会给利息，可用"国家发钱了"的噱头吸引关注（无政策风险，国家确给利息）；让大家关注利息进账的同时，也别忽略怎么借钱才更重要，不知道怎么选就选度小满——相比数字人民币利息，借钱踩坑影响更大。
+只有 fit=true 时才继续做第二至第四步；fit=false 时后面字段一律按"输出格式"里的占位规则填。
 
-示例二：
-- 热点：国家8月1号正式推行个人借贷出示综合融资成本明示表
-- 判断：借贷新规，金融经济相关 + 普罗大众都可能借贷 + 和钱直接相关 ✓ 符合
-- 植入策略：借贷新规关乎每个人经济生活，以前借钱被砍头息、隐形收费坑，新规让全部成本摊在阳光下；度小满响应新规，一直做合规借贷业务，以后可安全使用度小满解决周转问题。
+# 第二步：选语义锚点（决定转折难度的关键变量）
+锚点 = 热点与「借钱」之间共用的那个语义公共项。**必须从下面这个候选池里选一个，不要自造**：
+钱 / 收入 / 支出 / 借贷 / 征信 / 被骗
 
-示例三：
-- 热点：国家1月29号正式推行急难事项小额快救政策
-- 判断：小额快救属民生经济 + 救助金和钱相关 + 普罗大众相关 ✓ 符合
-- 植入策略：国家给救助金但有上限（不高于当地一个月低保标准），若有更大困难需要大额支出，可选度小满作为临时周转。
+找锚点的方法：先看这个热点里"和钱有关的那一层"，再判断哪一层能最直接地通向「借钱」。
+- 贷款贴息类 → 锚点「借贷」（贴息本身就是借钱成本，这条最近）
+- 货币/支付/存钱类 → 锚点「钱」（都要用钱、都关心钱怎么用）
+- 收入/工资/利息/补贴类 → 锚点「收入」
+- 消费/物价/月供类 → 锚点「支出」
+- 征信/信用体系类 → 锚点「征信」
+- 反诈/骗局/黑产类 → 锚点「被骗」
+
+**同一个热点通常能挂多个锚点，优先选离「借钱」最近的那个。**锚点选得越近，后面要转折的次数就越少。
+
+# 第三步：数转折跳数（口径必须严格遵守，这是判定的核心）
+跳数 = 从热点到「借钱需求」之间，**需要显式说出来的转折次数**。三条硬规则：
+
+规则一：**终点是「借钱」，不是品牌名。**
+度小满本身就是借钱渠道，所以"借钱 → 度小满"这一段是同义替换，**不计跳**。数到「借钱」就停。
+反例（错误算法）：把"借钱渠道 → 度小满"也算一跳，会凭空多出一跳。
+
+规则二：**先定锚点，再数跳数。**
+如果数出来 ≥2 跳，不要直接下结论，先回头换一个更近的锚点重新数一遍（见第二步）。很多时候不是热点太远，是锚点选远了。
+
+规则三：**区分「显式跳转」和「隐含前提」。**
+- 显式跳转 = 必须由文案说出来、听众需要被带着走的理解步骤 → 计入跳数
+- 隐含前提 = 听众默认成立、不必陈述的背景（例如"人都有支出"）→ 不计入跳数，**但也不许真的删掉**：它要在转折句里一笔带过，否则会出现"刚说你有钱、转头让你借钱"的逻辑断裂
+
+判例：
+- 贷款贴息 → 借钱：锚点「借贷」，贴息本身就是借钱成本。**0 跳**
+- 数字人民币（会给利息）→ 借钱：锚点「钱」，从"国家给你利息"一次转折到"急用钱的周转"。**1 跳**
+  隐含前提是"支出"——不单独陈述，用"收入能靠利息慢慢攒，支出等不起"这类从句一笔带过。
+- 网络反诈新规 → 借钱：锚点「被骗」，被骗过/怕被骗的人更需要正规借钱渠道。**1 跳**
+
+# 第四步：定植入方式（由跳数决定，不可自行改判）
+- 0 跳 → 直接阐述：概念同源，热点本身就是借钱话题，直接讲产品
+- 1 跳 → 隐喻植入：标准做法，用一次转折把热点引到借钱
+- ≥2 跳 → 仅蹭热度：只借热度做泛内容，**不做产品落点，strategy 必须填空字符串**
 
 # 当前待判断的热点
 平台：{platform}
@@ -123,7 +211,12 @@ const JUDGE_PROMPT = `# 角色
 {
   "fit": true 或 false,
   "reason": "用一两句说明是否满足两条硬条件，引用具体领域和相关性；不符合时说明违反哪条",
-  "strategy": "若 fit=true，按上面示例风格写出植入策略思考（含噱头/角度 + 度小满衔接逻辑）；若 fit=false，填空字符串"
+  "semantic_anchor": "钱|收入|支出|借贷|征信|被骗 中的一个；fit=false 时填 钱",
+  "hop_count": 整数，从热点到「借钱需求」的显式转折次数；fit=false 时填 0,
+  "hop_path": "用一个箭头串起显式转折节点，如：数字人民币（利息收入）→ 借钱需求；fit=false 时填空字符串",
+  "implicit_premise": "隐含前提节点（不计跳但必须在转折句里一笔带过）；没有则填空字符串",
+  "placement": "直接阐述|隐喻植入|仅蹭热度（必须与 hop_count 对应）；fit=false 时填空字符串",
+  "strategy": "hop_count 为 0 或 1 时写植入策略（含噱头/角度 + 度小满衔接逻辑，并体现锚点与转折句）；hop_count ≥2 或 fit=false 时必须填空字符串"
 }`;
 
 // ============ 标题归一化（去重用） ============
@@ -211,10 +304,17 @@ function makeHotId(item) {
   return `${prefix}_${date}_${short}`;
 }
 
-// ============ 生成热点概述（含溯源信息） ============
-function makeOverview(item, judge) {
+// ============ 生成热点概述（植入策略 + 转折判定依据 + 溯源信息） ============
+function makeOverview(item, judge, meta) {
   const parts = [];
   if (judge.strategy) parts.push(judge.strategy);
+  else if (meta.placement === '仅蹭热度') {
+    parts.push('【仅蹭热度】转折跳数 ≥2，只借热度做泛内容，不做产品落点。');
+  }
+  parts.push('——转折判定——');
+  parts.push(`语义锚点：${meta.anchor} | 转折跳数：${meta.hops} 跳 | 植入方式：${meta.placement}`);
+  if (judge.hop_path) parts.push(`转折路径：${judge.hop_path}`);
+  if (judge.implicit_premise) parts.push(`隐含前提：${judge.implicit_premise}（不计跳，但需在转折句里一笔带过）`);
   parts.push('——溯源信息——');
   parts.push(`平台：${item.platform || ''} | 来源：${item.source || ''}`);
   if (item.heat) parts.push(`热度值：${item.heat.toLocaleString()}`);
@@ -226,7 +326,7 @@ function makeOverview(item, judge) {
   return parts.join('\n');
 }
 
-// ============ 写入飞书热点素材表（7 字段） ============
+// ============ 写入飞书热点素材表（11 字段） ============
 function writeToBitable(records) {
   if (!HOTSPOT_BASE_TOKEN || !HOTSPOT_TABLE_ID) {
     log('⚠️ 未配置 HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID，跳过飞书写入');
@@ -242,9 +342,13 @@ function writeToBitable(records) {
     '热点ID': r.hot_id,
     '热点标题': r.topic,
     '热点概述': r.overview,
-    '热点类型': '时事政策',          // select 字段，符合的统一填
-    '植入方向': r.strategy,
-    '入库时间': today,                // datetime，写入当天
+    '热点类型': r.hotspot_type,        // select：时事政策 / 平台热榜 / 头部达人
+    '语义锚点': r.anchor,               // select：钱/收入/支出/借贷/征信/被骗
+    '转折跳数': r.hops,                 // number
+    '植入方式': r.placement,            // select：直接阐述 / 隐喻植入 / 仅蹭热度
+    '植入方向': r.strategy,             // 仅蹭热度时为空
+    '入库时间': today,                  // datetime，写入当天
+    '到期复查日': r.review_date,         // datetime，入库日 +3（热榜）/ +7（政策、达人）
     // 素材评分留空，由 hotspot_refine.js 手动精筛时回填
   }));
 
@@ -389,17 +493,51 @@ async function main() {
   const fitOnes = judged.filter(x => x.judge.fit);
   log(`\n✅ 符合度小满热点 ${fitOnes.length} / ${judged.length} 条`);
 
-  // Step 3: 生成热点ID + 概述，准备入表
-  const toWrite = fitOnes.map(x => ({
-    hot_id: makeHotId(x.item),
-    topic: x.item.topic,
-    overview: makeOverview(x.item, x.judge),
-    strategy: x.judge.strategy,
-    platform: x.item.platform,
-    source: x.item.source,
-    url: x.item.url,
-    heat: x.item.heat
-  }));
+  // Step 3: 归一锚点/跳数、按跳数硬判定植入方式、生成热点ID + 概述 + 到期复查日
+  const now = new Date();
+  const toWrite = fitOnes.map(x => {
+    const anchor = normalizeAnchor(x.judge.semantic_anchor);
+    const hops = Math.max(0, Math.round(Number(x.judge.hop_count) || 0));
+    const placement = placementFromHops(hops);
+    // 植入方式以跳数为准（防 AI 口径漂移）；≥2 跳一律不生成植入策略
+    const aiPlacement = String(x.judge.placement || '').trim();
+    if (aiPlacement && aiPlacement !== placement) {
+      log(`   ⚠️ 植入方式口径修正：AI=${aiPlacement} → 规则=${placement}（跳数 ${hops}）| ${x.item.topic?.substring(0, 24)}`);
+    }
+    const strategy = placement === '仅蹭热度' ? '' : String(x.judge.strategy || '');
+    const hotspotType = classifyHotspotType(x.item);
+    const meta = { anchor, hops, placement };
+    return {
+      hot_id: makeHotId(x.item),
+      topic: x.item.topic,
+      overview: makeOverview(x.item, x.judge, meta),
+      strategy,
+      hotspot_type: hotspotType,
+      anchor,
+      hops,
+      placement,
+      hop_path: String(x.judge.hop_path || ''),
+      review_date: reviewDate(hotspotType, now),
+      platform: x.item.platform,
+      source: x.item.source,
+      url: x.item.url,
+      heat: x.item.heat
+    };
+  });
+
+  // 跳数分布 + 复查到期分布（观察判定口径是否合理）
+  const hopDist = {};
+  const typeDist = {};
+  for (const r of toWrite) {
+    hopDist[r.hops] = (hopDist[r.hops] || 0) + 1;
+    typeDist[r.hotspot_type] = (typeDist[r.hotspot_type] || 0) + 1;
+  }
+  log(`\n📊 跳数分布：${Object.entries(hopDist).sort((a, b) => a[0] - b[0]).map(([k, v]) => `${k} 跳 ${v} 条`).join(' | ')}`);
+  log(`📊 热点类型：${Object.entries(typeDist).map(([k, v]) => `${k} ${v} 条`).join(' | ')}`);
+  const direct = toWrite.filter(r => r.placement === '直接阐述').length;
+  const metaphor = toWrite.filter(r => r.placement === '隐喻植入').length;
+  const bumpOnly = toWrite.filter(r => r.placement === '仅蹭热度').length;
+  log(`📊 植入方式：直接阐述 ${direct} | 隐喻植入 ${metaphor} | 仅蹭热度 ${bumpOnly}`);
 
   // Step 4: 写飞书（除非 dry-run）
   let writeResult = { success: 0, skipped: true };
@@ -418,8 +556,16 @@ async function main() {
     pre_skipped: preSkipped.slice(0, 20),
     total_judged: judged.length,
     total_fit: fitOnes.length,
+    hop_distribution: Object.keys(hopDist).sort((a, b) => a - b).map(k => ({ hops: Number(k), count: hopDist[k] })),
+    type_distribution: typeDist,
     fit_hotspots: toWrite.map(x => ({
       hot_id: x.hot_id, topic: x.topic, platform: x.platform,
+      hotspot_type: x.hotspot_type,
+      anchor: x.anchor,
+      hops: x.hops,
+      placement: x.placement,
+      hop_path: x.hop_path,
+      review_date: x.review_date,
       strategy: x.strategy.substring(0, 100) + (x.strategy.length > 100 ? '...' : '')
     })),
     not_fit: judged.filter(x => !x.judge.fit).map(x => ({
