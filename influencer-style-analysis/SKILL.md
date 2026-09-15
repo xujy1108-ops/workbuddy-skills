@@ -16,6 +16,9 @@ agent_created: true
 用户输入（抖音主页链接 / sec_user_id）
     │
     ▼
+Step 0 询问人工补充（达人职业 / 资产层次 / 其他补充，可全部留空）
+    │
+    ▼
 TikHub API 拉取达人作品列表
     ├── bio（达人简介）
     ├── author_nickname（达人昵称）
@@ -36,6 +39,9 @@ TikHub API 拉取达人作品列表
     ▼
 LLM 二次合并（多视频时）
     └── 综合多次分析结果 → 归纳最终风格画像
+    │
+    ▼
+人工补充强制覆盖（occupation / asset_level / other；留空则保持模型推断）
     │
     ▼
 JSON 输出（2 大维度）
@@ -164,6 +170,8 @@ scripts/
 ├── config/
 │   ├── __init__.py
 │   └── settings.py                # 环境变量配置（.env）
+├── _run_with_manual.py            # 运行入口：带人工补充 + 多候选视频 + 失败跳过
+├── _run_analysis_retry.py         # 运行入口：遇内容审核拦截时多取候选视频重试
 ├── requirements.txt
 └── .env.example
 ```
@@ -207,6 +215,37 @@ result = run_influencer_profiler("https://www.douyin.com/user/MS4w...")
 print(result.text)  # JSON 字符串
 ```
 
+### 带人工补充信息运行（推荐入口）
+
+```bash
+cd scripts
+
+# 带全部三项补充
+python _run_with_manual.py \
+  --url "https://www.douyin.com/user/MS4w..." \
+  --occupation "金融助贷从业者" \
+  --asset-level "高" \
+  --other "拍摄方式：一男一女双人共说台词"
+
+# 只补「其他补充」，前两项留空即不覆盖
+python _run_with_manual.py --url "https://www.douyin.com/user/MS4w..." --other "双人出镜共说台词"
+
+# 不做人工补充（等价纯推断）
+python _run_with_manual.py --url "https://www.douyin.com/user/MS4w..."
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--url` / `--sec-user-id` | 二选一，达人定位 |
+| `--occupation` | 人工补充：达人职业 |
+| `--asset-level` | 人工补充：资产层次 |
+| `--other` | 人工补充：其他补充 |
+| `--candidates` | 拉取候选视频数，默认 5（多拉是为规避千问内容审核拦截） |
+| `--target` | 成功分析目标数，默认 2 |
+| `--out` | 输出路径，默认 `analysis_result_manual_<日期>.json` |
+
+脚本内部流程：多拉候选视频 → 逐个分析、失败跳过、凑够 target 个即停 → LLM 二次合并 → 人工补充程序化强制覆盖 → 落盘 JSON。
+
 ## 分析设计原则
 
 1. **拒绝僵化标签**：禁止使用空泛枚举标签，必须用动态语言描述语速节奏、情绪基调和视觉符号
@@ -227,11 +266,13 @@ print(result.text)  # JSON 字符串
 
 ## 注意事项
 
-- **千问内容审核拦截（data_inspection_failed）**：qwen3-vl-plus 对个别视频会报 `400 InternalError.Algo.DataInspectionFailed`，默认"最小2个视频"可能全被拦截。处理方式：用 `fetch_influencer_from_douyin(video_count=5)` 多取候选，逐个分析、失败跳过、成功 2 个即停，再走 LLM 合并（参考 `scripts/_run_analysis_retry.py`）
+- **带人工补充信息一律走 `scripts/_run_with_manual.py`**：它是唯一支持 `--occupation/--asset-level/--other` 的入口，跑完自动执行人工补充强制覆盖；直接调 `run_influencer_profiler()` 需要自己按 Step 1 的 JSON 结构传 `manual_supplement`
+- **千问内容审核拦截（data_inspection_failed）**：qwen3-vl-plus 对个别视频会报 `400 InternalError.Algo.DataInspectionFailed`，默认"最小2个视频"可能全被拦截。处理方式：用 `--candidates 5` 多取候选，逐个分析、失败跳过、成功 2 个即停（`_run_with_manual.py` 与 `scripts/_run_analysis_retry.py` 均已内置该逻辑）
 - **勿复用 scripts 目录下的 analysis_result*.json 旧缓存**：这些是历史分析残留，可能是其他达人的结果，每次分析以本次运行输出为准
 - TikHub API 有调用频率限制，注意控速
 - 视频筛选按 `data_size` 升序排列，优先分析小文件以减少处理时间
 - 视频链接优先选 `api.amemv.com` 域名，该域名通常稳定可访问
 - 所有视频分析均失败时直接报错中止，不做文本兜底
-- 各字符串和数组字段有硬限制，超长自动截断（详见 `references/json-schema.md`）
+- 各字符串和数组字段有硬限制，超长按**标点感知**方式截断（回退到最近标点，不会拦腰切句；无标点可用时补 `…`），详见 `references/json-schema.md`
 - 需要配置的 API Key：`TIKHUB_API_TOKEN`、`ANTHROPIC_API_KEY`（或 `VIDEO_API_KEY`）
+- **Python 环境**：依赖（anthropic / openai / httpx / pydantic-settings）已装在托管虚拟环境 `/Users/dzsb-002295/.workbuddy/binaries/python/envs/default`，直接用它运行脚本即可（`/Users/dzsb-002295/.workbuddy/binaries/python/envs/default/bin/python _run_with_manual.py ...`），不要往系统 Python 里装包

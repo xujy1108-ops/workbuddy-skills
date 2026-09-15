@@ -60,7 +60,7 @@ _SYSTEM_PROMPT = """# Role
   "basic_positioning": {
     "nickname": "达人昵称",
     "influencer_type": "达人类型，格式'一级-二级'（如'财经-泛财经''生活-民生'），必须从上方标准列表选取；无匹配则输出'无匹配-需补充'，<=10字",
-    "core_persona": "人设一句话总结，需突出差异化与记忆点，<=40字",
+    "core_persona": "人设一句话总结，需突出差异化与记忆点，<=50字",
     "content_tracks": [
       "核心赛道1（<=10字）",
       "核心赛道2（<=10字）"
@@ -75,7 +75,7 @@ _SYSTEM_PROMPT = """# Role
         "evidence": "判定依据（引用bio原文或口述内容，或注明画面线索），<=50字"
       },
       "appearance": "外貌与气质（如'正气硬朗，身姿挺拔''和蔼可亲，面部圆润'），<=25字",
-      "speech_style": "讲话风格与外显特质（如'伶牙俐齿，逻辑清晰''温和慢条斯理''直爽犀利'），<=25字",
+      "speech_style": "讲话风格与外显特质（如'伶牙俐齿，逻辑清晰''温和慢条斯理''直爽犀利'），<=35字",
       "asset_level": "资产层次推断（高/中/一般），理由。结合bio身份暗示和视频客观线索，如'bio中身份暗示较高收入+视频穿搭简约'或'未发现任何资产线索，整体偏一般'，<=40字",
       "verbal_pace": "语速：整体快/中/慢 + 约字数/分 + 关键变化点。禁止'随情绪动态调整'这类无结论描述。如'整体偏慢（约150字/分），讲核心观点时略提速'，<=45字",
       "tone_and_emotion": "语气与情绪基调，如'专业自信、略带犀利、不卑不亢'，<=20字",
@@ -138,7 +138,7 @@ _MERGE_SYSTEM_PROMPT = """# Role
   "basic_positioning": {
     "nickname": "达人昵称",
     "influencer_type": "达人类型，格式'一级-二级'，必须从上方标准列表选取；无匹配则输出'无匹配-需补充'，<=10字",
-    "core_persona": "人设一句话总结，需突出差异化与记忆点，<=40字",
+    "core_persona": "人设一句话总结，需突出差异化与记忆点，<=50字",
     "content_tracks": [
       "核心赛道1（<=10字）",
       "核心赛道2（<=10字）"
@@ -153,7 +153,7 @@ _MERGE_SYSTEM_PROMPT = """# Role
         "evidence": "判定依据（引用bio原文或口述内容），<=50字"
       },
       "appearance": "外貌与气质，<=25字",
-      "speech_style": "讲话风格，<=25字",
+      "speech_style": "讲话风格，<=35字",
       "asset_level": "资产层次推断（高/中/一般）及理由，<=40字",
       "verbal_pace": "语速：整体快/中/慢 + 约字数/分 + 关键变化点，<=45字",
       "tone_and_emotion": "语气与情绪基调，<=20字",
@@ -177,7 +177,7 @@ _MERGE_SYSTEM_PROMPT = """# Role
 # ── 字段长度限制（用于 _compact_result 硬截断）─────────────────
 
 _STRING_FIELD_LIMITS: dict[str, int] = {
-    "basic_positioning.core_persona": 40,
+    "basic_positioning.core_persona": 50,
     "basic_positioning.influencer_type": 10,
     "basic_positioning.influencer_demographic.age_range": 10,
     "basic_positioning.influencer_demographic.occupation": 30,
@@ -185,7 +185,7 @@ _STRING_FIELD_LIMITS: dict[str, int] = {
     "basic_positioning.influencer_demographic.career_identity.description": 30,
     "basic_positioning.influencer_demographic.career_identity.evidence": 50,
     "basic_positioning.influencer_demographic.appearance": 25,
-    "basic_positioning.influencer_demographic.speech_style": 25,
+    "basic_positioning.influencer_demographic.speech_style": 35,
     "basic_positioning.influencer_demographic.asset_level": 40,
     "basic_positioning.influencer_demographic.verbal_pace": 45,
     "basic_positioning.influencer_demographic.tone_and_emotion": 20,
@@ -439,8 +439,38 @@ def _ensure_complete_json(result: AgentResult) -> AgentResult:
     )
 
 
+# 截断回退优先级：先句末标点，再子句标点
+_PAUSE_LEVELS: tuple[str, ...] = ("。！？；", "，、,;：")
+_ALL_PAUSES = "".join(_PAUSE_LEVELS)
+
+
+def _smart_truncate(val: str, limit: int) -> str:
+    """超长时回退到最近标点，避免把句子拦腰切断。
+
+    1. 未超限 → 原样返回
+    2. 截断点恰好落在标点上 → 直接收
+    3. 优先回退到最近句末标点（。！？；），再退到子句标点（，、,;：）；
+       但回退后不得少于 limit 的 60%（下限 8 字），否则视为"标点太远"，放弃回退
+    4. 无可用标点 → 去掉末尾一字补省略号，既语义可知又不超限
+    """
+    if len(val) <= limit:
+        return val
+
+    head = val[:limit]
+    if head[-1] in _ALL_PAUSES:
+        return head
+
+    floor = max(8, int(limit * 0.6))
+    for pauses in _PAUSE_LEVELS:
+        idx = max(head.rfind(p) for p in pauses)
+        if idx + 1 >= floor:
+            return head[: idx + 1]
+
+    return head[: limit - 1] + "…"
+
+
 def _truncate_string(obj: dict[str, Any], path: str, limit: int) -> None:
-    """按 dotted path 截断字符串字段。"""
+    """按 dotted path 截断字符串字段（标点感知，避免拦腰切句）。"""
     keys = path.split(".")
     target = obj
     for k in keys[:-1]:
@@ -452,7 +482,7 @@ def _truncate_string(obj: dict[str, Any], path: str, limit: int) -> None:
     key = keys[-1]
     val = target.get(key)
     if isinstance(val, str) and len(val) > limit:
-        target[key] = val[:limit]
+        target[key] = _smart_truncate(val, limit)
 
 
 def _truncate_array(obj: dict[str, Any], path: str, limit: int) -> None:
