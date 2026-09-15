@@ -154,35 +154,58 @@ async function collectXhs(debug) {
 // ============ 三、快手热点采集 ============
 async function collectKuaishou(debug) {
   log('🔹 [快手] 抓取热榜...');
-  const raw = await tikhubGet('/api/v1/kuaishou/web/fetch_kuaishou_hot_list_v2');
-  if (debug) log(`   raw: ${JSON.stringify(raw).substring(0, 400)}`);
+  // web 版 fetch_kuaishou_hot_list_v2/v1 已失效（2026-09-15 起上游 HTTP 400）
+  // 改用 App 版热榜接口：热榜(boardType=1,boardId=1) + 社会榜(boardType=5,boardId=7)
+  // 结构：data.topHots[]（置顶）+ data.hots[]（榜单 50 条），字段 keyword / hotValue / viewCount
+  const boards = [
+    { boardType: 1, boardId: 1, label: '快手热榜' },
+    { boardType: 5, boardId: 7, label: '快手社会榜' }
+  ];
 
-  // 结构：data.topHots[]（置顶）+ data.hots[]（热榜 50 条）
-  // 字段：keyword / hotValue / hotWordType
-  const d = raw.data || {};
-  const topHots = Array.isArray(d.topHots) ? d.topHots : [];
-  const hots = Array.isArray(d.hots) ? d.hots : [];
+  const collected = [];
+  for (const b of boards) {
+    let raw;
+    try {
+      raw = await tikhubGet(`/api/v1/kuaishou/app/fetch_hot_board_detail?boardType=${b.boardType}&boardId=${b.boardId}`);
+    } catch (e) {
+      log(`   ⚠️ ${b.label} 抓取失败，跳过: ${(e.message || e).toString().substring(0, 120)}`);
+      continue;
+    }
+    if (debug) log(`   raw(${b.label}): ${JSON.stringify(raw).substring(0, 300)}`);
+    const d = raw.data || {};
+    const topHots = Array.isArray(d.topHots) ? d.topHots : [];
+    const hots = Array.isArray(d.hots) ? d.hots : [];
+    log(`   ${b.label} ${hots.length} 条（含置顶 ${topHots.length} 条）`);
+    collected.push(
+      ...topHots.map((it, i) => ({ it, label: `${b.label}置顶`, rank: i + 1 })),
+      ...hots.map((it, i) => ({ it, label: b.label, rank: i + 1 }))
+    );
+  }
 
-  if (topHots.length + hots.length === 0) {
+  if (collected.length === 0) {
     log('   ⚠️ 快手热榜无数据，跳过');
     return [];
   }
-  log(`   热榜 ${hots.length} 条（含置顶 ${topHots.length} 条）`);
 
-  const mapItem = (it, i, label) => ({
-    platform: 'kuaishou',
-    source: label,
-    topic: it.keyword || '',
-    rank: i + 1,
-    heat: Number(it.hotValue) || 0,
-    url: `https://www.kuaishou.com/search/video?searchWord=${encodeURIComponent(it.keyword || '')}`,
-    captured_at: new Date().toISOString()
-  });
+  // 去重：同关键词只保留首次出现（热榜优先于社会榜）
+  const seen = new Set();
+  const items = [];
+  for (const { it, label, rank } of collected) {
+    const topic = (it.keyword || '').trim();
+    if (!topic || seen.has(topic)) continue;
+    seen.add(topic);
+    items.push({
+      platform: 'kuaishou',
+      source: label,
+      topic,
+      rank,
+      heat: Number(it.hotValue || it.viewCount) || 0,
+      url: `https://www.kuaishou.com/search/video?searchWord=${encodeURIComponent(topic)}`,
+      captured_at: new Date().toISOString()
+    });
+  }
 
-  return [
-    ...topHots.map((it, i) => mapItem(it, i, '快手热榜置顶')),
-    ...hots.map((it, i) => mapItem(it, i, '快手热榜'))
-  ].filter(x => x.topic);
+  return items;
 }
 
 // ============ 四、微博热搜采集 ============
