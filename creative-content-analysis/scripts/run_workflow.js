@@ -8,7 +8,8 @@
  *
  * 默认行为（一条命令跑完）：
  *   1. 自动查询飞书多维表格已有素材 ID（去重）
- *   2. 生成关键词 → 搜索抖音 → 提取脚本 → 分析创意
+ *   2. 三来源生成关键词（策略直搜 + 策略衍生 + 开放探索AI自由衍生）
+ *      → 搜索抖音 → 提取脚本 → 分析创意
  *   3. 自动将结果写入飞书多维表格
  *   4. 如果 API 余额不足，自动给飞书发消息通知
  *
@@ -27,7 +28,9 @@
  *   AIHUBMIX_BASE_URL  - AIHubMix API 地址（默认 https://api.inferera.com/v1）
  *   TIKHUB_TOKEN       - TikHub API 令牌
  *   DEEPSEEK_MODEL     - DeepSeek 模型名（默认 deepseek-v4-pro）
- *   DOUBAO_MODEL       - 豆包模型名（默认 doubao-seed-2-1-pro）
+ *   TRANSCRIBE_MODEL   - 视频转录模型（默认 qwen3-vl-plus；兼容旧变量名 DOUBAO_MODEL）
+ *   SEARCH_PAGES       - 每个关键词搜索翻页数（默认 1，即每个词 10 条；2026-09-08 应用户要求由 2 调为 1 控制单次处理量）
+ *   WORKFLOW_CONCURRENCY - 并行处理并发数（默认 3）
  *
  * 输出：JSON 格式结果到 stdout，进度日志输出到 stderr
  */
@@ -41,13 +44,14 @@ const { execFileSync } = require('child_process');
 const CHECKPOINT_DIR = path.join(os.tmpdir(), 'duxiaoman-workflow');
 const CHECKPOINT_FILE = path.join(CHECKPOINT_DIR, 'checkpoint.json');
 
-function saveCheckpoint(keywords, candidates) {
+function saveCheckpoint(keywords, candidates, keywordDirs) {
   if (!fs.existsSync(CHECKPOINT_DIR)) {
     fs.mkdirSync(CHECKPOINT_DIR, { recursive: true });
   }
   const data = {
     savedAt: new Date().toISOString(),
     keywords,
+    keywordDirs: keywordDirs || keywords.map(k => ({ keyword: k, direction: '' })),
     candidates,
     processed: [] // 已处理的 aweme_id 列表
   };
@@ -81,7 +85,7 @@ function clearCheckpoint() {
 
 // ============ 近期关键词记忆（避免重复） ============
 const RECENT_KEYWORDS_FILE = path.join(__dirname, '..', '.recent_keywords.json');
-const MAX_RECENT_KEYWORDS = 9; // 保留最近3次运行的关键词
+const MAX_RECENT_KEYWORDS = 15; // 保留最近5次运行的关键词（2026-09-15 由 9 扩容，防模板词轮出记忆后复发）
 
 function loadRecentKeywords() {
   if (!fs.existsSync(RECENT_KEYWORDS_FILE)) {
@@ -102,15 +106,374 @@ function saveRecentKeywords(keywords) {
   log(`   💾 近期关键词已记录（共 ${recent.length} 个）`);
 }
 
+// ============ 关键词命中率统计与方向休眠 ============
+// 记录每个关键词的搜索数/通过数/成功数，用于：
+// 1. 命中率反馈：连续多次零产出的关键词注入 prompt，禁止 AI 再生成同类词
+// 2. 方向休眠：某方向累计多个关键词且总产出为 0，该方向临时休眠轮换
+const KEYWORD_STATS_FILE = path.join(__dirname, '..', '.keyword_stats.json');
+const MAX_STATS_KEYWORDS = 40; // 只保留最近 40 个关键词的统计
+const ZERO_STREAK_THRESHOLD = 2; // 连续 N 次零产出进入低效名单
+const DORMANT_DIR_MIN_KEYWORDS = 2; // 方向累计 N 个关键词且零产出才休眠
+
+function loadKeywordStats() {
+  if (!fs.existsSync(KEYWORD_STATS_FILE)) {
+    return { runs: 0, keywords: {} };
+  }
+  try {
+    const raw = fs.readFileSync(KEYWORD_STATS_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return { runs: parsed.runs || 0, keywords: parsed.keywords || {}, live_counts: parsed.live_counts || null };
+  } catch {
+    return { runs: 0, keywords: {} };
+  }
+}
+
+function saveKeywordStats(stats) {
+  fs.writeFileSync(KEYWORD_STATS_FILE, JSON.stringify(stats, null, 2));
+}
+
+// 构建注入关键词生成 prompt 的命中率反馈文本
+function buildHitRateFeedback() {
+  const stats = loadKeywordStats();
+  if (!stats.runs || Object.keys(stats.keywords).length === 0) return '';
+
+  // 连续多次零产出的关键词（低效关键词黑名单）
+  const zeroKeywords = Object.entries(stats.keywords)
+    .filter(([, v]) => (v.zero_streak || 0) >= ZERO_STREAK_THRESHOLD)
+    .map(([k, v]) => `${k}（连续${v.zero_streak}次零产出）`);
+
+  // 方向级聚合：累计关键词数 >= 2 且总成功数为 0 的方向 → 休眠
+  const dirAgg = {};
+  for (const [, v] of Object.entries(stats.keywords)) {
+    const d = v.direction || '';
+    if (!d) continue;
+    if (!dirAgg[d]) dirAgg[d] = { keywords: 0, success: 0 };
+    dirAgg[d].keywords += 1;
+    dirAgg[d].success += v.total_success || 0;
+  }
+  const dormantDirs = Object.entries(dirAgg)
+    .filter(([, v]) => v.keywords >= DORMANT_DIR_MIN_KEYWORDS && v.success === 0)
+    .map(([d]) => d);
+
+  // 来源级聚合：某来源累计关键词数 >= 2 且总成功数为 0 → 来源休眠提示
+  const srcAgg = {};
+  for (const [, v] of Object.entries(stats.keywords)) {
+    const s = v.source || '';
+    if (!s) continue;
+    if (!srcAgg[s]) srcAgg[s] = { keywords: 0, success: 0 };
+    srcAgg[s].keywords += 1;
+    srcAgg[s].success += v.total_success || 0;
+  }
+  const dormantSources = Object.entries(srcAgg)
+    .filter(([, v]) => v.keywords >= DORMANT_DIR_MIN_KEYWORDS && v.success === 0)
+    .map(([s]) => s);
+
+  const sourceNames = {
+    strategy_direct: '策略直搜', strategy_derive: '策略衍生',
+    explore_suggest: '搜索联想词', explore_comments: '高赞评论', explore_ai: 'AI衍生'
+  };
+
+  const lines = [];
+  if (zeroKeywords.length > 0) {
+    lines.push(`以下关键词近期连续多次搜索零产出（经真实搜索验证低效），禁止再生成相同或高度相似的词：\n${zeroKeywords.map(k => `- ${k}`).join('\n')}`);
+  }
+  if (dormantDirs.length > 0) {
+    lines.push(`以下方向已用多个关键词验证均为零产出，当前处于休眠期，本次请暂停选择这些方向（包括其衍生变体），改选其他方向：${dormantDirs.join('、')}`);
+  }
+  if (dormantSources.length > 0) {
+    const named = dormantSources.map(s => sourceNames[s] || s).join('、');
+    lines.push(`以下关键词来源已连续多轮零产出（休眠中），本次生成时请降低对这些来源的依赖，将配额让给其他来源：${named}`);
+  }
+  return lines.length > 0 ? `\n${lines.join('\n\n')}\n` : '';
+}
+
+// 运行结束时更新关键词统计
+// keywordDirs: [{keyword, direction, source}]，counts: { [keyword]: {searched, filtered, success} }
+function updateKeywordStats(keywordDirs, counts) {
+  const stats = loadKeywordStats();
+  stats.runs = (stats.runs || 0) + 1;
+  stats.keywords = stats.keywords || {};
+
+  for (const { keyword, direction, source } of keywordDirs) {
+    const c = counts[keyword] || { searched: 0, filtered: 0, success: 0 };
+    const prev = stats.keywords[keyword] || {
+      direction: direction || '', source: source || '', runs: 0,
+      total_searched: 0, total_filtered: 0, total_success: 0, zero_streak: 0
+    };
+    prev.direction = direction || prev.direction;
+    prev.source = source || prev.source;
+    prev.runs += 1;
+    prev.total_searched = (prev.total_searched || 0) + c.searched;
+    prev.total_filtered = (prev.total_filtered || 0) + c.filtered;
+    prev.total_success = (prev.total_success || 0) + c.success;
+    prev.zero_streak = c.success === 0 ? (prev.zero_streak || 0) + 1 : 0;
+    prev.last_run = new Date().toISOString();
+    stats.keywords[keyword] = prev;
+  }
+
+  // 防膨胀：按 last_run 排序只保留最近 MAX_STATS_KEYWORDS 个
+  const entries = Object.entries(stats.keywords);
+  if (entries.length > MAX_STATS_KEYWORDS) {
+    entries.sort((a, b) => String(a[1].last_run || '').localeCompare(String(b[1].last_run || '')));
+    stats.keywords = Object.fromEntries(entries.slice(-MAX_STATS_KEYWORDS));
+  }
+
+  // 正常跑完：清除中断容错快照（本轮 totals 已完整落盘）
+  delete stats.live_counts;
+  saveKeywordStats(stats);
+  log(`   💾 关键词命中率统计已更新（第 ${stats.runs} 次运行）`);
+}
+
+// ============ 关键词硬查重（生成后程序化校验，prompt 软约束之外的第二道防线） ============
+// 背景：2026-09-15 发现两个重复模式——
+// 1) 模型会无视 prompt 的"请勿重复"（当天把 5 小时前用过的原词一字不差重新生成）；
+// 2) 策略衍生的示例句式被克隆（货车司机/小超市/花店/奶茶店老板缺现金吗，4 轮同一模板）。
+// 因此生成后必须程序化查重：完全相同 / 包含关系 / 最长公共子串 ≥4 字（同模板、同词族）均拒绝。
+const DEDUP_MIN_COMMON = 4;
+
+function normalizeKeyword(kw) {
+  return String(kw || '').toLowerCase().replace(/[\s，。！？、,.!?:：;；'"“”‘’]/g, '');
+}
+
+function longestCommonSubstring(a, b) {
+  let best = '';
+  for (let i = 0; i < a.length; i++) {
+    for (let j = 0; j < b.length; j++) {
+      if (a[i] !== b[j]) continue;
+      let len = 0;
+      while (i + len < a.length && j + len < b.length && a[i + len] === b[j + len]) len++;
+      if (len > best.length) best = a.substring(i, i + len);
+    }
+  }
+  return best;
+}
+
+// 返回 null 表示通过，否则返回冲突原因文本
+function checkKeywordDup(keyword, existingWords) {
+  const norm = normalizeKeyword(keyword);
+  if (!norm) return '空关键词';
+  for (const w of existingWords) {
+    const wn = normalizeKeyword(w);
+    if (!wn) continue;
+    if (wn === norm) return `与已用词完全相同：${w}`;
+    if ((norm.includes(wn) && wn.length >= DEDUP_MIN_COMMON) ||
+        (wn.includes(norm) && norm.length >= DEDUP_MIN_COMMON)) {
+      return `是已用词「${w}」的同族变体`;
+    }
+    const lcs = longestCommonSubstring(norm, wn);
+    if (lcs.length >= DEDUP_MIN_COMMON) {
+      return `与已用词「${w}」共享句式片段「${lcs}」（同模板/同词族）`;
+    }
+  }
+  return null;
+}
+
+// 查重池 = 近期关键词 + 零产出黑名单
+function buildDedupPool() {
+  const recent = loadRecentKeywords();
+  const stats = loadKeywordStats();
+  const blacklist = Object.entries(stats.keywords || {})
+    .filter(([, v]) => (v.zero_streak || 0) >= ZERO_STREAK_THRESHOLD)
+    .map(([k]) => k);
+  return [...new Set([...recent, ...blacklist])];
+}
+
+// ============ 中断容错：live_counts（运行中逐条落盘，中断后下次运行恢复） ============
+// 背景：2026-09-15 前台运行两次被中断，stats 只在跑完才写，中断即丢——
+// 导致被中断 run 用过的关键词既没进零产出黑名单、成功率也没记录（explore 种子词选择失真）。
+function flushLiveCounts(updates) {
+  const stats = loadKeywordStats();
+  stats.live_counts = stats.live_counts || {};
+  for (const [kw, fields] of Object.entries(updates)) {
+    stats.live_counts[kw] = { ...(stats.live_counts[kw] || {}), ...fields };
+  }
+  saveKeywordStats(stats);
+}
+
+function recoverLiveCounts() {
+  const stats = loadKeywordStats();
+  const live = stats.live_counts;
+  if (!live || Object.keys(live).length === 0) return;
+  stats.keywords = stats.keywords || {};
+  for (const [kw, c] of Object.entries(live)) {
+    const prev = stats.keywords[kw] || {
+      direction: c.direction || '', source: c.source || '', runs: 0,
+      total_searched: 0, total_filtered: 0, total_success: 0, zero_streak: 0
+    };
+    prev.total_searched = (prev.total_searched || 0) + (c.searched || 0);
+    prev.total_filtered = (prev.total_filtered || 0) + (c.filtered || 0);
+    prev.total_success = (prev.total_success || 0) + (c.success || 0);
+    if ((c.success || 0) > 0) prev.zero_streak = 0;
+    prev.last_run = c.last_run || new Date().toISOString();
+    stats.keywords[kw] = prev;
+  }
+  delete stats.live_counts;
+  saveKeywordStats(stats);
+  log(`   ♻️ 已恢复上次中断运行的关键词统计：${Object.keys(live).join('、')}`);
+}
+
+// ============ 内容策略文档（关键词来源1/2：策略直搜 + 策略衍生） ============
+// 运行时动态拉取内容策略文档，解析 S/A 级策略方向注入 prompt。
+// 缓存 24h；拉取失败用过期缓存；缓存也没有用内置兜底清单。
+// 这样以后只需要在文档里加新方向，搜索策略自动跟上，代码不用改。
+const STRATEGY_DOC_URL = 'https://kwza968lz1u.feishu.cn/docx/WmZfdDUZKod80NxCKULccMM4n9d';
+const STRATEGY_CACHE_FILE = path.join(__dirname, '..', '.strategy_cache.json');
+const STRATEGY_CACHE_TTL = 24 * 60 * 60 * 1000;
+// 整类排除：接广告后的回应内容，不是可搜的素材场景
+const STRATEGY_EXCLUDE_L1 = ['回应解释'];
+
+// 内置兜底策略清单（文档拉取失败时使用，与策略文档保持同步）
+const FALLBACK_STRATEGIES = [
+  { l1: '蹭热点', l2: '时政新闻', level: 'S', definition: '国家发布最新的政策新闻，先吸睛再衔接到借钱话题' },
+  { l1: '揭秘自己', l2: '生意赚多少钱', level: 'S', definition: '聚焦表面光鲜、实则重资产/高现金流压力的特定人群，揭秘真实收入与资产结构，打破高收入=高存款的刻板印象' },
+  { l1: '揭秘自己', l2: '炒股是否财富自由', level: 'A', definition: '揭秘炒股博主的真实财务状况，打破暴富滤镜' },
+  { l1: '借钱高性价比', l2: '借便宜的钱', level: 'S', definition: '向普通人揭秘低利率时代借到便宜的钱就是优势的财富真相，破除借钱羞耻' },
+  { l1: '借钱高性价比', l2: '利息计算', level: 'A', definition: '揭秘网贷真实利率的计算陷阱（等额本息/IRR），打破利息认知盲区' },
+  { l1: '有钱人借钱', l2: '对比富人', level: 'S', definition: '对比富人借钱让钱流动与普通人死存钱的思维差异，打破借钱羞耻' },
+  { l1: '网贷测评', l2: '反向测评', level: 'S', definition: '以较真打假的反向测评视角，替粉丝找茬挑刺，亲自实测拆解网贷文案' },
+  { l1: '鸡汤', l2: '中年人借网贷不是堕落', level: 'S', definition: '共情中年人上有老下有小的生存重压，为中年人借网贷正名' },
+  { l1: '鸡汤', l2: '求人不如靠自己', level: 'S', definition: '揭露借钱伤感情、求人看脸色的残酷社交真相' },
+  { l1: '鸡汤', l2: '我为你们感到着急', level: 'S', definition: '以知心人身份共情粉丝缺钱时翻通讯录不敢打电话的卑微与窘境' },
+  { l1: '避坑', l2: '不要贪便宜', level: 'S', definition: '盘点普通人极易中招的钱财陷阱，以人间清醒视角硬核科普避坑指南' },
+  { l1: '拒绝借钱', l2: '如何有效拒绝借钱', level: 'A', definition: '解决借钱抹不开面子又伤人情、最后人财两空的问题' }
+];
+
+// 解析策略文档 markdown 中的表格（处理 rowspan 合并单元格）
+function parseStrategyTable(markdown) {
+  const tableStart = markdown.indexOf('<table>');
+  const tableEnd = markdown.indexOf('</table>');
+  if (tableStart === -1 || tableEnd === -1) return [];
+  const table = markdown.substring(tableStart, tableEnd);
+  const rows = table.match(/<tr>[\s\S]*?<\/tr>/g) || [];
+
+  const cellText = (cell) => cell
+    .replace(/<br\s*\/?>/g, ' ')
+    .replace(/<[^>]+>/g, '')
+    .trim();
+
+  const COLS = 7; // 内容方向一/二、定义、植入策略、策略等级、适合达人、正向案例
+  const spanLeft = new Array(COLS).fill(0);
+  const lastVal = new Array(COLS).fill('');
+  const out = [];
+
+  for (const row of rows) {
+    const cells = row.match(/<td[^>]*>[\s\S]*?<\/td>/g) || [];
+    if (cells.length === 0) continue;
+    const values = new Array(COLS).fill('');
+    let ci = 0;
+    for (let col = 0; col < COLS && ci < cells.length; col++) {
+      if (spanLeft[col] > 0) {
+        spanLeft[col] -= 1;
+        values[col] = lastVal[col];
+        continue;
+      }
+      const cell = cells[ci++];
+      const rowspanMatch = cell.match(/rowspan="(\d+)"/);
+      if (rowspanMatch) spanLeft[col] = parseInt(rowspanMatch[1], 10) - 1;
+      values[col] = cellText(cell);
+      lastVal[col] = values[col];
+    }
+    out.push(values);
+  }
+
+  // 列索引：0内容方向一 1内容方向二 2定义 3植入策略 4策略等级 5适合达人 6正向案例
+  return out
+    .filter(v => v[0] && v[1] && v[0] !== '内容方向一')
+    .filter(v => !STRATEGY_EXCLUDE_L1.includes(v[0]))
+    .filter(v => v[4] === 'S' || v[4] === 'A')
+    .map(v => ({ l1: v[0], l2: v[1], definition: v[2].substring(0, 120), level: v[4] }));
+}
+
+function fetchStrategyDoc() {
+  // 1. 新鲜缓存直接用（24h 内）
+  if (fs.existsSync(STRATEGY_CACHE_FILE)) {
+    try {
+      const cache = JSON.parse(fs.readFileSync(STRATEGY_CACHE_FILE, 'utf-8'));
+      if (cache.fetchedAt
+        && (Date.now() - new Date(cache.fetchedAt).getTime()) < STRATEGY_CACHE_TTL
+        && (cache.strategies || []).length > 0) {
+        log(`   ♻️ 使用策略文档缓存（${cache.strategies.length} 个 S/A 级策略方向，24h 内）`);
+        return cache.strategies;
+      }
+    } catch { /* 缓存损坏，继续拉取 */ }
+  }
+
+  // 2. 拉取文档
+  try {
+    const output = runLarkCli([
+      'docs', '+fetch',
+      '--doc', STRATEGY_DOC_URL,
+      '--doc-format', 'markdown',
+      '--as', 'user',
+      '--format', 'json'
+    ]);
+    const data = JSON.parse(output);
+    const content = data?.data?.document?.content || '';
+    const strategies = parseStrategyTable(content);
+    if (strategies.length > 0) {
+      fs.writeFileSync(STRATEGY_CACHE_FILE, JSON.stringify({
+        fetchedAt: new Date().toISOString(),
+        source: STRATEGY_DOC_URL,
+        strategies
+      }, null, 2));
+      log(`   📋 策略文档拉取成功：${strategies.length} 个 S/A 级策略方向（已缓存 24h）`);
+      return strategies;
+    }
+    throw new Error('解析到 0 个策略');
+  } catch (error) {
+    // 3. 过期缓存兜底
+    if (fs.existsSync(STRATEGY_CACHE_FILE)) {
+      try {
+        const cache = JSON.parse(fs.readFileSync(STRATEGY_CACHE_FILE, 'utf-8'));
+        if ((cache.strategies || []).length > 0) {
+          log(`   ⚠️ 策略文档拉取失败（${error.message.substring(0, 100)}），使用过期缓存`);
+          return cache.strategies;
+        }
+      } catch { /* fallthrough */ }
+    }
+    // 4. 内置清单兜底
+    log(`   ⚠️ 策略文档拉取失败，使用内置兜底清单（${FALLBACK_STRATEGIES.length} 个）`);
+    return FALLBACK_STRATEGIES;
+  }
+}
+
+// ============ 开放探索来源（来源3）：固定 AI 自由衍生 ============
+// 2026-09-15 用户约定：不再走种子词+抖音联想词通道（历史成功率最高的词当种子存在正反馈锁死问题，
+// 且联想词接口可用性不稳），来源3直接由 AI 按"人群处境/金钱摩擦/心理状态/社会现象"维度衍生新方向。
+
+// 视频高赞评论（按点赞排序）
+async function fetchVideoComments(awemeId, count = 20) {
+  const response = await fetch(`https://api.tikhub.io/api/v1/douyin/app/v3/fetch_video_comments?aweme_id=${awemeId}&cursor=0&count=${count}`, {
+    headers: { 'Authorization': `Bearer ${TIKHUB_TOKEN}` },
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!response.ok) throw new Error(`评论接口失败 (HTTP ${response.status})`);
+  const result = await response.json();
+  const comments = result.data?.comments || [];
+  return comments
+    .map(c => ({ text: (c.text || c.content || '').trim(), digg: c.digg_count || 0 }))
+    .filter(c => c.text.length >= 5)
+    .sort((a, b) => b.digg - a.digg);
+}
+
+// 构建开放探索素材：固定走 AI 自由衍生（不再有联想词/评论轮换与降级链路）
+function buildExploreMaterial(existingIds) {
+  return { type: 'explore_ai', text: '' };
+}
+
 // ============ 配置 ============
 const AIHUBMIX_API_KEY = process.env.AIHUBMIX_API_KEY;
 const AIHUBMIX_BASE_URL = process.env.AIHUBMIX_BASE_URL || 'https://api.inferera.com/v1';
 const TIKHUB_TOKEN = process.env.TIKHUB_TOKEN;
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro';
-const DOUBAO_MODEL = process.env.DOUBAO_MODEL || 'doubao-seed-2-1-pro';
+// 转录模型：2026-09-08 A/B 实测后由 doubao-seed-2-1-pro 切换为 qwen3-vl-plus（成本 ¥0.60→¥0.20/条，说话人归属准确性不降）
+// 兼容旧变量名 DOUBAO_MODEL；视频输入必须用直链（aweme_info 里的 play_addr），抖音页面 URL 已不稳定
+const TRANSCRIBE_MODEL = process.env.TRANSCRIBE_MODEL || process.env.DOUBAO_MODEL || 'qwen3-vl-plus';
 
 const MIN_DIGG_COUNT = 2000; // 最低点赞数
 const MAX_VIDEO_SIZE_MB = 50; // 豆包 API 视频文件大小限制
+// 高赞评论分析触发阈值：本轮新入库视频点赞 > 该值时，并行抓取高赞评论做创意策略分析
+const COMMENT_ANALYSIS_DIGG_THRESHOLD = parseInt(process.env.COMMENT_ANALYSIS_DIGG_THRESHOLD || '30000', 10);
 const FORBIDDEN_KEYWORDS = ['催收', '医疗', '看病', '住院', '手术', '上学', '学费', '开学', '助学贷款', '助学',
   '结婚', '彩礼',
   // 公检法/政府人群
@@ -135,68 +498,60 @@ const TITLE_FORBIDDEN_KEYWORDS = [
 // 飞书多维表格配置
 const BITABLE_BASE_TOKEN = process.env.BITABLE_BASE_TOKEN;
 const BITABLE_TABLE_ID = process.env.BITABLE_TABLE_ID;
+// 内容策略表（度小满-网络创意策略）：素材创意同步沉淀为内容策略行
+const STRATEGY_BASE_TOKEN = process.env.STRATEGY_BASE_TOKEN || 'EPYhbxo9TaUclysWuM0cgjkdnFf';
+const STRATEGY_TABLE_ID = process.env.STRATEGY_TABLE_ID || 'tblSZ8LbahG9GnCH';
 const LARK_CLI = 'lark-cli';
 // ==============================
 
 // ============ 提示词 ============
 
-const KEYWORD_PROMPT = `你是抖音内容素材策划专家，熟悉抖音平台的内容生态、用户情绪和话题传播逻辑。请围绕"资金周转困难"这个核心场景，生成3个抖音搜索关键词。
+const KEYWORD_PROMPT = `你是抖音内容素材策划专家，熟悉抖音平台的内容生态、用户情绪和话题传播逻辑。请围绕"资金周转困难"这个核心场景，生成3个抖音搜索关键词，分别来自以下3个来源：
 
-场景方向按重要性分为三个层级，请严格按比例选取：
+【来源1：策略直搜】（source 填 strategy_direct）
+从下方内容策略清单中选1个策略方向，把它"翻译"成普通用户真实会搜的词。不是照抄策略名，而是想：对这个话题感兴趣的真实用户，会在抖音搜什么。
+例：策略「揭秘自己-生意赚多少钱」→ 搜词"开店一年赚多少"；策略「借钱高性价比-利息计算」→ 搜词"网贷利息怎么算"；策略「拒绝借钱-如何有效拒绝借钱」→ 搜词"如何拒绝借钱"。
 
-【重点方向】（每次必须从中选2个，覆盖不同方向）
-1. 熟人借贷纠纷：被朋友/亲戚开口借钱、借了要不回来、借钱伤感情、不好意思拒绝
-2. 做生意资金周转：创业资金链断裂、进货缺钱、年底结账收不回款、周转不开
-3. 如何拒绝借钱：不想借钱给别人、怎么体面拒绝、拒绝借钱的理由、怎么说不伤感情
-4. 借钱遇到的困难：借钱时遇到的尴尬/困难/门槛、开口借钱难以启齿、借钱被拒的经历
+【来源2：策略衍生】（source 填 strategy_derive）
+从策略清单中选另一个策略（必须与来源1不同的策略方向，且不得选择下方"近期已使用的方向"里出现过的策略），先抽象出该策略的核心钩子公式，再实例化成全新搜索词。
+公式示例（仅示范"如何从策略抽象公式"，禁止套用句式模板）：「揭秘自己」的核心公式 = 高收入表象 vs 现金流紧张的反差；「网贷测评」的核心公式 = 较真打假替粉丝实测。生成时必须基于策略自身逻辑构造全新表达——同一句式骨架仅替换职业/人群/平台名也算重复（如近期已用过"花店老板缺现金吗"，就禁止再生成"XX老板缺现金吗"）。
 
-【一般方向】（每次从中选1个，与重点方向不重复）
-1. 因为什么原因要借钱：什么情况下需要借钱、借钱的理由和动机
-2. 借钱被坑经历：被熟人骗钱、担保踩坑、高利贷陷阱、网贷越借越多
-3. 银行贷款困境：普通人为什么银行借不出来、征信花了借不到钱、贷款被拒
-4. 突发用钱压力（仅限经营/投资类场景：日常经营周转、购置设备、扩大经营、创业启动、装修、购买大件。禁止看病、上学、结婚彩礼等方向）
+【来源3：开放探索】（source 填 explore）
+按下方"开放探索素材"的指示执行；若素材为空，则 AI 自主衍生1个与借钱/缺钱/用钱相关的新方向（可从这些维度切入：不同人群的借钱处境、不同关系的金钱摩擦、不同心理状态的缺钱体验、社会现象与钱的交织），不要困在策略清单里。
 
-【非重点方向】（偶尔出现，每3次运行最多替换1次一般方向的位置，不要每次都出现）
-1. 过来人东山再起：只选曾经因为借钱/负债陷入困境、后来已经还清债务并走出来的人，回顾分享当时借钱那段经历中的真实感受和教训。关键词必须聚焦"借钱/还债"本身（如"借的钱终于还清了""还清了所有借款"），不要用"负债还清了重新开始""走出低谷""改变磁场"这类泛化词——它们搜出的内容多为个人成长/心态/旅居类，与借钱毫无关系。
-2. 搞钱奋斗类：普通人怎么搞钱、副业赚钱、省钱过紧日子
+内容策略清单（来自内容策略文档，S=已验证成功 / A=可继续尝试）：
+__STRATEGY_LIST__
 
-【AI自主衍生方向】（不要只困在上述列表里，主动从抖音内容生态中衍生新方向。以下为启发维度，可以替换一般方向的位置）
-- 不同人群的借钱处境（年轻人第一笔贷款、中年人养家压力、老年人被骗借钱、大学生生活费不够）
-- 不同关系中的金钱摩擦（夫妻因钱吵架、兄弟姐妹分家产、合伙人翻脸、房东租客纠纷）
-- 不同心理状态的缺钱体验（不敢看手机余额、超市结账时算计、不敢接电话怕催款、朋友圈看别人消费的自卑）
-- 社会现象与钱的交织（彩礼压力、房子月供、农村留守家庭经济困境、打工人月底吃土）
-- 你观察到的抖音上其他真实存在且高讨论度的"钱"相关话题
+__EXPLORE_MATERIAL__
 
 选取规则：
-- 3个关键词 = 2个重点方向 + 1个一般方向
-- 第3个关键词可以来自一般方向、非重点方向、或AI自主衍生方向，三者轮换出现，保持多样性
-- 3个关键词必须覆盖不同的场景类型，不可重复同一方向
-- 避免与近期已使用的关键词重复或高度相似（近期已用关键词列表见下方），尽量从不同角度切入同一方向
-- 如果选"过来人"方向，关键词必须聚焦借钱/还债本身（如"借的钱终于还清了""还清了所有借款"），不要用"负债还清了重新开始""走出低谷""改变磁场"等泛化词。
+- 3个关键词必须来自3个不同来源（strategy_direct / strategy_derive / explore 各1个）
+- 来源1和来源2必须选择不同的策略方向，不可重复同一策略
+- 3个关键词覆盖不同的场景方向，不可重复同一方向
+- 来源3不得选取与近期已用词同词族的联想词（共享核心短语的变体均算重复，如近期已用过"借钱伤感情"，则"借钱伤感情XX"类联想词全部禁选）
+- 避免与近期已使用的关键词重复或高度相似
 
-要求如下：
+通用要求：
 
 话题原生性：关键词必须来自真实用户在抖音上自发讨论的内容方向，不能带有任何品牌卖点、产品功能或推广意图，要像普通用户会搜索的词一样自然。
 
-关键词形式：以3-8个字的通用搜索词为主，适当泛化以提高搜索量和结果质量。避免过于具体的长尾短语（如"借钱给亲戚要不回来怎么办"太长太窄），优先选择搜索量更高的短语（如"生意周转不开"、"怎么拒绝借钱"）。不要过于宽泛（如单个字"钱"），也不要超过10个字。
+关键词形式：以2-8个字的搜索词为主，优先选择高搜索量的短词；策略直搜类允许最长10字的自然短语（如"开店一年真的能赚多少"）。不要过于宽泛（如单个字"钱"）。
 
-内容聚焦性：关键词必须围绕"借钱、缺钱、资金周转"本身展开，借钱/缺钱是视频的核心议题而非引子。禁止生成"借钱见人心""借钱看清一个人""借钱试人品""借钱考验感情"这类把借钱当由头去讨论人心、人品、善良、信任的泛化话题——它们搜索量虽大，但结果严重偏离资金周转核心，产出的素材大多与借钱无关。
+内容聚焦性：关键词必须围绕"借钱、缺钱、资金周转、收入真相、用钱痛点"本身展开，借钱/缺钱是内容的核心议题而非引子。禁止生成"借钱见人心""借钱看清一个人""借钱试人品""借钱考验感情"这类把借钱当由头去讨论人心、人品、善良、信任的泛化话题——它们搜索量虽大，但结果严重偏离资金周转核心。
 
-内容多样性：3个关键词需要覆盖不同类型的内容形态，例如心理分析类、情绪记录类、真实案例分享类、人性讨论类、经验干货类等，不能全是同一类型。
-
-禁止预设案例：只输出关键词本身，不要预设或编造具体案例，让下一个agent自己去抖音搜索发现和筛选真实素材。
-
-禁止方向：不要生成「当下负债怎么翻身」「负债几十万怎么办」「以贷养贷」等引导负债人群继续借贷的关键词。过来人故事必须是已经走出困境的回顾视角，不是当下还在困境中找出路的求助视角。不要生成与公检法、法律科普、维权诉讼相关的关键词（如"怎么起诉老赖""报警立案"等），我们不需要政府/执法人员视角的内容。不要生成看病、上学、助学贷款、结婚彩礼等方向的突发用钱关键词。此外，以下关键词虽表面聚焦借钱，但抖音搜索结果几乎全部是法律科普/催收/维权干货类内容，会被内容过滤规则100%拦截，禁止生成：\n- "朋友借钱不还" / "借钱不还怎么办" / "老赖" / "欠钱不还" — 结果大量是民警普法、法律维权干货\n- "网贷逾期" / "网贷不还" / "网贷催收" — 结果大量涉及催收话题\n- "借钱见人心" / "借钱看清一个人" / "借钱试人品" — 结果是讨论人心/人品，偏离资金周转核心\n- "过来人负债经历" / "负债经历分享" — 太模糊，搜出来大量还在还债路上挣扎的人，不是已经成功翻身的人，对素材策划没有参考价值\n- "房贷断供" / "断供的后果" / "弃房断供" — 结果大量是政策分析、法拍房、信用破产等法律/金融科普内容，偏离个人借钱/资金周转核心\n- "借给亲戚的钱要不回来" / "年底结账收不回款" / "借钱容易要钱难" / "怎么讨债" / "怎么要回钱" / "收不回款" / "讨债" — 这类"讨债/要钱/收不回"方向的关键词，抖音搜索结果几乎全是法律维权、法院强制执行、民警调解类内容，会被内容过滤规则100%拦截，禁止生成。如果要聚焦"借钱伤感情"方向，应从"借钱时的尴尬/为难/伤感情"角度切入，而不是从"要不回来/讨债"角度\n- "中年人养家缺钱压力" / "中年人压力" / "人到中年不容易" — 过于泛化，搜出的内容多为情感抒发/歌改类视频，偏离借钱核心议题，禁止生成这类泛化情感方向\n应当生成聚焦借钱本身带来的情感、生活压力、人际关系变化的关键词，例如个人经历分享、真实故事记录、生活困境感悟等方向。
+禁止方向：不要生成「当下负债怎么翻身」「负债几十万怎么办」「以贷养贷」等引导负债人群继续借贷的关键词。不要生成与公检法、法律科普、维权诉讼相关的关键词（如"怎么起诉老赖""报警立案"）。不要生成看病、上学、助学贷款、结婚彩礼等方向的突发用钱关键词。此外，以下方向搜索结果几乎全是法律科普/催收/维权干货类内容，会被内容过滤规则100%拦截，禁止生成："朋友借钱不还"/"借钱不还怎么办"/"老赖"/"欠钱不还"/"网贷逾期"/"网贷催收"/"讨债"/"怎么要回钱"/"收不回款"/"房贷断供"/"法拍房"；"中年人压力"等泛化情感方向也禁止。
 
 __RECENT_KEYWORDS__
 
-输出格式：严格按以下JSON格式输出，不要增加任何额外字段、注释或说明文字：
+__HIT_RATE_FEEDBACK__
+
+输出格式：严格按以下JSON格式输出，不要增加任何额外字段、注释或说明文字。source 必须是 strategy_direct / strategy_derive / explore 三者之一；direction 填写该关键词所属的场景方向（用简短方向名，如：揭秘自己-生意赚多少钱、策略衍生-反差职业收入、联想词-借钱救急）：
 
 {
   "keywords": [
-    { "id": 1, "keyword": "完整的长尾搜索关键词" },
-    { "id": 2, "keyword": "完整的长尾搜索关键词" },
-    { "id": 3, "keyword": "完整的长尾搜索关键词" }
+    { "id": 1, "keyword": "搜索关键词", "source": "strategy_direct", "direction": "所属方向" },
+    { "id": 2, "keyword": "搜索关键词", "source": "strategy_derive", "direction": "所属方向" },
+    { "id": 3, "keyword": "搜索关键词", "source": "explore", "direction": "所属方向" }
   ]
 }`;
 
@@ -223,32 +578,55 @@ const ANALYSIS_PROMPT = `# 角色
 你是一位资深短视频编导，擅长拆解爆款素材的叙事逻辑，并为品牌广告提供可落地的植入策略。
 
 # 任务
-分析用户提供的脚本素材，完成六项输出，直接输出JSON。
+分析用户提供的脚本素材，完成七项输出（六项素材分析 + 一项内容策略分析），直接输出JSON。
 
 # 输出格式
 {
   "内容相关性": "强相关/弱相关/不相关",
+  "时效性": "长青 / 时效话题-未过气 / 时效话题-已过气",
   "内容方向": "用一句大白话总结整个脚本的叙事逻辑和核心主张，让观众一听就懂",
+  "场景": ["对镜口播"],
   "素材逻辑分析": "从叙事视角、双方行为画像、核心结论三个维度综合分析，一段话写清楚，直接给结论",
   "对度小满的借鉴": "从情绪借势、反向论证、核心策略三个维度综合分析，一段话写清楚核心策略",
   "植入修改建议": "包含植入锚点、修改后话术（用引号标出）、植入逻辑三个要素，一段话写清楚",
   "适配达人": {
-    "达人类型": "一级分类-二级分类，按达人类型分类标准判断，如：剧情-剧情搞笑",
+    "达人类型": "按达人类型分类标准判断，粒度规则：整个一级类型都适合就只写一级分类（如「财经」=财经下所有二级类型都适合）；仅当适配范围限定在某一二级类型时才写「一级-二级」（如：剧情-剧情搞笑）",
     "表现形式": "口播/剧情/AI生成/其他",
     "语速与风格": "语速快慢+说话风格，如：快、犀利",
     "口吻": "老登说教/犀利点评/真挚分享等",
     "推荐达人类型": "基于以上三点推导，2-3个类型，如：财经、职场、母婴亲子"
+  },
+  "内容策略": {
+    "内容方向一": "一级方向，优先从下方内容策略分析标准给出的枚举中选；确实不满足时新建（命名简短，与现有枚举风格一致）",
+    "内容方向二": "二级方向，优先从所属一级方向下属的二级枚举中选；确实不满足时新建（命名具体，能独立区分一批素材）",
+    "方向定义": "1-3句：目标人群+核心叙事+内容落点，讲清这个素材体现的方向边界",
+    "植入策略": "一句话打法概括+具体示例（讲清从内容到产品的完整推理链），沿用本素材实际的植入方式",
+    "适合达人": "达人类型（粒度同适配达人.达人类型：整个一级都适合只写一级，如「财经」；仅限某二级才写「一级-二级」），可附简要风格说明"
   }
 }
 
 # 内容相关性判断标准
-判断脚本内容是否真正围绕"借钱、缺钱、资金周转、债务"等核心议题展开：
-- 强相关：脚本核心主题就是借钱/缺钱/还钱/债务/资金周转，借钱是推动剧情或论述的主线
-- 弱相关：脚本提到了借钱，但只是作为众多情节之一，主线是其他主题（如正能量、心灵鸡汤、搞笑段子等）。或者：如果是"过来人"类内容，但当事人还在还债路上挣扎、尚未成功翻身，也算弱相关——我们需要的是已经走出来的成功者视角
-- 不相关：脚本与借钱/资金周转完全无关
+判断脚本内容是否真正围绕"借钱、缺钱、资金周转、债务、真实收入"等核心议题展开：
+- 强相关：脚本核心主题是借钱/缺钱/还钱/债务/资金周转；或者脚本核心是"揭秘真实收入与现金流压力"（如生意人揭秘年收入、打破高收入=高存款的刻板印象、收入构成与垫资压力），且借钱/周转是内容主线之一；或者是网贷平台实测/利息计算类内容
+- 弱相关：脚本提到了借钱或收入，但只是作为众多情节之一，主线是其他主题（如正能量、心灵鸡汤、搞笑段子等）。或者：如果是"过来人"类内容，但当事人还在还债路上挣扎、尚未成功翻身，也算弱相关——我们需要的是已经走出来的成功者视角
+- 不相关：脚本与借钱/资金周转/收入真相完全无关
+
+# 时效性判断标准
+判断素材是"永远不过期的人性/财务话题"还是"依赖特定时间窗口的时效内容"——这不是看发布时间，而是看内容内核：
+- **长青**：内容核心是人性、人情世故、普遍财务困境——不论什么时候拍都有共鸣，老视频反而沉淀好。典型：借钱伤感情、求人不如靠自己、有钱人借钱vs普通人死存钱、中年人借网贷不是堕落、不要给别人借钱、熟人借钱风险、借钱看清人心、守财避坑等。这类素材发布时间不参与判断，越老越好
+- **时效话题-已过气**：内容依赖某个特定时间窗口的平台功能/政策细则/阶段性热点/具体事件，发布时是热点，现在已经没人关注。典型：抖音小店先采后付（已过电商红利期）、某个具体平台的具体活动（活动已结束）、某条已落地的阶段性政策（后续已有更新）、某个具体人物的具体风波（热度已退）。判断关键：如果把素材里的"时间锚点"换成今天，观众还会关心吗？不会 → 已过气
+- **时效话题-未过气**：时效内容但当前仍处传播窗口内（如本季度的金融新规、本月的热点事件），仍有讨论价值
+
+# 场景判断标准（用于输出「场景」字段）
+判断这条素材的画面/情节发生在哪里——供后续按达人拍摄能力匹配素材（能拍剧情的、只能对镜口播的、能出户外的）。
+- 只能从以下枚举中选，可多选（一条素材跨多个场景时全部列出）：
+  **对镜口播**（全片为博主/讲师/女主等对镜讲述，无场景情节）、**酒席饭桌**、**居家室内**、**职场办公**、**户外街头**、**店铺商户**、**车内出行**、**线上通话**（电话/微信对话推进）、**工地工厂**、**其他**
+- 判定依据是脚本里的场景动作与地点线索（如"酒席上""从单元门走出""在办公室""在电话里"），不是内容主题；不要输出"借钱""职场故事"这类主题词
+- 纯对镜讲述、无任何场景情节的，必须选「对镜口播」，不要归入「其他」；确实无法判断具体场所、又不是纯口播的，才选「其他」
+- 场景是"物理/情境发生地"，不要编造脚本中没出现的地点
 
 # 达人类型分类标准（用于输出「达人类型」字段）
-根据脚本文案对照以下标准判断素材适配的达人类型，输出格式为「一级分类-二级分类」。
+根据脚本文案对照以下标准判断素材适配的达人类型。输出粒度规则：**如果素材内容适配整个一级类型（该一级下所有二级都适合），只输出一级分类（如「财经」）；仅当适配范围确实限定在某一二级类型时才输出「一级-二级」（如只适配剧情-剧情搞笑、不适配剧情-常规剧情）**。
 
 ## 标准类型（全部类型，只能从中选择）
 - 财经-泛财经：商业故事、个人财富、消费决策、搞钱思路、时政要闻等一切与金钱/财富/商业相关的点评输出观点，不含投资
@@ -261,18 +639,45 @@ const ANALYSIS_PROMPT = `# 角色
 - 剧情-常规剧情：1分钟以上、多人（非一人分饰多角）多场景演出，有完整叙事结构（人物关系、核心冲突、起承转合），环环相扣
 - 剧情-剧情搞笑：相比常规剧情逻辑可不严谨、可不到1分钟，无脑耍丑肢体搞笑为主，可有万万没想到式转折
 
-判断规则：必须且只能从上述 9 个标准类型中选择，以脚本文案的内容形态（叙事结构、表现形式、主题方向）为准判断，不是判断视频作者本人是什么达人。即使素材与所有标准类型的匹配度都不高，也必须选择范围最接近的那一个，禁止自创类型、禁止输出标准列表之外的类型。
+判断规则：必须且只能从上述 9 个标准类型（或其一级分类）中选择，以脚本文案的内容形态（叙事结构、表现形式、主题方向）为准判断，不是判断视频作者本人是什么达人。先判断适配粒度：内容适配整个一级类型下所有二级 → 只输出一级分类（如「财经」）；内容只适配其中某一个二级 → 输出「一级-二级」。即使素材与所有标准类型的匹配度都不高，也必须选择范围最接近的那一个，禁止自创类型、禁止输出标准列表之外的类型。
 
 # 适配达人分析要求
-- 达人类型：严格按「达人类型分类标准」判断，只能从 9 个标准类型中选范围最接近的一个，输出「一级分类-二级分类」格式，禁止自创类型
+- 达人类型：严格按「达人类型分类标准」判断，从 9 个标准类型中选范围最接近的；整个一级类型都适合时输出一级分类（如「财经」），仅限某一二级适合时才输出「一级-二级」，禁止自创类型
 - 表现形式：如输入中已提供「视频表现特征」，直接引用；否则从脚本结构推断（单人长段=口播，多人对话=剧情）。提示中列举的类型仅为参考，可根据实际情况自行补充其他类型
 - 语速与风格：如输入中已提供「视频表现特征」，直接引用；否则从脚本语言密度和标点推断。提示中列举的档位和风格仅为参考，可根据实际情况自行补充其他描述
 - 口吻：从脚本内容的说话态度和立场判断，提示中列举的类型仅为参考，可根据实际情况自行补充其他口吻描述
 - 推荐达人类型：综合表现形式、语速风格、口吻三个维度，推导什么类型的达人适合演绎这类脚本（自由描述，不受达人类型分类标准约束）
 
+# 内容策略分析标准（用于输出「内容策略」字段）
+把这条素材沉淀为一条内容策略：回答「这条内容走什么叙事方向、产品怎么植入、找什么达人拍」。
+
+## 内容方向一（一级方向，优先从以下枚举中选，不满足时可新建）
+- 蹭热点：借时政/政策新闻的注意力，先吸睛再承接
+- 揭秘自己：博主自曝真实收入与资产结构，打破刻板印象
+- 借钱高性价比：揭秘「借到便宜的钱就是优势」的财富真相
+- 利息计算：硬核数学计算拆解利率陷阱，建立专业信任
+- 有钱人借钱：对比富人/普通人的资金思维差异
+- 网贷测评：较真打假视角反向实测，欲扬先抑
+- 回应解释：承接上期广告话题，回应质疑或做常规科普
+- 鸡汤：共情中年人处境，先理解再劝告
+- 避坑：守财导师视角，盘点钱财陷阱
+- 拒绝借钱：解决「抹不开面子又伤人情」的社交痛点
+
+## 内容方向二（二级方向，优先选所属一级方向下的枚举，不满足时可新建）
+蹭热点：时政新闻｜揭秘自己：生意赚多少钱、炒股是否财富自由｜借钱高性价比：借便宜的钱｜利息计算：详细计算｜有钱人借钱：对比富人｜网贷测评：反向测评｜回应解释：回怼回应、常规回应｜鸡汤：中年人借网贷不是堕落、求人不如靠自己、我为你们感到着急｜避坑：不要贪便宜｜拒绝借钱：如何有效拒绝借钱
+
+## 判断规则
+1. 优先复用已有枚举：内容方向一和内容方向二先对照上述枚举判断，能贴合就选最贴切的那个（内容方向二必须在所选一级方向下属的二级枚举中选；切入角度不完全贴合时选语义最接近的，并在「方向定义」中说明具体角度）
+2. 新建判断标准：仅当素材的核心叙事在所有对应层级枚举中都找不到容身之处（强行套用会让方向失真、误导后续策略沉淀）时才新建。新建一级方向：命名简短（2-6字，与现有枚举风格一致），并在「方向定义」开头注明【新建方向】+一句话说明为什么已有方向都不适用；新建二级方向：必须挂靠一个一级方向（优先已有一级），命名要具体到能独立区分一批素材，同样在「方向定义」开头注明【新建方向】+理由。不要为了标新立异而新建——如果某条素材只是切入角度不同但方向内核相同，应复用枚举并在定义中说明角度
+3. 方向定义：1-3句，覆盖目标人群（给谁看）、核心叙事（讲什么故事/打破什么认知）、内容落点（最终引向什么）；只讲内容是什么，不要把植入逻辑写进定义
+4. 植入策略：一句话打法概括 + 具体示例，示例要展现完整的「内容→痛点→产品」推理链（参考本素材实际的植入方式或植入修改建议）；只写打法不给示例视为不合格
+5. 适合达人：按「达人类型分类标准」输出，粒度同「适配达人.达人类型」——整个一级类型都适合只写一级类型（如「财经」），仅限某二级适合才写「一级-二级」；可附 20 字以内的风格说明（如年龄段/职业身份/讲话风格）
+6. 策略等级由程序自动填写（新沉淀的策略初始为 X=创意洞察未验证），无需输出
+
 # 约束条件
+- 场景只能从枚举中选（可多选，禁止自创场景名）；纯对镜讲述选「对镜口播」
 - 内容方向，总字数在30字以内
-- 适配达人的达人类型严格按「一级分类-二级分类」格式输出且只选一个，推荐达人类型控制在20字以内，其余3个子项各15字以内
+- 适配达人的达人类型选范围最接近的一个（整个一级类型适合输出一级分类如「财经」，仅限某二级适合才输出「一级-二级」），推荐达人类型控制在20字以内，其余3个子项各15字以内
 - 植入话术单独不计入总字数，素材逻辑分析、对度小满的借鉴、植入修改建议三项总字数控制在100字以内
 - 不要分点罗列，每项一段话连贯输出
 - 语言精炼直接，不给铺垫过程
@@ -287,6 +692,7 @@ const ANALYSIS_PROMPT = `# 角色
 {
   "内容相关性": "强相关",
   "内容方向": "不想既丢钱又丢朋友，就记住：没做好送钱的准备，一分都别借。",
+  "场景": ["对镜口播"],
   "素材逻辑分析": "被借钱者受害者视角，借钱方占便宜、试探底线、施压人情，被借方羞耻绑架、承担风险、人财两空。核心结论：借钱＝拿钱买仇人，赠予心态才可例外。",
   "对度小满的借鉴": "借势熟人借贷伤感情高风险的情绪，反向论证正规平台是正向替代方案。核心策略：品牌接住观众'不伤感情+不求人'的需求，成为两难后的最优解。",
   "植入修改建议": "在'找银行借钱要付利息'处接入'找银行借钱要付利息，但银行还不一定借给你；找度小满，明码标价，利息清楚，到账快，不欠人情不伤感情。那你说，你为啥还要找朋友开口？'核心逻辑：把'向朋友借'的熟人借贷痛点转化为'用正规平台'的解决方案。",
@@ -296,6 +702,13 @@ const ANALYSIS_PROMPT = `# 角色
     "语速与风格": "中速、犀利、利落",
     "口吻": "犀利点评",
     "推荐达人类型": "财经、职场、情感观点"
+  },
+  "内容策略": {
+    "内容方向一": "拒绝借钱",
+    "内容方向二": "如何有效拒绝借钱",
+    "方向定义": "给被熟人开口借钱、抹不开面子又怕伤感情的普通人看；核心叙事是拒绝借钱的实操方法与人情边界；落点是把「借出去是仇人」的恐惧转化为守住钱包的行动指南。",
+    "植入策略": "打法：先立「借钱=买仇人」的恐惧共识，再衔接到正规平台的替代方案。示例——在「没做好送钱的准备，一分都别借」处接入「真要帮，也要帮得明明白白：自己周转不开时，找度小满，新人首借年化4.9%，不欠人情。把借出去的钱收回来，比什么都强」。推理链：拒绝借钱的痛点→拒绝不了时的兜底→正规平台补位。",
+    "适合达人": "财经-鸡汤，30-50岁、有生活阅历、讲话接地气的口播博主"
   }
 }`;
 
@@ -305,66 +718,132 @@ function log(msg) {
   process.stderr.write(msg + '\n');
 }
 
-// Step 1: 生成搜索关键词
-async function generateKeywords() {
-  log('🔹 Step 1: 生成搜索关键词...');
+// Step 1: 生成搜索关键词（返回 [{keyword, direction, source}]）
+async function generateKeywords(existingIds) {
+  log('🔹 Step 1: 生成搜索关键词（三来源：策略直搜 + 策略衍生 + 开放探索）...');
 
-  // 加载近期关键词，避免重复
+  // 来源1/2：拉取内容策略清单（24h 缓存 + 兜底）
+  const strategies = fetchStrategyDoc();
+  const strategyListText = strategies
+    .map(s => `- ${s.l1}-${s.l2}（${s.level}级）：${s.definition}`)
+    .join('\n');
+
+  // 来源3：构建开放探索素材（固定 AI 自由衍生，2026-09-15 起不再走种子词+联想词）
+  const explore = await buildExploreMaterial(existingIds || []);
+  const exploreLabel = explore.type === 'explore_suggest' ? '搜索联想词' :
+    explore.type === 'explore_comments' ? '高赞评论' : 'AI 自由衍生';
+  log(`   来源3开放探索：${exploreLabel}`);
+
+  let prompt = KEYWORD_PROMPT
+    .replace('__STRATEGY_LIST__', strategyListText)
+    .replace('__EXPLORE_MATERIAL__', explore.text || '（无开放探索素材，来源3请由 AI 自主衍生新方向）');
+
+  // 近期关键词 + 近期方向（软约束注入 prompt；方向级避开用于阻断"反差职业收入"类反复衍生）
   const recentKeywords = loadRecentKeywords();
-  let prompt = KEYWORD_PROMPT;
+  const statsNow = loadKeywordStats();
+  const recentDirs = [...new Set(recentKeywords
+    .map(k => (statsNow.keywords[k] || {}).direction)
+    .filter(Boolean))];
+  let recentBlock = '';
   if (recentKeywords.length > 0) {
-    prompt = prompt.replace('__RECENT_KEYWORDS__', `\n近期已使用的关键词（请勿重复或生成高度相似的词）：\n${recentKeywords.map((k, i) => `${i + 1}. ${k}`).join('\n')}\n`);
-  } else {
-    prompt = prompt.replace('__RECENT_KEYWORDS__', '');
+    recentBlock += `\n近期已使用的关键词（请勿重复或生成高度相似的词）：\n${recentKeywords.map((k, i) => `${i + 1}. ${k}`).join('\n')}\n`;
+  }
+  if (recentDirs.length > 0) {
+    recentBlock += `\n近期已使用的方向（来源2策略衍生、来源3开放探索必须避开这些方向，改选清单里的其他策略）：${recentDirs.join('、')}\n`;
+  }
+  prompt = prompt.replace('__RECENT_KEYWORDS__', recentBlock);
+
+  // 注入命中率反馈（低效关键词黑名单 + 休眠方向 + 休眠来源）
+  prompt = prompt.replace('__HIT_RATE_FEEDBACK__', buildHitRateFeedback());
+
+  const callKeywordLLM = async (promptText) => {
+    const response = await fetch(`${AIHUBMIX_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${AIHUBMIX_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages: [
+          { role: 'system', content: '你是一个抖音内容策划专家，只输出JSON，不输出任何其他内容。' },
+          { role: 'user', content: promptText }
+        ],
+        max_tokens: 2048,
+        temperature: 0.7
+      }),
+      signal: AbortSignal.timeout(60000)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`关键词生成失败 (HTTP ${response.status}): ${errorText.substring(0, 300)}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices[0].message.content.trim();
+
+    // 提取 JSON
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error(`关键词生成返回格式异常: ${content.substring(0, 200)}`);
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    return parsed.keywords.map(k => {
+      // source 归一化：explore 统一为 AI 自由衍生（explore_ai）
+      let source = k.source || '';
+      if (source === 'explore' || !source) source = explore.type;
+      return { keyword: k.keyword, direction: k.direction || '', source };
+    });
+  };
+
+  // 硬查重（程序化第二道防线）：命中重复则带原因重试，最多 3 轮
+  const MAX_GEN_ATTEMPTS = 3;
+  const dedupPool = buildDedupPool();
+  let keywordDirs = [];
+  let lastRejections = [];
+  for (let attempt = 1; attempt <= MAX_GEN_ATTEMPTS; attempt++) {
+    const attemptPrompt = lastRejections.length > 0
+      ? `${prompt}\n\n【上一轮生成结果已被程序查重拒绝，本次必须全部规避】\n${lastRejections.map(r => `- ${r}`).join('\n')}\n请重新生成 3 个与近期已用词及以上冲突词都不重复、不相似、不同句式模板的关键词。`
+      : prompt;
+    const rawDirs = await callKeywordLLM(attemptPrompt);
+
+    // 逐词校验（查重池 = 近期词 + 黑名单 + 本轮已通过的词）
+    const accepted = [];
+    const problems = [];
+    for (const k of rawDirs) {
+      const conflict = checkKeywordDup(k.keyword, [...dedupPool, ...accepted.map(a => a.keyword)]);
+      if (conflict) problems.push(`「${k.keyword}」：${conflict}`);
+      else accepted.push(k);
+    }
+    log(`   查重第${attempt}轮：${rawDirs.length} 个候选，${accepted.length} 个通过${problems.length ? '；拒绝 → ' + problems.join('；') : ''}`);
+
+    keywordDirs = accepted;
+    if (accepted.length === rawDirs.length && rawDirs.length > 0) break;
+    lastRejections = problems;
   }
 
-  const response = await fetch(`${AIHUBMIX_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${AIHUBMIX_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      messages: [
-        { role: 'system', content: '你是一个抖音内容策划专家，只输出JSON，不输出任何其他内容。' },
-        { role: 'user', content: prompt }
-      ],
-      max_tokens: 2048,
-      temperature: 0.7
-    }),
-    signal: AbortSignal.timeout(60000)
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`关键词生成失败 (HTTP ${response.status}): ${errorText.substring(0, 300)}`);
+  if (keywordDirs.length === 0) {
+    throw new Error(`关键词生成失败：连续 ${MAX_GEN_ATTEMPTS} 轮生成的关键词全部与近期已用词重复/高度相似`);
+  }
+  if (keywordDirs.length < 3) {
+    log(`   ⚠️ 查重后仅保留 ${keywordDirs.length} 个关键词（部分候选与近期词重复被拒）`);
   }
 
-  const data = await response.json();
-  const content = data.choices[0].message.content.trim();
-
-  // 提取 JSON
-  const jsonMatch = content.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    throw new Error(`关键词生成返回格式异常: ${content.substring(0, 200)}`);
-  }
-
-  const parsed = JSON.parse(jsonMatch[0]);
-  const keywords = parsed.keywords.map(k => k.keyword);
-
-  log(`   生成了 ${keywords.length} 个关键词: ${keywords.join(', ')}`);
+  log(`   最终采用 ${keywordDirs.length} 个关键词:`);
+  keywordDirs.forEach(k => log(`     - [${k.source}] ${k.keyword}（${k.direction}）`));
 
   // 保存到近期关键词列表
-  saveRecentKeywords(keywords);
+  saveRecentKeywords(keywordDirs.map(k => k.keyword));
 
-  return keywords;
+  return keywordDirs;
 }
 
-// Step 2: 搜索抖音视频
-async function searchDouyin(keyword) {
-  log(`🔹 Step 2: 搜索抖音关键词 "${keyword}"...`);
+// Step 2: 搜索抖音视频（按 cursor 翻页，默认 2 页，扩大候选池）
+const SEARCH_PAGES = parseInt(process.env.SEARCH_PAGES || '1', 10);
 
+async function searchDouyinPage(keyword, cursor, searchId) {
   const response = await fetch('https://api.tikhub.io/api/v1/douyin/search/fetch_video_search_v2', {
     method: 'POST',
     headers: {
@@ -373,12 +852,12 @@ async function searchDouyin(keyword) {
     },
     body: JSON.stringify({
       keyword,
-      cursor: 0,
+      cursor,
       sort_type: '1',
       publish_time: '0',
       filter_duration: '0',
       content_type: '0',
-      search_id: '',
+      search_id: searchId || '',
       backtrace: ''
     }),
     signal: AbortSignal.timeout(30000)
@@ -393,6 +872,9 @@ async function searchDouyin(keyword) {
 
   // 解析搜索结果，兼容多种 TikHub 响应结构
   let items = [];
+  let nextCursor = null;
+  let hasMore = false;
+  let nextSearchId = '';
   if (result.data) {
     if (Array.isArray(result.data)) {
       items = result.data;
@@ -403,6 +885,19 @@ async function searchDouyin(keyword) {
       items = result.data.data;
     } else if (result.data.aweme_info) {
       items = [result.data];
+    }
+    if (!Array.isArray(result.data)) {
+      // 翻页信息在 data.business_config 里（has_more + next_page.cursor/search_id）
+      const bc = result.data.business_config || {};
+      const np = bc.next_page || {};
+      hasMore = Boolean(bc.has_more);
+      nextCursor = (np.cursor !== undefined && np.cursor !== null) ? np.cursor : null;
+      nextSearchId = np.search_id || '';
+      // 兜底：business_config 里没有时读顶层字段
+      if (nextCursor === null && result.data.cursor !== undefined && result.data.cursor !== null) {
+        nextCursor = result.data.cursor;
+        hasMore = hasMore || Boolean(result.data.has_more);
+      }
     }
   } else if (Array.isArray(result)) {
     items = result;
@@ -415,8 +910,36 @@ async function searchDouyin(keyword) {
     return null;
   }).filter(Boolean);
 
-  log(`   搜索到 ${awemeList.length} 条视频`);
-  return awemeList;
+  return { awemeList, nextCursor, hasMore, nextSearchId };
+}
+
+async function searchDouyin(keyword) {
+  log(`🔹 Step 2: 搜索抖音关键词 "${keyword}"（最多 ${SEARCH_PAGES} 页）...`);
+
+  let all = [];
+  let cursor = 0;
+  let searchId = '';
+  for (let page = 1; page <= SEARCH_PAGES; page++) {
+    const { awemeList, nextCursor, hasMore, nextSearchId } = await searchDouyinPage(keyword, cursor, searchId);
+    all.push(...awemeList);
+    log(`   第 ${page} 页: ${awemeList.length} 条`);
+
+    if (!hasMore) break;
+    // 响应未返回 cursor 时按每页 10 条递增兜底
+    cursor = (nextCursor !== null && nextCursor !== undefined) ? nextCursor : cursor + 10;
+    searchId = nextSearchId;
+  }
+
+  // 按 aweme_id 去重（不同页可能返回重复视频）
+  const seen = new Set();
+  all = all.filter(a => {
+    if (!a.aweme_id || seen.has(a.aweme_id)) return false;
+    seen.add(a.aweme_id);
+    return true;
+  });
+
+  log(`   搜索到 ${all.length} 条视频（去重后）`);
+  return all;
 }
 
 // Step 3: 提取视频脚本（同时获取视频表现特征元信息）
@@ -428,7 +951,7 @@ async function extractVideoScript(videoUrl) {
       'Authorization': `Bearer ${AIHUBMIX_API_KEY}`
     },
     body: JSON.stringify({
-      model: DOUBAO_MODEL,
+      model: TRANSCRIBE_MODEL,
       messages: [
         { role: 'system', content: VIDEO_SCRIPT_PROMPT },
         {
@@ -529,6 +1052,154 @@ ${script}${metaSection}`;
   return JSON.parse(jsonMatch[0]);
 }
 
+// ============ 高赞评论创意策略分析（独立第二条线） ============
+// 触发：本轮新入库视频点赞 > COMMENT_ANALYSIS_DIGG_THRESHOLD（默认3万）时并行触发
+// 逻辑：抓高赞评论 → 过滤（无效/禁止方向/去重）→ 相关性判断 → 强相关才分析
+// 产出：与脚本分析同结构（内容方向一/二 + 植入策略 + 适合达人等），来源标记 comment_insight
+// 沉淀：现有策略表，与脚本来源的策略按方向聚合
+
+const COMMENT_ANALYSIS_PROMPT = `# 角色
+你是一位资深短视频编导，擅长从用户评论区的真实情绪和讨论中提炼创意方向，为品牌广告提供可落地的植入策略。
+
+# 任务
+分析用户提供的高赞评论列表（来自一条资金周转/借钱主题的爆款视频），提炼用户真实痛点与情绪共鸣，输出创意策略分析，直接输出JSON。输出结构与脚本创意分析完全一致。
+
+# 输出格式
+{
+  "内容相关性": "强相关/弱相关/不相关",
+  "时效性": "长青 / 时效话题-未过气 / 时效话题-已过气",
+  "内容方向": "用一句大白话总结评论区反映的核心情绪和讨论主张",
+  "素材逻辑分析": "从评论的主要情绪、典型讨论路径、核心共鸣点三个维度综合分析，一段话写清楚，直接给结论",
+  "对度小满的借鉴": "从评论暴露的真实痛点出发，反向论证度小满如何承接这些痛点，核心策略一段话写清楚",
+  "植入修改建议": "基于评论洞察设计的创意方向（不是修改某条具体话术，而是给出可落地的创意切入点），一段话写清楚",
+  "适配达人": {
+    "达人类型": "按达人类型分类标准判断，粒度规则：整个一级类型都适合就只写一级分类（如「财经」）；仅限某二级适合才写「一级-二级」（如剧情-剧情搞笑）",
+    "表现形式": "口播/剧情/AI生成/其他",
+    "语速与风格": "语速快慢+说话风格",
+    "口吻": "老登说教/犀利点评/真挚分享等",
+    "推荐达人类型": "基于以上三点推导，2-3个类型"
+  },
+  "内容策略": {
+    "内容方向一": "一级方向，优先从枚举中选；确实不满足时新建（注明【新建方向】+理由）",
+    "内容方向二": "二级方向，优先选所属一级方向下属的枚举；确实不满足时新建",
+    "方向定义": "1-3句：目标人群+核心叙事+内容落点",
+    "植入策略": "一句话打法概括+具体示例（讲清从评论痛点到产品的完整推理链）",
+    "适合达人": "达人类型（粒度同适配达人.达人类型：整个一级都适合只写一级，如「财经」；仅限某二级才写「一级-二级」），可附简要风格说明"
+  }
+}
+
+# 内容相关性判断标准
+- 强相关：评论区核心讨论围绕借钱/缺钱/还钱/债务/资金周转/借钱伤感情等核心议题，有真实用户情绪共鸣
+- 弱相关：评论里提到借钱或收入，但只是零星提及，主线是其他主题
+- 不相关：评论区与借钱/资金周转/收入真相完全无关
+
+# 时效性判断标准
+- 长青：评论反映的人性、人情世故、普遍财务困境——不论何时都有共鸣
+- 时效话题-已过气：评论围绕的平台功能/阶段性热点/具体事件已经过气
+- 时效话题-未过气：时效内容但仍在传播窗口内
+
+# 达人类型分类标准（与脚本分析一致，从 9 个标准类型中选范围最接近的一个）
+- 财经-泛财经 / 财经-高价值 / 财经-小微企业主 / 财经-常规 / 财经-鸡汤 / 三农-三农美食 / 三农-三农建造 / 剧情-常规剧情 / 剧情-剧情搞笑
+- 输出粒度：整个一级类型都适合就只输出一级分类（如「财经」）；仅限某二级适合才输出「一级-二级」
+
+# 内容策略分析标准（与脚本分析一致）
+内容方向一优先从以下枚举中选：蹭热点、揭秘自己、借钱高性价比、利息计算、有钱人借钱、网贷测评、回应解释、鸡汤、避坑、拒绝借钱
+内容方向二优先从所属一级方向下属枚举中选，不满足时新建并注明【新建方向】+理由
+植入策略：一句话打法概括 + 具体示例，示例展现完整的「评论痛点→产品」推理链
+
+# 约束条件
+- 适配达人的达人类型选范围最接近的一个（整个一级类型适合输出一级分类如「财经」，仅限某二级适合才输出「一级-二级」）
+- 不要分点罗列，每项一段话连贯输出
+- 语言精炼直接，不给铺垫过程
+
+# 品牌名称
+品牌名称：度小满
+品牌卖点：新人首借年华利率4.9%，借一万一年利息约271元；不用不收费
+目标人群：24-50岁的新锐白领、中产阶级，资深中产等方向的男性
+`;
+
+async function analyzeCommentsInsight(videoDesc, comments, videoMeta) {
+  // 1. 过滤：去掉空评论、纯表情、过短（<4字）、命中禁止方向的评论
+  const forbiddenPatterns = [/催收/, /上门催/, /起诉/, /立案/, /律师函/, /支付令/, /看病/, /治病/, /学费/, /彩礼/, /结婚/, /房贷断供/, /法拍/];
+  const cleaned = comments
+    .map(c => (c.text || '').trim())
+    .filter(t => t.length >= 4)
+    .filter(t => !forbiddenPatterns.some(p => p.test(t)));
+  // 去重
+  const seen = new Set();
+  const unique = cleaned.filter(t => {
+    if (seen.has(t)) return false;
+    seen.add(t);
+    return true;
+  });
+  if (unique.length < 5) {
+    return null; // 有效评论不足5条，不足以做策略分析
+  }
+
+  const topComments = unique.slice(0, 20).map((t, i) => `${i + 1}. ${t}`).join('\n');
+  let metaSection = '';
+  if (videoMeta && videoMeta.表现形式) {
+    metaSection = `\n# 视频表现特征（原视频）\n- 表现形式：${videoMeta.表现形式}\n- 语速：${videoMeta.语速}\n- 说话风格：${videoMeta.说话风格}`;
+  }
+
+  const userInput = `# 输入
+视频标题：${videoDesc}
+该视频的高赞评论列表（真实用户情绪与讨论）：
+${topComments}${metaSection}`;
+
+  try {
+    const response = await fetch(`${AIHUBMIX_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${AIHUBMIX_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages: [
+          { role: 'system', content: COMMENT_ANALYSIS_PROMPT },
+          { role: 'user', content: userInput }
+        ],
+        max_tokens: 4096,
+        temperature: 0.3
+      }),
+      signal: AbortSignal.timeout(120000)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      log(`   ⚠️ 评论洞察分析失败 (HTTP ${response.status}): ${errorText.substring(0, 150)}`);
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data.choices[0].message.content.trim();
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      log(`   ⚠️ 评论洞察分析返回格式异常`);
+      return null;
+    }
+
+    const analysis = JSON.parse(jsonMatch[0]);
+
+    // 相关性判断：弱相关/不相关 → 不入库
+    if (analysis.内容相关性 && analysis.内容相关性 !== '强相关') {
+      log(`   ⏭️  评论洞察内容${analysis.内容相关性}，跳过`);
+      return null;
+    }
+    // 时效性判断：已过气 → 不入库
+    if (analysis.时效性 === '时效话题-已过气') {
+      log(`   ⏭️  评论洞察时效话题已过气，跳过`);
+      return null;
+    }
+
+    return analysis;
+  } catch (error) {
+    log(`   ⚠️ 评论洞察分析异常: ${error.message.substring(0, 150)}`);
+    return null;
+  }
+}
+
 // 从视频对象中提取下载 URL
 function getDownloadUrl(aweme) {
   const video = aweme.video || {};
@@ -541,6 +1212,22 @@ function getDownloadUrl(aweme) {
 
   // 回退到第一个可用 URL
   return urlList[0] || null;
+}
+
+// 处理候选前实时刷新视频直链（抖音 CDN 签名链接有时效，checkpoint 里的旧链会过期导致模型下载失败）
+async function refreshPlayUrl(awemeId) {
+  const resp = await fetch(`https://api.tikhub.io/api/v1/douyin/web/fetch_one_video?aweme_id=${awemeId}`, {
+    headers: { 'Authorization': `Bearer ${TIKHUB_TOKEN}` },
+    signal: AbortSignal.timeout(30000)
+  });
+  if (!resp.ok) throw new Error(`TikHub fetch_one_video HTTP ${resp.status}`);
+  const d = await resp.json();
+  const aweme = d?.data?.aweme_detail || d?.data || {};
+  const br = aweme?.video?.bit_rate || [];
+  const url = (br[Math.min(1, br.length - 1)]?.play_addr?.url_list || [])[0]
+    || (aweme?.video?.play_addr?.url_list || [])[0];
+  if (!url) throw new Error('no play url in response');
+  return url;
 }
 
 // 检查脚本是否包含禁止内容
@@ -642,6 +1329,26 @@ function runLarkCli(args) {
   });
 }
 
+// Step 0: 飞书预检 —— 在任何付费 API 调用（LLM 关键词生成 / TikHub 搜索 / 转录）之前，
+// 先确认 lark-cli 鉴权正常、素材库和策略表都可访问。任何一个探针失败立即中止，
+// 避免「整轮跑完才发现飞书写入全灭、白烧 API 资源」的事故重演（2026-09-08 实际发生过）。
+function preflightFeishu() {
+  log('🔹 Step 0: 飞书预检（lark-cli 鉴权 + 素材库/策略表可达性）...');
+  const probes = [
+    ['素材库', BITABLE_BASE_TOKEN, BITABLE_TABLE_ID],
+    ['策略表', STRATEGY_BASE_TOKEN, STRATEGY_TABLE_ID]
+  ];
+  for (const [name, baseToken, tableId] of probes) {
+    try {
+      runLarkCli(['base', '+record-list', '--base-token', baseToken, '--table-id', tableId,
+        '--limit', '1', '--as', 'user', '--format', 'json']);
+      log(`   ✅ ${name} 可访问`);
+    } catch (error) {
+      throw new Error(`飞书预检失败（${name} 表不可访问）: ${error.message.substring(0, 200)}`);
+    }
+  }
+}
+
 // Step 1 自动化：从多维表格查询已有素材 ID
 function fetchExistingIds() {
   log('🔹 Step 1: 查询飞书多维表格已有素材 ID...');
@@ -685,8 +1392,9 @@ function fetchExistingIds() {
     log(`   已有素材 ID: ${ids.length} 条`);
     return ids;
   } catch (error) {
-    log(`   ⚠️ 查询已有素材 ID 失败（将跳过去重）: ${error.message.substring(0, 200)}`);
-    return [];
+    // 失败即中止：跳过去重会导致老素材重复入库（2026-09-08 试跑实际发生），且
+    // lark-cli/keychain 挂掉时后续飞书写入也必然失败，整轮白跑。中止让问题当场暴露。
+    throw new Error(`查询已有素材 ID 失败，中止运行（防重复入库）：${error.message.substring(0, 200)}`);
   }
 }
 
@@ -704,6 +1412,24 @@ function formatAdaptation(adaptation) {
     return parts.join('\n');
   }
   return '';
+}
+
+// 素材「场景」枚举（与飞书 tblYEQ0raRDrB4tb「场景」多选字段 fldKapI96Z 严格一致）
+const SCENE_OPTIONS = [
+  '对镜口播', '酒席饭桌', '居家室内', '职场办公', '户外街头',
+  '店铺商户', '车内出行', '线上通话', '工地工厂', '其他'
+];
+
+// 归一化「场景」判定结果：只保留合法枚举项（去重、过滤自创值）
+function formatScenes(scenes) {
+  if (!scenes) return [];
+  const arr = Array.isArray(scenes) ? scenes : [scenes];
+  const out = [];
+  for (const s of arr) {
+    const name = String(s || '').trim();
+    if (SCENE_OPTIONS.includes(name) && !out.includes(name)) out.push(name);
+  }
+  return out;
 }
 
 // Step 3 自动化：构建 payload 并写入多维表格
@@ -729,6 +1455,7 @@ function writeToBitable(results) {
       '素材链接': r.video_url,
       '素材脚本文案': r.script,
       '内容方向': analysis['内容方向'] || '',
+      '场景': formatScenes(analysis['场景']),
       '内容分析': analysis['素材逻辑分析'] || '',
       '广告可借鉴点': adInsight,
       '适配达人': formatAdaptation(analysis['适配达人']),
@@ -769,6 +1496,373 @@ function writeToBitable(results) {
   }
 }
 
+// ============ 内容策略表同步（度小满-网络创意策略） ============
+// 唯一性判断标准：内容方向一|内容方向二 组合。同方向多条素材 →
+// 补充完善该方向的植入策略 + 素材id 追加进「素材链接ids」（用、分隔）；新方向 → 新建策略行（等级 X）
+
+// 解析飞书单元格（文本字段可能是 string 或 [{text}] 数组）
+function cellText(val) {
+  if (!val) return '';
+  if (typeof val === 'string') return val.trim();
+  if (Array.isArray(val)) return val.map(v => (typeof v === 'string' ? v : v.text || '')).join('').trim();
+  return String(val);
+}
+
+// 读取策略表现有记录，返回 Map「方向一|方向二」-> { recordId, 植入策略, 素材链接ids }
+function fetchStrategyRecords() {
+  const output = runLarkCli([
+    'base', '+record-list',
+    '--base-token', STRATEGY_BASE_TOKEN,
+    '--table-id', STRATEGY_TABLE_ID,
+    '--limit', '200',
+    '--as', 'user',
+    '--format', 'json'
+  ]);
+  const data = JSON.parse(output)?.data || {};
+  const fieldNames = data.fields || [];
+  const rows = data.data || [];
+  const recordIds = data.record_id_list || [];
+  const idx = {};
+  ['内容方向一', '内容方向二', '植入策略', '素材链接ids', '适合达人'].forEach(name => {
+    idx[name] = fieldNames.indexOf(name);
+  });
+
+  const map = new Map();
+  rows.forEach((row, i) => {
+    const dir1 = cellText(idx['内容方向一'] >= 0 ? row[idx['内容方向一']] : null);
+    const dir2 = cellText(idx['内容方向二'] >= 0 ? row[idx['内容方向二']] : null);
+    if (!dir1 || !dir2) return;
+    map.set(`${dir1}|${dir2}`, {
+      recordId: recordIds[i] || null,
+      植入策略: cellText(idx['植入策略'] >= 0 ? row[idx['植入策略']] : null),
+      素材链接ids: cellText(idx['素材链接ids'] >= 0 ? row[idx['素材链接ids']] : null),
+      适合达人: cellText(idx['适合达人'] >= 0 ? row[idx['适合达人']] : null)
+    });
+  });
+  return map;
+}
+
+// 合并「适合达人」：把新素材里行上未覆盖的达人类型并入「达人类型：」行（幂等）
+// 粒度规则（2026-09-09 用户约定）：整个一级类型都适用只写一级（如「财经」=财经下所有二级都适合）；仅限某二级才写「一级-二级」
+// 覆盖判定：宽(一级)覆盖窄(一级-二级)；窄不覆盖宽——若行上是窄(财经-泛财经)、新素材判定为宽(财经)，需把窄收敛为宽
+// 2026-09-09 新增：此前更新已有策略行只写素材链接ids/植入策略，从不看适合达人（行14剧情类素材漏覆盖）
+function mergeSuitedInfluencers(existing, items) {
+  const existingText = (existing || '').trim();
+  const lines = existingText ? existingText.split('\n') : [];
+  const ti = lines.findIndex(l => /^达人类型[:：]/.test(l.trim()));
+  let tokens = [];
+  if (ti >= 0) {
+    tokens = lines[ti].replace(/^达人类型[:：]\s*/, '').split(/、|，|,/).map(s => s.trim()).filter(Boolean);
+  }
+  const isNarrow = t => t.includes('-');
+  const primaryOf = t => t.split('-')[0];
+  const adds = [];        // 需新增的宽/窄类型（追加行尾）
+  const replaceMap = {};  // 窄类型 -> 收敛为的宽类型（原位替换第一个，其余删除）
+  for (const r of items) {
+    const suited = r.analysis?.内容策略?.['适合达人'] || '';
+    const m = suited.match(/达人类型[:：]\s*([^\n]+)/);
+    if (!m) continue;
+    for (const seg of m[1].split(/、|，|,/)) {
+      const t = seg.trim();
+      if (!t) continue;
+      if (isNarrow(t)) {
+        // 窄类型：行上已有同款或其一级（宽覆盖窄）即视为覆盖
+        if (tokens.includes(t) || tokens.includes(primaryOf(t))) continue;
+        if (!adds.includes(t)) adds.push(t);
+      } else {
+        // 宽类型：行上已有同款即覆盖；行上有同级的窄类型 → 把窄收敛为宽；否则新增宽
+        if (tokens.includes(t)) continue;
+        const narrower = tokens.filter(tok => tok.startsWith(t + '-'));
+        if (narrower.length > 0) {
+          narrower.forEach(tok => { replaceMap[tok] = t; });
+        } else if (!adds.includes(t)) {
+          adds.push(t);
+        }
+      }
+    }
+  }
+  if (adds.length === 0 && Object.keys(replaceMap).length === 0) return existingText;
+  if (lines.length === 0) {
+    // 原字段为空：直接用第一条新素材的完整画像
+    const first = items.find(r => r.analysis?.内容策略?.['适合达人']);
+    return first ? first.analysis.内容策略['适合达人'] : existingText;
+  }
+  const keepTokens = [];
+  let replaced = false;
+  for (const tok of tokens) {
+    if (replaceMap[tok]) {
+      if (!replaced) { keepTokens.push(replaceMap[tok]); replaced = true; }
+      continue;
+    }
+    keepTokens.push(tok);
+  }
+  const finalTokens = [...keepTokens, ...adds];
+  const typeLine = '达人类型：' + finalTokens.join('、');
+  const otherLines = lines.filter(l => !/^达人类型[:：]/.test(l.trim()));
+  return [typeLine, ...otherLines].join('\n');
+}
+
+// 确保策略表 select 字段包含给定选项（新方向落表的前提：飞书不会自动创建不存在的选项）
+// fieldName: 字段名；values: 需要的选项值数组。返回实际新增的选项列表。
+function ensureSelectOptions(fieldName, values) {
+  const needed = [...new Set(values.filter(v => v && String(v).trim()))];
+  if (needed.length === 0) return [];
+
+  // 1) 读全量字段定义（field-update 是全量 PUT，必须先读后改）
+  const resp = JSON.parse(runLarkCli([
+    'base', '+field-get',
+    '--base-token', STRATEGY_BASE_TOKEN,
+    '--table-id', STRATEGY_TABLE_ID,
+    '--field-id', fieldName,
+    '--as', 'user', '--format', 'json'
+  ]));
+  const field = resp?.data?.field;
+  if (!field || field.type !== 'select') throw new Error(`字段 ${fieldName} 不存在或不是单选类型`);
+
+  const existingNames = new Set((field.options || []).map(o => o.name));
+  const toAdd = needed.filter(v => !existingNames.has(v));
+  if (toAdd.length === 0) return [];
+
+  // 2) 追加新选项（保留已有选项原样），全量 PUT 回去
+  const updated = {
+    name: field.name,
+    type: field.type,
+    multiple: field.multiple === true,
+    options: [...(field.options || []), ...toAdd.map(name => ({ name }))]
+  };
+  const updateResp = JSON.parse(runLarkCli([
+    'base', '+field-update',
+    '--base-token', STRATEGY_BASE_TOKEN,
+    '--table-id', STRATEGY_TABLE_ID,
+    '--field-id', field.id,
+    '--json', JSON.stringify(updated),
+    '--yes',
+    '--as', 'user', '--format', 'json'
+  ]));
+  if (!updateResp?.ok) throw new Error(`更新字段 ${fieldName} 失败: ${JSON.stringify(updateResp).substring(0, 200)}`);
+  log(`   🆕 策略表字段「${fieldName}」新增选项: ${toAdd.join('、')}`);
+  return toAdd;
+}
+
+// 新方向创建前，批量确保内容方向一/二的选项存在；失败时抛错由调用方决定降级
+function ensureStrategyDirections(createRecords) {
+  const dir1s = createRecords.map(r => Array.isArray(r['内容方向一']) ? r['内容方向一'][0] : r['内容方向一']);
+  const dir2s = createRecords.map(r => Array.isArray(r['内容方向二']) ? r['内容方向二'][0] : r['内容方向二']);
+  ensureSelectOptions('内容方向一', dir1s);
+  ensureSelectOptions('内容方向二', dir2s);
+}
+
+// 策略查重：判断新素材的植入策略与已有策略是否为同一套打法逻辑
+// 返回 per-item verdict 数组 ['duplicate'|'new']；LLM 失败时全部视为 new（回退旧行为，宁可多存不丢失）
+async function dedupeStrategies(existingStrategyText, items) {
+  try {
+    const verdicts = new Array(items.length).fill('new');
+    const listText = items.map((r, i) =>
+      `【素材${i + 1} dy_${r.aweme_id}】${r.analysis.内容策略['植入策略']}`
+    ).join('\n\n');
+
+    const prompt = `你在维护一张内容策略表。某个内容方向下已有一条策略（含打法概括、示例、推理链），现在新收集了一批素材，每条素材也总结了自己的植入策略。
+
+# 已有策略
+${existingStrategyText.substring(0, 1500)}
+
+# 新素材的植入策略
+${listText}
+
+# 任务
+逐条判断每个新素材的植入策略与已有策略是否为**同一个策略**。判定口径按《内容策略表字段填写指南》3.4：植入策略 = 一句话打法概括 + 具体示例（示例的价值在于展现「内容→痛点→产品」的完整推理链）。因此：
+- duplicate：打法概括相同，且示例的推理链也相同（例如都是"硬核计算揭露高息→制造恐惧→低息正规平台补位"）——只是措辞、接入锚点位置、具体数字不同。这类变体已由已有策略覆盖，重复罗列没有价值
+- new：打法概括不同，或示例展现了实质不同的推理链（不同的情绪入口、不同的论证路径、不同的植入时机，如"先共情再劝告"vs"先恐惧再解救"）——这类值得作为新示例编号补充进已有策略
+
+只输出JSON：{"verdicts": ["duplicate" 或 "new", ...]}，数组长度必须等于素材数量（${items.length}）。`;
+
+    const response = await fetch(`${AIHUBMIX_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${AIHUBMIX_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages: [
+          { role: 'system', content: '你是一个内容策略分析专家，只输出JSON，不输出任何其他内容。' },
+          { role: 'user', content: prompt }
+        ],
+        max_tokens: 512,
+        temperature: 0.1
+      }),
+      signal: AbortSignal.timeout(60000)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const parsed = JSON.parse(data.choices[0].message.content.match(/\{[\s\S]*\}/)[0]);
+    if (Array.isArray(parsed.verdicts)) {
+      parsed.verdicts.slice(0, items.length).forEach((v, i) => {
+        verdicts[i] = v === 'duplicate' ? 'duplicate' : 'new';
+      });
+    }
+    return verdicts;
+  } catch (error) {
+    // 查重失败返回 null（区别于查重结果）：调用方只并入素材链接ids、不追加策略文字，
+    // 避免回退"全保留"在 API 故障时重新堆叠重复补充段（堆进去后是粘性的，不会自动清理）
+    log(`   ⚠️ 策略查重失败（本轮仅并入素材链接ids，策略文本不更新，下轮重试）: ${error.message.substring(0, 150)}`);
+    return null;
+  }
+}
+
+// 将本轮成功素材的「内容策略」同步到策略表（同方向聚合，去重更新）
+async function syncStrategyTable(results) {
+  // 脚本来源的策略
+  const withStrategy = (results || []).filter(r => r.analysis?.内容策略?.['内容方向一'] && r.analysis?.内容策略?.['内容方向二']);
+  // 评论洞察来源的策略（独立第二条线，与脚本策略合并聚合到同一张策略表）
+  const withCommentInsight = (results || [])
+    .filter(r => r.commentInsight && r.commentInsight.内容策略?.['内容方向一'] && r.commentInsight.内容策略?.['内容方向二'])
+    .map(r => ({
+      aweme_id: r.commentInsight._source_aweme_id || r.aweme_id,
+      desc: r.commentInsight._source_desc || r.desc,
+      analysis: { 内容策略: r.commentInsight.内容策略 },
+      _source: 'comment_insight'
+    }));
+  const allStrategyItems = [...withStrategy, ...withCommentInsight];
+  if (allStrategyItems.length === 0) {
+    log('   （本轮无内容策略产出，跳过）');
+    return { created: 0, updated: 0, skipped: 0 };
+  }
+  if (withCommentInsight.length > 0) {
+    log(`   其中脚本来源策略 ${withStrategy.length} 条，评论洞察来源策略 ${withCommentInsight.length} 条`);
+  }
+
+  let existing;
+  try {
+    existing = fetchStrategyRecords();
+  } catch (error) {
+    log(`   ❌ 读取策略表失败，跳过同步: ${error.message.substring(0, 200)}`);
+    return { created: 0, updated: 0, skipped: allStrategyItems.length };
+  }
+  log(`   策略表现有 ${existing.size} 个方向组合`);
+
+  // 按方向组合聚合本轮素材（脚本来源 + 评论洞察来源合并聚合）
+  const grouped = new Map();
+  for (const r of allStrategyItems) {
+    const s = r.analysis.内容策略;
+    const key = `${s['内容方向一']}|${s['内容方向二']}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(r);
+  }
+
+  const createRecords = [];
+  const updateRecords = {};
+  let created = 0, updated = 0;
+
+  for (const [key, items] of grouped) {
+    const [dir1, dir2] = key.split('|');
+    // 评论洞察来源的素材id加来源标记，便于策略表区分
+    const newIds = items.map(r => r._source === 'comment_insight'
+      ? `dy_${r.aweme_id}（评论洞察）`
+      : `dy_${r.aweme_id}`);
+    const exist = existing.get(key);
+
+    if (exist && exist.recordId) {
+      // 已有方向：先查重——策略逻辑与已有重复的只并入素材链接ids，有实质差异的才追加【素材补充】
+      const verdicts = await dedupeStrategies(exist.植入策略, items);
+      const dedupeOk = verdicts !== null;
+      const dupCount = dedupeOk ? verdicts.filter(v => v === 'duplicate').length : items.length;
+      const newItems = dedupeOk ? items.filter((_, i) => verdicts[i] === 'new') : [];
+
+      const mergedIds = [...new Set([...(exist.素材链接ids ? exist.素材链接ids.split('、') : []), ...newIds])].join('、');
+      const updateFields = { '素材链接ids': mergedIds };
+      if (newItems.length > 0) {
+        const supplements = newItems.map(r => {
+          const s = r.analysis.内容策略;
+          return `【素材补充 dy_${r.aweme_id}】${s['植入策略']}`;
+        }).join('\n\n');
+        updateFields['植入策略'] = `${exist.植入策略}\n\n${supplements}`;
+      }
+      // 合并适合达人：新素材的类型行上有未覆盖达人类型时补充（幂等，无变化则不写）
+      const mergedSuited = mergeSuitedInfluencers(exist.适合达人, items);
+      if (mergedSuited && mergedSuited !== (exist.适合达人 || '')) {
+        updateFields['适合达人'] = mergedSuited;
+      }
+      updateRecords[exist.recordId] = updateFields;
+      updated += 1;
+      log(dedupeOk
+        ? `   🔄 已有方向「${dir1}-${dir2}」：${items.length} 条中 ${dupCount} 条策略重复（仅并入素材链接ids）、${newItems.length} 条有新打法（追加素材补充），素材链接ids → ${mergedIds}`
+        : `   🔄 已有方向「${dir1}-${dir2}」：查重失败，${items.length} 条全部仅并入素材链接ids（策略文本未动），素材链接ids → ${mergedIds}`);
+    } else {
+      // 新方向：新建策略行，等级 X（创意洞察，未经业务验证）
+      // 多条素材时同样查重：以第 1 条为基准，重复的只并入 ids，有差异的追加
+      const first = items[0];
+      const s = first.analysis.内容策略;
+      let 植入策略 = s['植入策略'];
+      if (items.length > 1) {
+        const verdicts = await dedupeStrategies(植入策略, items.slice(1));
+        const dedupeOk = verdicts !== null;
+        const newItems = dedupeOk ? items.slice(1).filter((_, i) => verdicts[i] === 'new') : [];
+        if (newItems.length > 0) {
+          植入策略 += '\n\n' + newItems.map(r => `【素材补充 dy_${r.aweme_id}】${r.analysis.内容策略['植入策略']}`).join('\n\n');
+        }
+        const dupCount = dedupeOk ? items.length - 1 - newItems.length : items.length - 1;
+        log(dedupeOk
+          ? `   ↳ 新方向查重：${dupCount} 条重复（仅并入素材链接ids）、${newItems.length} 条追加补充`
+          : `   ↳ 新方向查重失败：${items.length - 1} 条全部仅并入素材链接ids（策略文本未动）`);
+      }
+      const ids = newIds.join('、');
+      createRecords.push({
+        '内容方向一': [dir1],
+        '内容方向二': [dir2],
+        '内容一方向定义': s['方向定义'] || '',
+        '植入策略': 植入策略,
+        '策略等级': ['X'],
+        '适合达人': s['适合达人'] || '',
+        '素材链接ids': ids,
+        '正向案例': first.script || ''
+      });
+      created += 1;
+      log(`   ➕ 新方向「${dir1}-${dir2}」：新建策略行（等级 X），素材链接ids → ${ids}`);
+    }
+  }
+
+  let skipped = withStrategy.length;
+  try {
+    if (createRecords.length > 0) {
+      // 飞书 select 不会自动创建不存在的选项，新方向落表前先扩选项
+      try {
+        ensureStrategyDirections(createRecords);
+      } catch (error) {
+        log(`   ❌ 策略表选项扩充失败，跳过 ${createRecords.length} 条新方向写入: ${error.message.substring(0, 200)}`);
+        skipped += createRecords.length;
+        createRecords.length = 0;
+      }
+    }
+    if (createRecords.length > 0) {
+      const resp = JSON.parse(runLarkCli([
+        'base', '+record-batch-create',
+        '--base-token', STRATEGY_BASE_TOKEN,
+        '--table-id', STRATEGY_TABLE_ID,
+        '--json', JSON.stringify({ create_records: createRecords }),
+        '--as', 'user', '--format', 'json'
+      ]));
+      if (!resp?.ok) throw new Error(JSON.stringify(resp).substring(0, 300));
+    }
+    if (Object.keys(updateRecords).length > 0) {
+      const resp = JSON.parse(runLarkCli([
+        'base', '+record-batch-update',
+        '--base-token', STRATEGY_BASE_TOKEN,
+        '--table-id', STRATEGY_TABLE_ID,
+        '--json', JSON.stringify({ update_records: updateRecords }),
+        '--as', 'user', '--format', 'json'
+      ]));
+      if (!resp?.ok) throw new Error(JSON.stringify(resp).substring(0, 300));
+    }
+    skipped = 0;
+    log(`   ✅ 内容策略同步完成：新建 ${created} 行，更新 ${updated} 行`);
+  } catch (error) {
+    log(`   ❌ 策略表写入失败: ${error.message.substring(0, 300)}`);
+    return { created: 0, updated: 0, skipped };
+  }
+  return { created, updated, skipped: 0 };
+}
+
 // 发送飞书通知（每次运行结束都发，含成功/失败/放弃统计）
 function sendFeishuNotification(summary, quotaExhausted) {
   log('🔹 发送飞书结果通知...');
@@ -801,6 +1895,10 @@ function sendFeishuNotification(summary, quotaExhausted) {
 
     if (summary.bitable_success !== undefined) {
       lines.push(`- 📝 飞书写入：${summary.bitable_success} 条`);
+    }
+
+    if (summary.strategy_created !== undefined) {
+      lines.push(`- 🧭 内容策略沉淀：新建 ${summary.strategy_created} 行，更新 ${summary.strategy_updated} 行`);
     }
 
     if (quotaExhausted) {
@@ -869,15 +1967,36 @@ async function main() {
     process.exit(1);
   }
 
+  // Step 0: 飞书预检——付费 API（LLM/TikHub）之前先确认飞书可用，失败立即中止
+  if (!skipBitable) {
+    try {
+      preflightFeishu();
+    } catch (error) {
+      log(`❌ ${error.message}`);
+      log('   排查方向：1) run_workflow 必须前台运行，不能丢后台任务（沙箱会拦截 lark-cli keychain 刷新）；2) lark-cli auth status 检查授权是否过期；3) 飞书应用权限/表 id 是否变更');
+      process.exit(1);
+    }
+    log('');
+  }
+
   // Step 1: 查询已有素材 ID（如果未手动传入）
   if (existingIds.length === 0 && !skipBitable) {
-    existingIds = fetchExistingIds();
+    try {
+      existingIds = fetchExistingIds();
+    } catch (error) {
+      log(`❌ ${error.message}`);
+      log('   排查方向：1) lark-cli keychain 是否被沙箱拦截（run_workflow 必须前台运行，不能丢后台）；2) 飞书授权是否过期（lark-cli auth status）');
+      process.exit(1);
+    }
   } else if (existingIds.length > 0) {
     log(`🔹 Step 1: 使用传入的 ${existingIds.length} 个已有素材 ID`);
   }
 
   // ========== Resume 模式：从 checkpoint 恢复 ==========
+  // 先恢复上次中断运行的关键词统计（live_counts → totals），防中断丢黑名单/种子词数据
+  recoverLiveCounts();
   let keywords;
+  let keywordDirs = [];
   let candidates = [];
   let allAweme = [];
   const skipped = [];
@@ -889,6 +2008,7 @@ async function main() {
       process.exit(1);
     }
     keywords = cp.keywords;
+    keywordDirs = cp.keywordDirs || keywords.map(k => ({ keyword: k, direction: '' }));
     candidates = cp.candidates.filter(c => !cp.processed.includes(c.aweme_id));
     // 也跳过已写入飞书的（双重保险）
     candidates = candidates.filter(c => !existingIds.includes(`dy_${c.aweme_id}`));
@@ -906,9 +2026,11 @@ async function main() {
     // Step 1: 生成关键词（或使用自定义关键词）
     if (customKeywords && customKeywords.length > 0) {
       keywords = customKeywords;
+      keywordDirs = keywords.map(k => ({ keyword: k, direction: '自定义', source: 'custom' }));
       log(`🔹 Step 1: 使用自定义关键词: ${keywords.join(', ')}`);
     } else {
-      keywords = await generateKeywords();
+      keywordDirs = await generateKeywords(existingIds);
+      keywords = keywordDirs.map(k => k.keyword);
     }
     log('');
 
@@ -986,8 +2108,20 @@ async function main() {
 
     // 保存 checkpoint（防中断丢失）
     if (candidates.length > 0) {
-      saveCheckpoint(keywords, candidates);
+      saveCheckpoint(keywords, candidates, keywordDirs);
     }
+
+    // 中断容错：Step 3 完成即落盘 searched/filtered（成功数由 Step 4 逐条追加）
+    const liveUpdates = {};
+    for (const { keyword, direction, source } of keywordDirs) {
+      liveUpdates[keyword] = {
+        direction: direction || '', source: source || '',
+        searched: allAweme.filter(x => x.keyword === keyword).length,
+        filtered: candidates.filter(c => c.keyword === keyword).length,
+        last_run: new Date().toISOString()
+      };
+    }
+    flushLiveCounts(liveUpdates);
   }
 
   // Step 4: 提取脚本 + 分析（并行执行）
@@ -997,9 +2131,20 @@ async function main() {
   // 共享状态：一旦检测到余额不足，后续未开始的任务直接跳过
   const state = { quotaExhausted: false };
 
+  // 中断容错：成功数逐条落盘（LIVE_SUCCESS 惰性初始化自 live_counts，兼容 --resume 续跑）
+  const LIVE_SUCCESS = {};
+  const recordLiveSuccess = (keyword) => {
+    if (LIVE_SUCCESS[keyword] === undefined) {
+      const cur = loadKeywordStats().live_counts || {};
+      LIVE_SUCCESS[keyword] = (cur[keyword] && cur[keyword].success) || 0;
+    }
+    LIVE_SUCCESS[keyword] += 1;
+    flushLiveCounts({ [keyword]: { success: LIVE_SUCCESS[keyword], last_run: new Date().toISOString() } });
+  };
+
   // 为每个候选构建处理函数（返回结构化结果，不抛异常）
   const taskFns = candidates.map((candidate, i) => {
-    return async () => {
+    const runTask = async () => {
       // 余额已耗尽，跳过
       if (state.quotaExhausted) {
         log(`   [${i + 1}/${candidates.length}] ⏭️  跳过 ${candidate.aweme_id}（API 余额不足，未开始）`);
@@ -1009,8 +2154,17 @@ async function main() {
       log(`   [${i + 1}/${candidates.length}] 处理: ${candidate.aweme_id} — ${candidate.desc.substring(0, 50)}`);
 
       try {
+        // 实时刷新视频直链（旧链接可能已过期），失败则回退到候选里存的链接
+        let downloadUrl = candidate.download_url;
+        try {
+          downloadUrl = await refreshPlayUrl(candidate.aweme_id);
+        } catch (e) {
+          if (!downloadUrl) throw new Error(`刷新直链失败且无备用链接: ${e.message}`);
+          log(`   [${candidate.aweme_id}] ⚠️ 刷新直链失败，使用存的链接重试: ${e.message.substring(0, 100)}`);
+        }
+
         // 提取脚本 + 视频表现特征
-        const { script, meta } = await extractVideoScript(candidate.download_url);
+        const { script, meta } = await extractVideoScript(downloadUrl);
         log(`   [${candidate.aweme_id}] 脚本长度: ${script.length} 字`);
 
         // 检查全程未开口说话
@@ -1037,6 +2191,14 @@ async function main() {
           return { status: 'skipped', aweme_id: candidate.aweme_id, desc: candidate.desc, reason: 'low_relevance', relevance: analysis.内容相关性 };
         }
 
+        // 检查时效性：依赖特定时间窗口的过气内容（平台功能/阶段性热点/已结束活动）不入库；
+        // 长青话题（人情世故/普遍财务困境）不受时间限制，老素材反而沉淀好
+        if (analysis.时效性 === '时效话题-已过气') {
+          log(`   [${candidate.aweme_id}] ⏭️  跳过: 时效话题已过气（如平台功能红利期/阶段性热点已退）`);
+          markProcessed(candidate.aweme_id);
+          return { status: 'skipped', aweme_id: candidate.aweme_id, desc: candidate.desc, reason: 'stale_topic', timeliness: analysis.时效性 };
+        }
+
         log(`   [${candidate.aweme_id}] ✅ 分析完成`);
 
         const result = {
@@ -1047,6 +2209,32 @@ async function main() {
           analysis,
           keyword: candidate.keyword
         };
+
+        // 高赞评论创意策略分析（独立第二条线）：点赞 > 阈值时并行触发
+        // 评论分析不阻塞主流程入库——先入库脚本来源的结果，评论洞察结果单独收集后统一沉淀到策略表
+        const diggCount = candidate.digg_count || candidate.aweme?.statistics?.digg_count || 0;
+        let commentInsight = null;
+        if (diggCount > COMMENT_ANALYSIS_DIGG_THRESHOLD) {
+          log(`   [${candidate.aweme_id}] 💬 点赞 ${diggCount} > ${COMMENT_ANALYSIS_DIGG_THRESHOLD}，触发高赞评论创意策略分析`);
+          try {
+            const comments = await fetchVideoComments(candidate.aweme_id, 30);
+            if (comments.length >= 5) {
+              commentInsight = await analyzeCommentsInsight(candidate.desc, comments, meta);
+              if (commentInsight) {
+                // 给评论洞察的素材id加来源标记，便于策略表区分
+                commentInsight._source = 'comment_insight';
+                commentInsight._source_aweme_id = candidate.aweme_id;
+                commentInsight._source_desc = candidate.desc;
+                log(`   [${candidate.aweme_id}] 💬 评论洞察分析完成（方向：${commentInsight.内容策略?.['内容方向一']}/${commentInsight.内容策略?.['内容方向二']}）`);
+              }
+            } else {
+              log(`   [${candidate.aweme_id}] ⚠️ 高赞评论不足5条（${comments.length}），跳过评论洞察分析`);
+            }
+          } catch (error) {
+            log(`   [${candidate.aweme_id}] ⚠️ 评论洞察分析失败（不影响主流程）: ${error.message.substring(0, 150)}`);
+          }
+        }
+        result.commentInsight = commentInsight;
 
         // 即时写入飞书（不等全部完成，防中途中断丢失数据）
         let bitableWritten = false;
@@ -1068,6 +2256,12 @@ async function main() {
         markProcessed(candidate.aweme_id);
         return { status: 'failed', aweme_id: candidate.aweme_id, desc: candidate.desc, error: error.message };
       }
+    };
+    // 中断容错包装：每条任务出结果即更新 live_counts
+    return async () => {
+      const r = await runTask();
+      if (r && r.status === 'success' && candidate.keyword) recordLiveSuccess(candidate.keyword);
+      return r;
     };
   });
 
@@ -1108,6 +2302,33 @@ async function main() {
     log(`🔹 Step 5: 飞书写入统计 — 成功 ${bitableResult.success} 条，失败 ${bitableResult.failed} 条`);
   }
 
+  // 更新关键词命中率统计（余额不足时中途终止，统计会失真，不更新）
+  if (!state.quotaExhausted && keywordDirs.length > 0) {
+    const counts = {};
+    for (const { keyword } of keywordDirs) {
+      counts[keyword] = { searched: 0, filtered: 0, success: 0 };
+    }
+    for (const { keyword } of allAweme) {
+      if (counts[keyword]) counts[keyword].searched += 1;
+    }
+    for (const c of candidates) {
+      if (counts[c.keyword]) counts[c.keyword].filtered += 1;
+    }
+    for (const r of results) {
+      if (counts[r.keyword]) counts[r.keyword].success += 1;
+    }
+    updateKeywordStats(keywordDirs, counts);
+  }
+
+  // Step 6: 内容策略沉淀（按内容方向一/二聚合去重，写入策略表）
+  log('🔹 Step 6: 内容策略沉淀（度小满-网络创意策略表）...');
+  let strategyResult = { created: 0, updated: 0, skipped: 0 };
+  try {
+    strategyResult = await syncStrategyTable(results);
+  } catch (error) {
+    log(`   ⚠️ 内容策略同步异常（不影响主流程）: ${error.message.substring(0, 200)}`);
+  }
+
   // 每次运行结束都发送飞书通知
   sendFeishuNotification(
     {
@@ -1115,6 +2336,8 @@ async function main() {
       total_skipped: skipped.length,
       total_failed: failedItems.length,
       bitable_success: bitableResult.success,
+      strategy_created: strategyResult.created,
+      strategy_updated: strategyResult.updated,
       keywords: keywords
     },
     state.quotaExhausted
