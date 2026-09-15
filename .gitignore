@@ -22,3 +22,10 @@ __pycache__/
 
 # 测试产物
 analysis_result*.json
+
+# 热点入表失败时的落盘文件（用于重放，不入库）
+pending_bitable_*.json
+
+# lark-cli 读表暂存产物（ndjson 明细 + manifest 清单）
+*.ndjson
+*.manifest.json
