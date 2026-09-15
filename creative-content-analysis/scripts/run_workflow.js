@@ -8,7 +8,8 @@
  *
  * 默认行为（一条命令跑完）：
  *   1. 自动查询飞书多维表格已有素材 ID（去重）
- *   2. 三来源生成关键词（策略直搜 + 策略衍生 + 开放探索AI自由衍生）
+ *   2. 生成 4 个搜索关键词（策略直搜1 + 策略衍生1 + 开放探索2；探索素材接入飞书热点素材表。
+ *      连续 2 轮零新策略产出时自动进入加强模式：直搜1 + 探索3，策略衍生通道暂停——反内循环）
  *      → 搜索抖音 → 提取脚本 → 分析创意
  *   3. 自动将结果写入飞书多维表格
  *   4. 如果 API 余额不足，自动给飞书发消息通知
@@ -312,6 +313,44 @@ function recoverLiveCounts() {
   log(`   ♻️ 已恢复上次中断运行的关键词统计：${Object.keys(live).join('、')}`);
 }
 
+// ============ 策略库生长统计（反内循环预警，2026-09-15） ============
+// 每轮运行结束记录：新建方向数（created）/ 追加新打法数（appended）/ 仅并入素材数（mergedOnly）。
+// 「新策略」= created + appended。本轮有策略产出但新策略为 0 → 记一轮旱灾（drought）；
+// 连续 STRATEGY_DROUGHT_BOOST_THRESHOLD 轮旱灾 → 下轮关键词生成进入加强模式
+// （explore 2→3、策略衍生暂停），并在飞书通知中预警。
+const STRATEGY_GROWTH_FILE = path.join(__dirname, '..', '.strategy_growth.json');
+const STRATEGY_DROUGHT_BOOST_THRESHOLD = 2;
+const STRATEGY_GROWTH_HISTORY = 20;
+
+function loadStrategyGrowth() {
+  try {
+    if (fs.existsSync(STRATEGY_GROWTH_FILE)) {
+      const g = JSON.parse(fs.readFileSync(STRATEGY_GROWTH_FILE, 'utf-8'));
+      if (typeof g.droughtStreak === 'number') return g;
+    }
+  } catch { /* 损坏则重置 */ }
+  return { droughtStreak: 0, history: [] };
+}
+
+function updateStrategyGrowth(strategyResult, itemCount) {
+  const growth = loadStrategyGrowth();
+  const newStrategy = (strategyResult.created || 0) + (strategyResult.appended || 0);
+  // 本轮有策略产出但全部只是并入素材链接ids → 记一轮旱灾；本轮无策略产出（0 条素材）不计入
+  const isDroughtRound = itemCount > 0 && newStrategy === 0;
+  growth.droughtStreak = isDroughtRound ? growth.droughtStreak + 1 : 0;
+  growth.history = [...(growth.history || []), {
+    date: new Date().toISOString(),
+    created: strategyResult.created || 0,
+    appended: strategyResult.appended || 0,
+    mergedOnly: strategyResult.mergedOnly || 0,
+    droughtStreak: growth.droughtStreak
+  }].slice(-STRATEGY_GROWTH_HISTORY);
+  growth.lastRun = new Date().toISOString();
+  fs.writeFileSync(STRATEGY_GROWTH_FILE, JSON.stringify(growth, null, 2));
+  log(`   💾 策略库生长统计已更新（零新策略连续 ${growth.droughtStreak} 轮${growth.droughtStreak >= STRATEGY_DROUGHT_BOOST_THRESHOLD ? '，下轮进入加强探索模式' : ''}）`);
+  return growth;
+}
+
 // ============ 内容策略文档（关键词来源1/2：策略直搜 + 策略衍生） ============
 // 运行时动态拉取内容策略文档，解析 S/A 级策略方向注入 prompt。
 // 缓存 24h；拉取失败用过期缓存；缓存也没有用内置兜底清单。
@@ -437,9 +476,14 @@ function fetchStrategyDoc() {
   }
 }
 
-// ============ 开放探索来源（来源3）：固定 AI 自由衍生 ============
-// 2026-09-15 用户约定：不再走种子词+抖音联想词通道（历史成功率最高的词当种子存在正反馈锁死问题，
-// 且联想词接口可用性不稳），来源3直接由 AI 按"人群处境/金钱摩擦/心理状态/社会现象"维度衍生新方向。
+// ============ 开放探索来源（来源3）：飞书热点素材表 + AI 自由衍生 ============
+// 2026-09-15 反内循环改造：探索素材接入热点素材表（duxiaoman-hotspot 抓取沉淀的近期热点），
+// 为关键词生成注入策略文档之外的外部信号，打断"关键词←策略文档→验证老策略"的闭环。
+// 热点表读取失败 / 无新鲜热点时降级为 AI 自由衍生（旧行为）。
+const HOTSPOT_BASE_TOKEN = process.env.HOTSPOT_BASE_TOKEN || 'STMrbQgqma35dksI3WsclJlNnlc';
+const HOTSPOT_TABLE_ID = process.env.HOTSPOT_TABLE_ID || 'tblDpxkM7psozqeO';
+const HOTSPOT_MAX_AGE_DAYS = 7;   // 只取入库 7 天内的热点（过老的热点已过传播窗口）
+const HOTSPOT_MAX_COUNT = 8;      // 每轮最多注入 8 条热点，防止 prompt 过长
 
 // 视频高赞评论（按点赞排序）
 async function fetchVideoComments(awemeId, count = 20) {
@@ -456,9 +500,63 @@ async function fetchVideoComments(awemeId, count = 20) {
     .sort((a, b) => b.digg - a.digg);
 }
 
-// 构建开放探索素材：固定走 AI 自由衍生（不再有联想词/评论轮换与降级链路）
-function buildExploreMaterial(existingIds) {
-  return { type: 'explore_ai', text: '' };
+// 拉取热点素材表中的新鲜热点（入库 ≤ 7 天且未过到期复查日）
+function fetchRecentHotspots() {
+  const output = runLarkCli([
+    'base', '+record-list',
+    '--base-token', HOTSPOT_BASE_TOKEN,
+    '--table-id', HOTSPOT_TABLE_ID,
+    '--limit', '50',
+    '--as', 'user',
+    '--format', 'json'
+  ]);
+  const data = JSON.parse(output)?.data || {};
+  const fieldNames = data.fields || [];
+  const rows = data.data || [];
+  const idx = {};
+  ['热点标题', '热点概述', '热点类型', '入库时间', '到期复查日'].forEach(name => {
+    idx[name] = fieldNames.indexOf(name);
+  });
+  const cell = (row, name) => {
+    const v = idx[name] >= 0 ? row[idx[name]] : null;
+    if (Array.isArray(v)) return v.filter(Boolean).join('、');
+    return cellText(v);
+  };
+  const now = Date.now();
+  const cutoff = now - HOTSPOT_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+  return rows
+    .map(row => ({
+      title: cell(row, '热点标题'),
+      summary: cell(row, '热点概述').split('\n')[0], // 概述首段（去掉溯源信息尾巴）
+      type: cell(row, '热点类型'),
+      storedAt: Date.parse(cell(row, '入库时间')) || 0,
+      reviewAt: Date.parse(cell(row, '到期复查日')) || 0
+    }))
+    .filter(h => h.title && h.storedAt >= cutoff && (!h.reviewAt || h.reviewAt >= now))
+    .sort((a, b) => b.storedAt - a.storedAt)
+    .slice(0, HOTSPOT_MAX_COUNT);
+}
+
+// 构建开放探索素材：优先注入热点素材表新鲜热点；失败/为空降级 AI 自由衍生
+function buildExploreMaterial() {
+  try {
+    const hotspots = fetchRecentHotspots();
+    if (hotspots.length === 0) {
+      log('   热点素材表无 7 天内新鲜热点，探索来源降级为 AI 自由衍生');
+      return { type: 'explore_ai', text: '' };
+    }
+    const lines = hotspots.map((h, i) =>
+      `${i + 1}. [${h.type || '热点'}] ${h.title}——${(h.summary || '').substring(0, 120)}`
+    );
+    const text = `# 开放探索素材：近期热点素材表（来自热点抓取流程，${hotspots.length} 条新鲜热点）
+优先从下列热点中找与借钱/缺钱/资金周转有真实关联的角度，把热点话题翻译成普通用户会搜的搜索词——注意不是搜热点事件本身，而是搜热点牵出的用钱场景或人群处境（热点概述里已包含植入思路可参考）。每个热点最多衍生 1 个搜索词，多个探索词必须来自不同热点或不同角度：
+${lines.join('\n')}`;
+    log(`   热点素材表注入 ${hotspots.length} 条新鲜热点作为探索素材`);
+    return { type: 'explore_hotspot', text };
+  } catch (error) {
+    log(`   ⚠️ 热点素材表读取失败（${error.message.substring(0, 120)}），探索来源降级为 AI 自由衍生`);
+    return { type: 'explore_ai', text: '' };
+  }
 }
 
 // ============ 配置 ============
@@ -506,18 +604,37 @@ const LARK_CLI = 'lark-cli';
 
 // ============ 提示词 ============
 
-const KEYWORD_PROMPT = `你是抖音内容素材策划专家，熟悉抖音平台的内容生态、用户情绪和话题传播逻辑。请围绕"资金周转困难"这个核心场景，生成3个抖音搜索关键词，分别来自以下3个来源：
+// 关键词生成 prompt（2026-09-15 反内循环改造：固定 3 词改为动态配额）
+// 常规模式：直搜1 + 衍生1 + 探索2 = 4 词；加强模式（连续 2 轮零新策略）：直搜1 + 探索3 = 4 词（衍生暂停）
+function buildKeywordPrompt(directQuota, deriveQuota, exploreQuota) {
+  const total = directQuota + deriveQuota + exploreQuota;
+  const sources = [];
+  if (directQuota > 0) {
+    sources.push(`【来源：策略直搜】${directQuota} 个（source 填 strategy_direct）
+从下方内容策略清单中选策略方向，把它"翻译"成普通用户真实会搜的词。不是照抄策略名，而是想：对这个话题感兴趣的真实用户，会在抖音搜什么。
+例：策略「揭秘自己-生意赚多少钱」→ 搜词"开店一年赚多少"；策略「借钱高性价比-利息计算」→ 搜词"网贷利息怎么算"；策略「拒绝借钱-如何有效拒绝借钱」→ 搜词"如何拒绝借钱"。`);
+  }
+  if (deriveQuota > 0) {
+    sources.push(`【来源：策略衍生】${deriveQuota} 个（source 填 strategy_derive）
+从策略清单中选另一个策略（必须与策略直搜不同的策略方向，且不得选择下方"近期已使用的方向"里出现过的策略），先抽象出该策略的核心钩子公式，再实例化成全新搜索词。
+公式示例（仅示范"如何从策略抽象公式"，禁止套用句式模板）：「揭秘自己」的核心公式 = 高收入表象 vs 现金流紧张的反差；「网贷测评」的核心公式 = 较真打假替粉丝实测。生成时必须基于策略自身逻辑构造全新表达——同一句式骨架仅替换职业/人群/平台名也算重复（如近期已用过"花店老板缺现金吗"，就禁止再生成"XX老板缺现金吗"）。`);
+  }
+  if (exploreQuota > 0) {
+    sources.push(`【来源：开放探索】${exploreQuota} 个（source 填 explore）
+按下方"开放探索素材"的指示执行；若素材为空，则 AI 自主衍生与借钱/缺钱/用钱相关的新方向（可从这些维度切入：不同人群的借钱处境、不同关系的金钱摩擦、不同心理状态的缺钱体验、社会现象与钱的交织），不要困在策略清单里。多个探索词之间必须覆盖互不相同的新方向，来自不同热点或不同角度。`);
+  }
 
-【来源1：策略直搜】（source 填 strategy_direct）
-从下方内容策略清单中选1个策略方向，把它"翻译"成普通用户真实会搜的词。不是照抄策略名，而是想：对这个话题感兴趣的真实用户，会在抖音搜什么。
-例：策略「揭秘自己-生意赚多少钱」→ 搜词"开店一年赚多少"；策略「借钱高性价比-利息计算」→ 搜词"网贷利息怎么算"；策略「拒绝借钱-如何有效拒绝借钱」→ 搜词"如何拒绝借钱"。
+  const exampleItems = [];
+  let eid = 1;
+  if (directQuota > 0) exampleItems.push(`    { "id": ${eid++}, "keyword": "搜索关键词", "source": "strategy_direct", "direction": "所属方向" }`);
+  if (deriveQuota > 0) exampleItems.push(`    { "id": ${eid++}, "keyword": "搜索关键词", "source": "strategy_derive", "direction": "所属方向" }`);
+  for (let i = 0; i < exploreQuota; i++) {
+    exampleItems.push(`    { "id": ${eid++}, "keyword": "搜索关键词", "source": "explore", "direction": "所属方向" }`);
+  }
 
-【来源2：策略衍生】（source 填 strategy_derive）
-从策略清单中选另一个策略（必须与来源1不同的策略方向，且不得选择下方"近期已使用的方向"里出现过的策略），先抽象出该策略的核心钩子公式，再实例化成全新搜索词。
-公式示例（仅示范"如何从策略抽象公式"，禁止套用句式模板）：「揭秘自己」的核心公式 = 高收入表象 vs 现金流紧张的反差；「网贷测评」的核心公式 = 较真打假替粉丝实测。生成时必须基于策略自身逻辑构造全新表达——同一句式骨架仅替换职业/人群/平台名也算重复（如近期已用过"花店老板缺现金吗"，就禁止再生成"XX老板缺现金吗"）。
+  return `你是抖音内容素材策划专家，熟悉抖音平台的内容生态、用户情绪和话题传播逻辑。请围绕"资金周转困难"这个核心场景，生成 ${total} 个抖音搜索关键词，按下列来源分配：
 
-【来源3：开放探索】（source 填 explore）
-按下方"开放探索素材"的指示执行；若素材为空，则 AI 自主衍生1个与借钱/缺钱/用钱相关的新方向（可从这些维度切入：不同人群的借钱处境、不同关系的金钱摩擦、不同心理状态的缺钱体验、社会现象与钱的交织），不要困在策略清单里。
+${sources.join('\n\n')}
 
 内容策略清单（来自内容策略文档，S=已验证成功 / A=可继续尝试）：
 __STRATEGY_LIST__
@@ -525,10 +642,10 @@ __STRATEGY_LIST__
 __EXPLORE_MATERIAL__
 
 选取规则：
-- 3个关键词必须来自3个不同来源（strategy_direct / strategy_derive / explore 各1个）
-- 来源1和来源2必须选择不同的策略方向，不可重复同一策略
-- 3个关键词覆盖不同的场景方向，不可重复同一方向
-- 来源3不得选取与近期已用词同词族的联想词（共享核心短语的变体均算重复，如近期已用过"借钱伤感情"，则"借钱伤感情XX"类联想词全部禁选）
+- 关键词严格按上述来源配额分配
+- 策略直搜和策略衍生（如启用）必须选择不同的策略方向，不可重复同一策略
+- ${total} 个关键词覆盖互不相同的场景方向，不可重复同一方向
+- 开放探索不得选取与近期已用词同词族的联想词（共享核心短语的变体均算重复，如近期已用过"借钱伤感情"，则"借钱伤感情XX"类联想词全部禁选）
 - 避免与近期已使用的关键词重复或高度相似
 
 通用要求：
@@ -545,15 +662,14 @@ __RECENT_KEYWORDS__
 
 __HIT_RATE_FEEDBACK__
 
-输出格式：严格按以下JSON格式输出，不要增加任何额外字段、注释或说明文字。source 必须是 strategy_direct / strategy_derive / explore 三者之一；direction 填写该关键词所属的场景方向（用简短方向名，如：揭秘自己-生意赚多少钱、策略衍生-反差职业收入、联想词-借钱救急）：
+输出格式：严格按以下JSON格式输出，不要增加任何额外字段、注释或说明文字。source 必须是 strategy_direct / strategy_derive / explore 三者之一；direction 填写该关键词所属的场景方向（用简短方向名，如：揭秘自己-生意赚多少钱、策略衍生-反差职业收入、热点素材-公共数据开放）：
 
 {
   "keywords": [
-    { "id": 1, "keyword": "搜索关键词", "source": "strategy_direct", "direction": "所属方向" },
-    { "id": 2, "keyword": "搜索关键词", "source": "strategy_derive", "direction": "所属方向" },
-    { "id": 3, "keyword": "搜索关键词", "source": "explore", "direction": "所属方向" }
+${exampleItems.join(',\n')}
   ]
 }`;
+}
 
 const VIDEO_SCRIPT_PROMPT = `你是专业的视频脚本转录助手。请将视频中的所有对话和台词完整转录为文字。
 
@@ -573,6 +689,82 @@ const VIDEO_SCRIPT_PROMPT = `你是专业的视频脚本转录助手。请将视
 - 表现形式：以下为参考类型，可根据视频实际情况自行补充其他类型（如情景演绎、街头采访、教程演示等）
 - 语速：以下为参考档位，可根据实际听感自行补充其他描述
 - 说话风格：以下为参考类型，可根据实际听感自行补充其他风格描述，可多选，用逗号分隔`;
+
+// ============ 方向枚举动态化（2026-09-15 反内循环改造） ============
+// 背景：分析 prompt 里硬编码的方向枚举 + "优先复用/不要标新立异"强偏置，
+// 导致新素材被硬塞进老方向组合，策略表几乎不可能长出新行。
+// 改造：运行时从策略表拉取现有方向组合及素材数注入 prompt；
+// 饱和方向（素材数 ≥ SATURATED_DIR_MATERIALS）注入"切入角度实质不同时优先新建二级方向"指令。
+// 策略表读取失败时用内置兜底枚举（即原硬编码清单）。
+const SATURATED_DIR_MATERIALS = 5;
+let _directionSnapshot = null; // 进程级缓存（策略表只在本轮 Step 6 末尾写入，运行期间不变）
+
+function getDirectionSnapshot() {
+  if (_directionSnapshot) return _directionSnapshot;
+  try {
+    const existing = fetchStrategyRecords();
+    const groups = new Map(); // dir1 -> Map(dir2 -> 素材数)
+    for (const [key, val] of existing) {
+      const [dir1, dir2] = key.split('|');
+      const count = (val.素材链接ids || '').split('、').filter(Boolean).length;
+      if (!dir1 || !dir2) continue;
+      if (!groups.has(dir1)) groups.set(dir1, new Map());
+      groups.get(dir1).set(dir2, count);
+    }
+    _directionSnapshot = { groups, total: existing.size };
+    log(`   📋 方向枚举动态拉取：策略表 ${existing.size} 个方向组合已注入分析 prompt`);
+  } catch (error) {
+    log(`   ⚠️ 策略表方向拉取失败，方向枚举使用内置兜底: ${error.message.substring(0, 120)}`);
+    _directionSnapshot = null;
+  }
+  return _directionSnapshot;
+}
+
+// 内置兜底枚举（策略表读取失败时用，与策略表初始方向保持一致）
+const FALLBACK_DIRECTION_ENUMS = `## 内容方向一（一级方向，优先从以下枚举中选，不满足时可新建）
+- 蹭热点：借时政/政策新闻的注意力，先吸睛再承接
+- 揭秘自己：博主自曝真实收入与资产结构，打破刻板印象
+- 借钱高性价比：揭秘「借到便宜的钱就是优势」的财富真相
+- 利息计算：硬核数学计算拆解利率陷阱，建立专业信任
+- 有钱人借钱：对比富人/普通人的资金思维差异
+- 网贷测评：较真打假视角反向实测，欲扬先抑
+- 回应解释：承接上期广告话题，回应质疑或做常规科普
+- 鸡汤：共情中年人处境，先理解再劝告
+- 避坑：守财导师视角，盘点钱财陷阱
+- 拒绝借钱：解决「抹不开面子又伤人情」的社交痛点
+
+## 内容方向二（二级方向，优先选所属一级方向下的枚举，不满足时可新建）
+蹭热点：时政新闻｜揭秘自己：生意赚多少钱、炒股是否财富自由｜借钱高性价比：借便宜的钱｜利息计算：详细计算｜有钱人借钱：对比富人｜网贷测评：反向测评｜回应解释：回怼回应、常规回应｜鸡汤：中年人借网贷不是堕落、求人不如靠自己、我为你们感到着急｜避坑：不要贪便宜｜拒绝借钱：如何有效拒绝借钱`;
+
+function buildDirectionEnumSection() {
+  const snap = getDirectionSnapshot();
+  if (!snap) return FALLBACK_DIRECTION_ENUMS;
+  const lines = [];
+  const saturated = [];
+  for (const [dir1, subs] of snap.groups) {
+    lines.push(`- ${dir1}：${[...subs.entries()].map(([d2, n]) => `${d2}（${n}条素材）`).join('、')}`);
+    for (const [d2, n] of subs) {
+      if (n >= SATURATED_DIR_MATERIALS) saturated.push(`${dir1}-${d2}`);
+    }
+  }
+  let text = `## 内容方向一/二（下方为策略表现有方向组合，括号内为已沉淀素材数，共 ${snap.total} 个组合）
+${lines.join('\n')}
+方向选取原则：优先复用现有方向；新建判断标准见下方判断规则。`;
+  if (saturated.length > 0) {
+    text += `
+
+**饱和方向预警**：以下方向已充分覆盖（素材数 ≥ ${SATURATED_DIR_MATERIALS}）：${saturated.join('、')}。当素材的核心叙事切入角度与这些饱和方向的既定内涵实质不同（不同人群、不同情绪入口、不同论证路径）时，优先新建二级方向（挂靠已有或新一级方向），不要挤进饱和方向；只有方向内核真正相同时才复用，并在「方向定义」中说明具体角度。`;
+  }
+  return text;
+}
+
+function buildAnalysisPrompt() {
+  return ANALYSIS_PROMPT.replace('__DIRECTION_ENUMS__', buildDirectionEnumSection());
+}
+
+function buildCommentAnalysisPrompt() {
+  return COMMENT_ANALYSIS_PROMPT.replace('__DIRECTION_ENUMS__', buildDirectionEnumSection());
+}
 
 const ANALYSIS_PROMPT = `# 角色
 你是一位资深短视频编导，擅长拆解爆款素材的叙事逻辑，并为品牌广告提供可落地的植入策略。
@@ -651,24 +843,11 @@ const ANALYSIS_PROMPT = `# 角色
 # 内容策略分析标准（用于输出「内容策略」字段）
 把这条素材沉淀为一条内容策略：回答「这条内容走什么叙事方向、产品怎么植入、找什么达人拍」。
 
-## 内容方向一（一级方向，优先从以下枚举中选，不满足时可新建）
-- 蹭热点：借时政/政策新闻的注意力，先吸睛再承接
-- 揭秘自己：博主自曝真实收入与资产结构，打破刻板印象
-- 借钱高性价比：揭秘「借到便宜的钱就是优势」的财富真相
-- 利息计算：硬核数学计算拆解利率陷阱，建立专业信任
-- 有钱人借钱：对比富人/普通人的资金思维差异
-- 网贷测评：较真打假视角反向实测，欲扬先抑
-- 回应解释：承接上期广告话题，回应质疑或做常规科普
-- 鸡汤：共情中年人处境，先理解再劝告
-- 避坑：守财导师视角，盘点钱财陷阱
-- 拒绝借钱：解决「抹不开面子又伤人情」的社交痛点
-
-## 内容方向二（二级方向，优先选所属一级方向下的枚举，不满足时可新建）
-蹭热点：时政新闻｜揭秘自己：生意赚多少钱、炒股是否财富自由｜借钱高性价比：借便宜的钱｜利息计算：详细计算｜有钱人借钱：对比富人｜网贷测评：反向测评｜回应解释：回怼回应、常规回应｜鸡汤：中年人借网贷不是堕落、求人不如靠自己、我为你们感到着急｜避坑：不要贪便宜｜拒绝借钱：如何有效拒绝借钱
+__DIRECTION_ENUMS__
 
 ## 判断规则
-1. 优先复用已有枚举：内容方向一和内容方向二先对照上述枚举判断，能贴合就选最贴切的那个（内容方向二必须在所选一级方向下属的二级枚举中选；切入角度不完全贴合时选语义最接近的，并在「方向定义」中说明具体角度）
-2. 新建判断标准：仅当素材的核心叙事在所有对应层级枚举中都找不到容身之处（强行套用会让方向失真、误导后续策略沉淀）时才新建。新建一级方向：命名简短（2-6字，与现有枚举风格一致），并在「方向定义」开头注明【新建方向】+一句话说明为什么已有方向都不适用；新建二级方向：必须挂靠一个一级方向（优先已有一级），命名要具体到能独立区分一批素材，同样在「方向定义」开头注明【新建方向】+理由。不要为了标新立异而新建——如果某条素材只是切入角度不同但方向内核相同，应复用枚举并在定义中说明角度
+1. 优先复用已有方向：内容方向一和内容方向二先对照上述方向判断，能贴合就选最贴切的那个（内容方向二必须在所选一级方向下属的二级方向中选；切入角度不完全贴合时选语义最接近的，并在「方向定义」中说明具体角度）
+2. 新建判断标准：仅当素材的核心叙事在所有对应层级方向中都找不到容身之处（强行套用会让方向失真、误导后续策略沉淀）时才新建。新建一级方向：命名简短（2-6字，与现有方向风格一致），并在「方向定义」开头注明【新建方向】+一句话说明为什么已有方向都不适用；新建二级方向：必须挂靠一个一级方向（优先已有一级），命名要具体到能独立区分一批素材，同样在「方向定义」开头注明【新建方向】+理由。素材的切入角度（人群、情绪入口、论证路径）与现有方向实质不同时，应倾向新建而不是硬套；只是措辞和锚点不同但方向内核相同的，才复用并在定义中说明角度
 3. 方向定义：1-3句，覆盖目标人群（给谁看）、核心叙事（讲什么故事/打破什么认知）、内容落点（最终引向什么）；只讲内容是什么，不要把植入逻辑写进定义
 4. 植入策略：一句话打法概括 + 具体示例，示例要展现完整的「内容→痛点→产品」推理链（参考本素材实际的植入方式或植入修改建议）；只写打法不给示例视为不合格
 5. 适合达人：按「达人类型分类标准」输出，粒度同「适配达人.达人类型」——整个一级类型都适合只写一级类型（如「财经」），仅限某二级适合才写「一级-二级」；可附 20 字以内的风格说明（如年龄段/职业身份/讲话风格）
@@ -720,7 +899,14 @@ function log(msg) {
 
 // Step 1: 生成搜索关键词（返回 [{keyword, direction, source}]）
 async function generateKeywords(existingIds) {
-  log('🔹 Step 1: 生成搜索关键词（三来源：策略直搜 + 策略衍生 + 开放探索）...');
+  // 反内循环配额（2026-09-15）：常规 直搜1+衍生1+探索2；连续零新策略 → 加强 直搜1+探索3（衍生暂停）
+  const growth = loadStrategyGrowth();
+  const boost = (growth.droughtStreak || 0) >= STRATEGY_DROUGHT_BOOST_THRESHOLD;
+  const directQuota = 1;
+  const deriveQuota = boost ? 0 : 1;
+  const exploreQuota = boost ? 3 : 2;
+  const totalQuota = directQuota + deriveQuota + exploreQuota;
+  log(`🔹 Step 1: 生成搜索关键词（${boost ? `加强探索模式：直搜${directQuota} + 探索${exploreQuota}，策略衍生暂停` : `直搜${directQuota} + 衍生${deriveQuota} + 探索${exploreQuota}`}）${boost ? `——已连续 ${growth.droughtStreak} 轮零新策略，自动提升探索配额` : ''}`);
 
   // 来源1/2：拉取内容策略清单（24h 缓存 + 兜底）
   const strategies = fetchStrategyDoc();
@@ -728,15 +914,16 @@ async function generateKeywords(existingIds) {
     .map(s => `- ${s.l1}-${s.l2}（${s.level}级）：${s.definition}`)
     .join('\n');
 
-  // 来源3：构建开放探索素材（固定 AI 自由衍生，2026-09-15 起不再走种子词+联想词）
+  // 来源3：构建开放探索素材（热点素材表新鲜热点优先，失败降级 AI 自由衍生）
   const explore = await buildExploreMaterial(existingIds || []);
-  const exploreLabel = explore.type === 'explore_suggest' ? '搜索联想词' :
-    explore.type === 'explore_comments' ? '高赞评论' : 'AI 自由衍生';
-  log(`   来源3开放探索：${exploreLabel}`);
+  const exploreLabel = explore.type === 'explore_hotspot' ? '热点素材表' :
+    explore.type === 'explore_suggest' ? '搜索联想词' :
+      explore.type === 'explore_comments' ? '高赞评论' : 'AI 自由衍生';
+  log(`   开放探索素材来源：${exploreLabel}（配额 ${exploreQuota} 个）`);
 
-  let prompt = KEYWORD_PROMPT
+  let prompt = buildKeywordPrompt(directQuota, deriveQuota, exploreQuota)
     .replace('__STRATEGY_LIST__', strategyListText)
-    .replace('__EXPLORE_MATERIAL__', explore.text || '（无开放探索素材，来源3请由 AI 自主衍生新方向）');
+    .replace('__EXPLORE_MATERIAL__', explore.text || '（无开放探索素材，开放探索来源请由 AI 自主衍生新方向）');
 
   // 近期关键词 + 近期方向（软约束注入 prompt；方向级避开用于阻断"反差职业收入"类反复衍生）
   const recentKeywords = loadRecentKeywords();
@@ -805,7 +992,7 @@ async function generateKeywords(existingIds) {
   let lastRejections = [];
   for (let attempt = 1; attempt <= MAX_GEN_ATTEMPTS; attempt++) {
     const attemptPrompt = lastRejections.length > 0
-      ? `${prompt}\n\n【上一轮生成结果已被程序查重拒绝，本次必须全部规避】\n${lastRejections.map(r => `- ${r}`).join('\n')}\n请重新生成 3 个与近期已用词及以上冲突词都不重复、不相似、不同句式模板的关键词。`
+      ? `${prompt}\n\n【上一轮生成结果已被程序查重拒绝，本次必须全部规避】\n${lastRejections.map(r => `- ${r}`).join('\n')}\n请重新生成 ${totalQuota} 个与近期已用词及以上冲突词都不重复、不相似、不同句式模板的关键词（保持原来源配额）。`
       : prompt;
     const rawDirs = await callKeywordLLM(attemptPrompt);
 
@@ -827,8 +1014,8 @@ async function generateKeywords(existingIds) {
   if (keywordDirs.length === 0) {
     throw new Error(`关键词生成失败：连续 ${MAX_GEN_ATTEMPTS} 轮生成的关键词全部与近期已用词重复/高度相似`);
   }
-  if (keywordDirs.length < 3) {
-    log(`   ⚠️ 查重后仅保留 ${keywordDirs.length} 个关键词（部分候选与近期词重复被拒）`);
+  if (keywordDirs.length < totalQuota) {
+    log(`   ⚠️ 查重后仅保留 ${keywordDirs.length} 个关键词（预期 ${totalQuota}，部分候选与近期词重复被拒）`);
   }
 
   log(`   最终采用 ${keywordDirs.length} 个关键词:`);
@@ -1025,7 +1212,7 @@ ${script}${metaSection}`;
     body: JSON.stringify({
       model: DEEPSEEK_MODEL,
       messages: [
-        { role: 'system', content: ANALYSIS_PROMPT },
+        { role: 'system', content: buildAnalysisPrompt() },
         { role: 'user', content: userInput }
       ],
       max_tokens: 4096,
@@ -1103,8 +1290,8 @@ const COMMENT_ANALYSIS_PROMPT = `# 角色
 - 输出粒度：整个一级类型都适合就只输出一级分类（如「财经」）；仅限某二级适合才输出「一级-二级」
 
 # 内容策略分析标准（与脚本分析一致）
-内容方向一优先从以下枚举中选：蹭热点、揭秘自己、借钱高性价比、利息计算、有钱人借钱、网贷测评、回应解释、鸡汤、避坑、拒绝借钱
-内容方向二优先从所属一级方向下属枚举中选，不满足时新建并注明【新建方向】+理由
+__DIRECTION_ENUMS__
+内容方向二优先选所属一级方向下属的现有方向，不满足时新建并注明【新建方向】+理由；素材切入角度与饱和方向实质不同时优先新建二级方向
 植入策略：一句话打法概括 + 具体示例，示例展现完整的「评论痛点→产品」推理链
 
 # 约束条件
@@ -1157,7 +1344,7 @@ ${topComments}${metaSection}`;
       body: JSON.stringify({
         model: DEEPSEEK_MODEL,
         messages: [
-          { role: 'system', content: COMMENT_ANALYSIS_PROMPT },
+          { role: 'system', content: buildCommentAnalysisPrompt() },
           { role: 'user', content: userInput }
         ],
         max_tokens: 4096,
@@ -1726,7 +1913,7 @@ async function syncStrategyTable(results) {
   const allStrategyItems = [...withStrategy, ...withCommentInsight];
   if (allStrategyItems.length === 0) {
     log('   （本轮无内容策略产出，跳过）');
-    return { created: 0, updated: 0, skipped: 0 };
+    return { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: 0, skipped: 0 };
   }
   if (withCommentInsight.length > 0) {
     log(`   其中脚本来源策略 ${withStrategy.length} 条，评论洞察来源策略 ${withCommentInsight.length} 条`);
@@ -1737,7 +1924,7 @@ async function syncStrategyTable(results) {
     existing = fetchStrategyRecords();
   } catch (error) {
     log(`   ❌ 读取策略表失败，跳过同步: ${error.message.substring(0, 200)}`);
-    return { created: 0, updated: 0, skipped: allStrategyItems.length };
+    return { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: allStrategyItems.length, skipped: allStrategyItems.length };
   }
   log(`   策略表现有 ${existing.size} 个方向组合`);
 
@@ -1753,6 +1940,8 @@ async function syncStrategyTable(results) {
   const createRecords = [];
   const updateRecords = {};
   let created = 0, updated = 0;
+  // 反内循环统计（2026-09-15）：appended = 追加的新打法条数；mergedOnly = 仅并入素材链接ids的条数
+  let appended = 0, mergedOnly = 0;
 
   for (const [key, items] of grouped) {
     const [dir1, dir2] = key.split('|');
@@ -1768,6 +1957,8 @@ async function syncStrategyTable(results) {
       const dedupeOk = verdicts !== null;
       const dupCount = dedupeOk ? verdicts.filter(v => v === 'duplicate').length : items.length;
       const newItems = dedupeOk ? items.filter((_, i) => verdicts[i] === 'new') : [];
+      appended += newItems.length;
+      mergedOnly += dedupeOk ? dupCount : items.length;
 
       const mergedIds = [...new Set([...(exist.素材链接ids ? exist.素材链接ids.split('、') : []), ...newIds])].join('、');
       const updateFields = { '素材链接ids': mergedIds };
@@ -1798,6 +1989,8 @@ async function syncStrategyTable(results) {
         const verdicts = await dedupeStrategies(植入策略, items.slice(1));
         const dedupeOk = verdicts !== null;
         const newItems = dedupeOk ? items.slice(1).filter((_, i) => verdicts[i] === 'new') : [];
+        appended += newItems.length;
+        mergedOnly += dedupeOk ? (items.length - 1 - newItems.length) : (items.length - 1);
         if (newItems.length > 0) {
           植入策略 += '\n\n' + newItems.map(r => `【素材补充 dy_${r.aweme_id}】${r.analysis.内容策略['植入策略']}`).join('\n\n');
         }
@@ -1858,9 +2051,9 @@ async function syncStrategyTable(results) {
     log(`   ✅ 内容策略同步完成：新建 ${created} 行，更新 ${updated} 行`);
   } catch (error) {
     log(`   ❌ 策略表写入失败: ${error.message.substring(0, 300)}`);
-    return { created: 0, updated: 0, skipped };
+    return { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: allStrategyItems.length, skipped };
   }
-  return { created, updated, skipped: 0 };
+  return { created, updated, appended, mergedOnly, items: allStrategyItems.length, skipped: 0 };
 }
 
 // 发送飞书通知（每次运行结束都发，含成功/失败/放弃统计）
@@ -1898,7 +2091,10 @@ function sendFeishuNotification(summary, quotaExhausted) {
     }
 
     if (summary.strategy_created !== undefined) {
-      lines.push(`- 🧭 内容策略沉淀：新建 ${summary.strategy_created} 行，更新 ${summary.strategy_updated} 行`);
+      lines.push(`- 🧭 内容策略沉淀：新建 ${summary.strategy_created} 行，更新 ${summary.strategy_updated} 行（追加新打法 ${summary.strategy_appended || 0} 条，仅并入素材 ${summary.strategy_merged_only || 0} 条）`);
+    }
+    if ((summary.drought_streak || 0) >= 2) {
+      lines.push(`- ⚠️ 策略库内循环预警：已连续 ${summary.drought_streak} 轮零新策略产出，下轮探索配额自动提升（探索词 2→3、策略衍生暂停）`);
     }
 
     if (quotaExhausted) {
@@ -2322,11 +2518,19 @@ async function main() {
 
   // Step 6: 内容策略沉淀（按内容方向一/二聚合去重，写入策略表）
   log('🔹 Step 6: 内容策略沉淀（度小满-网络创意策略表）...');
-  let strategyResult = { created: 0, updated: 0, skipped: 0 };
+  let strategyResult = { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: 0, skipped: 0 };
   try {
     strategyResult = await syncStrategyTable(results);
   } catch (error) {
     log(`   ⚠️ 内容策略同步异常（不影响主流程）: ${error.message.substring(0, 200)}`);
+  }
+
+  // 策略库生长统计（反内循环预警）：零新策略连续 N 轮 → 下轮自动提升探索配额
+  let growthAfter = null;
+  try {
+    growthAfter = updateStrategyGrowth(strategyResult, strategyResult.items || 0);
+  } catch (error) {
+    log(`   ⚠️ 策略库生长统计更新失败（不影响主流程）: ${error.message.substring(0, 150)}`);
   }
 
   // 每次运行结束都发送飞书通知
@@ -2338,6 +2542,9 @@ async function main() {
       bitable_success: bitableResult.success,
       strategy_created: strategyResult.created,
       strategy_updated: strategyResult.updated,
+      strategy_appended: strategyResult.appended,
+      strategy_merged_only: strategyResult.mergedOnly,
+      drought_streak: growthAfter ? growthAfter.droughtStreak : 0,
       keywords: keywords
     },
     state.quotaExhausted
