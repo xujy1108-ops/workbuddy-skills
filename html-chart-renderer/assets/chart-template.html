@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Chart Template</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  background: linear-gradient(135deg, #e8f1ff 0%, #f5f9ff 50%, #eef4ff 100%);
+  width: 1600px;
+  height: 820px;
+  overflow: hidden;
+  position: relative;
+  color: #0B2A5C;
+}
+.watermark {
+  position: absolute;
+  top: -50%; left: -50%;
+  width: 200%; height: 200%;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.055;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240' viewBox='0 0 240 240'%3E%3Ctext x='0' y='160' fill='%231a5fd6' font-size='18' font-family='Arial' font-weight='700' transform='rotate(-25 0 160)'%3ETOPKLOUT.COM%3C/text%3E%3C/svg%3E");
+}
+.container {
+  position: relative;
+  z-index: 1;
+  width: 100%; height: 100%;
+  padding: 50px 70px 40px 70px;
+}
+.title {
+  font-size: 34px;
+  font-weight: 800;
+  text-align: center;
+  margin-bottom: 35px;
+  letter-spacing: 1px;
+}
+.main {
+  display: flex;
+  gap: 50px;
+  height: 620px;
+}
+.panel {
+  background: rgba(255,255,255,0.5);
+  border-radius: 24px;
+  padding: 30px;
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.8);
+  box-shadow: 0 18px 60px rgba(30, 80, 160, 0.12);
+}
+.card {
+  background: rgba(255,255,255,0.55);
+  border-radius: 22px;
+  padding: 28px 30px;
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.85);
+  box-shadow: 0 14px 48px rgba(30, 80, 160, 0.1);
+  position: relative;
+  overflow: hidden;
+}
+.card::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 6px;
+}
+.card.blue::before { background: linear-gradient(180deg, #2b7fff, #1a6de0); }
+.card.orange::before { background: linear-gradient(180deg, #ff9a4d, #ff7a2e); }
+.card-tag {
+  display: inline-block;
+  padding: 8px 22px;
+  border-radius: 20px;
+  font-size: 17px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 16px;
+}
+.card.blue .card-tag { background: linear-gradient(90deg, #2b7fff, #1a6de0); }
+.card.orange .card-tag { background: linear-gradient(90deg, #ff9a4d, #ff7a2e); }
+.card-text {
+  font-size: 17px;
+  line-height: 1.85;
+  color: #3a5278;
+}
+.bar {
+  border-radius: 16px 16px 8px 8px;
+  background: linear-gradient(180deg, #5ba3ff 0%, #2b7fff 60%, #1a6de0 100%);
+  box-shadow: 0 12px 32px rgba(43,127,255,0.3);
+}
+</style>
+</head>
+<body>
+<div class="watermark"></div>
+<div class="container">
+  <div class="title">在这里填写主标题</div>
+  <div class="main">
+    <!-- 左侧：图表区域 -->
+    <div class="panel" style="flex: 1;">
+      <div style="font-size: 17px; color: #3A5A8A; font-weight: 600; margin-bottom: 20px;">在这里填写图表副标题</div>
+      <!-- 自定义图表内容 -->
+    </div>
+    <!-- 右侧：洞察卡片 -->
+    <div style="width: 420px; display: flex; flex-direction: column; gap: 30px;">
+      <div class="card blue">
+        <div class="card-tag">卡片标签</div>
+        <div class="card-text">在这里填写蓝色卡片说明文字。</div>
+      </div>
+      <div class="card orange">
+        <div class="card-tag">卡片标签</div>
+        <div class="card-text">在这里填写橙色卡片说明文字。</div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
