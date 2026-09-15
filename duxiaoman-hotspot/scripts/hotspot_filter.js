@@ -22,14 +22,20 @@
  *   头部达人 +7 天（查是否仍在讲同一话题）
  *   平台热榜 +3 天（冷却淘汰，到期直接下线）
  *
+ * 表级去重（2026-09-16 新增）：
+ *   入表前先读素材表已有「热点标题」，按归一化标题（去话题标签与标点）比对，
+ *   已存在则跳过——修复"每轮全量重写入表导致同题重复"的问题。
+ *   需要强制全量写入时加 --force-write。
+ *
  * 使用方法：
- *   node hotspot_filter.js [--input <collect.json>] [--channels ...] [--top 20] [--dry-run] [--debug]
+ *   node hotspot_filter.js [--input <collect.json>] [--channels ...] [--top 20] [--dry-run] [--force-write] [--debug]
  *
  * 参数：
  *   --input <file>   直接读取 hotspot_collect.js 已生成的 JSON 结果（跳过采集）
  *   --channels       采集渠道（仅未指定 --input 时生效），默认 douyin,xhs,kuaishou,weibo,bilibili,gov,creator
  *   --top N          每渠道取前 N 条送 AI 判断（默认 20）
  *   --dry-run        只判断不入表（用于观察 AI 判断结果）
+ *   --force-write    跳过表级去重，全部入表（默认跳过表中已存在同标题的热点）
  *   --debug          输出 AI 原始返回片段
  *
  * 环境变量：
@@ -326,8 +332,60 @@ function makeOverview(item, judge, meta) {
   return parts.join('\n');
 }
 
+// ============ 表级去重键（比采集期 normalizeTopic 更强：去话题标签 + 去标点） ============
+// 同一热点在不同轮次/不同渠道抓到时，标题可能带不同话题标签或标点差异，
+// 归一化到"纯中文英文数字"后再比对，才认得出是同一条。
+function dedupKey(t) {
+  return (t || '')
+    .replace(/#[^\s#]+/g, '')                    // 去话题标签 #xxx
+    .replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, '')   // 只保留中英文数字
+    .toLowerCase();
+}
+
+// ============ 读取素材表已有记录（表级去重用） ============
+// 注意：lark-cli 的 --limit 在 json 格式下上限为 200（ndjson 为 2000，但记录会落到外部文件），
+// 因此这里用 json + limit 200；表内记录超过 200 条时会告警提示去重覆盖不全。
+function fetchExistingKeys() {
+  try {
+    const output = execFileSync(LARK_CLI, [
+      'base', '+record-list',
+      '--base-token', HOTSPOT_BASE_TOKEN,
+      '--table-id', HOTSPOT_TABLE_ID,
+      '--field-id', '热点标题',
+      '--field-id', '热点ID',
+      '--limit', '200',
+      '--as', 'user',
+      '--format', 'json'
+    ], {
+      encoding: 'utf-8',
+      timeout: 60000,
+      env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' },
+      maxBuffer: 50 * 1024 * 1024
+    });
+    const resp = JSON.parse(output);
+    if (!resp?.ok) throw new Error(resp?.error?.message || 'record-list 返回 ok=false');
+    const rows = resp?.data?.data || [];
+    if (resp?.data?.has_more) {
+      log('   ⚠️ 表内记录已超 200 条上限，本轮去重只覆盖前 200 条');
+    }
+    const titles = new Set();
+    const ids = new Set();
+    for (const r of rows) {
+      const k = dedupKey(r[0]);
+      if (k) titles.add(k);
+      const id = String(r[1] || '').trim();
+      if (id) ids.add(id);
+    }
+    log(`   📖 已读表 ${rows.length} 条记录（用于去重比对）`);
+    return { titles, ids, count: rows.length };
+  } catch (e) {
+    log(`   ⚠️ 读取已有记录失败，本轮跳过去重（${e.message.substring(0, 160)}）`);
+    return null;
+  }
+}
+
 // ============ 写入飞书热点素材表（11 字段） ============
-function writeToBitable(records) {
+function writeToBitable(records, existing) {
   if (!HOTSPOT_BASE_TOKEN || !HOTSPOT_TABLE_ID) {
     log('⚠️ 未配置 HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID，跳过飞书写入');
     return { success: 0, skipped: true };
@@ -337,8 +395,28 @@ function writeToBitable(records) {
     return { success: 0 };
   }
 
+  // 表级去重：标题在表中已存在 → 跳过，避免同一热点跨轮次重复入表
+  let toCreate = records;
+  let dupSkipped = [];
+  if (existing && existing.titles.size > 0) {
+    toCreate = [];
+    for (const r of records) {
+      const k = dedupKey(r.topic);
+      if (k && existing.titles.has(k)) { dupSkipped.push(r.topic); continue; }
+      toCreate.push(r);
+    }
+    if (dupSkipped.length > 0) {
+      log(`🔹 表级去重：${records.length} 条中 ${dupSkipped.length} 条已在表中，跳过`);
+      for (const t of dupSkipped) log(`   ⏭️  ${t.substring(0, 52)}`);
+    }
+    if (toCreate.length === 0) {
+      log('🔹 无新热点需要写入');
+      return { success: 0, skipped_existing: dupSkipped.length };
+    }
+  }
+
   const today = new Date().toISOString().substring(0, 10); // yyyy-MM-dd，飞书 datetime 字段接受
-  const createRecords = records.map(r => ({
+  const createRecords = toCreate.map(r => ({
     '热点ID': r.hot_id,
     '热点标题': r.topic,
     '热点概述': r.overview,
@@ -370,11 +448,20 @@ function writeToBitable(records) {
     });
     const resp = JSON.parse(output);
     const count = resp?.data?.record_id_list?.length || 0;
-    log(`   ✅ 写入 ${count} 条`);
-    return { success: count };
+    log(`   ✅ 写入 ${count} 条${dupSkipped.length ? `（另跳过已存在 ${dupSkipped.length} 条）` : ''}`);
+    return { success: count, skipped_existing: dupSkipped.length };
   } catch (error) {
+    // 失败落盘：入表失败时把待写数据存成文件，直接重放即可，不必再从日志里捞转义 JSON
+    let dumpPath = null;
+    try {
+      dumpPath = path.join(SCRIPT_DIR, `pending_bitable_${Date.now()}.json`);
+      fs.writeFileSync(dumpPath, payload, 'utf-8');
+      log(`   💾 待入表数据已落盘：${dumpPath}`);
+    } catch (e2) {
+      log(`   ⚠️ 落盘失败：${e2.message.substring(0, 120)}`);
+    }
     log(`   ❌ 写入失败: ${error.message.substring(0, 400)}`);
-    return { success: 0, failed: error.message };
+    return { success: 0, failed: error.message, pending_file: dumpPath };
   }
 }
 
@@ -408,6 +495,7 @@ async function main() {
     channels: 'douyin,xhs,kuaishou,weibo,bilibili,gov,creator',
     top: 20,
     dryRun: false,
+    forceWrite: false,
     debug: false
   };
   for (let i = 0; i < args.length; i++) {
@@ -415,6 +503,7 @@ async function main() {
     else if (args[i] === '--channels' && args[i + 1]) opts.channels = args[++i];
     else if (args[i] === '--top' && args[i + 1]) opts.top = Number(args[++i]);
     else if (args[i] === '--dry-run') opts.dryRun = true;
+    else if (args[i] === '--force-write') opts.forceWrite = true;
     else if (args[i] === '--debug') opts.debug = true;
   }
 
@@ -539,10 +628,16 @@ async function main() {
   const bumpOnly = toWrite.filter(r => r.placement === '仅蹭热度').length;
   log(`📊 植入方式：直接阐述 ${direct} | 隐喻植入 ${metaphor} | 仅蹭热度 ${bumpOnly}`);
 
-  // Step 4: 写飞书（除非 dry-run）
+  // Step 4: 写飞书（除非 dry-run）。默认先读表做表级去重，避免同一热点跨轮次重复入表
   let writeResult = { success: 0, skipped: true };
   if (!opts.dryRun) {
-    writeResult = writeToBitable(toWrite);
+    if (opts.forceWrite) {
+      log('ℹ️ --force-write：跳过表级去重，全量入表');
+      writeResult = writeToBitable(toWrite, null);
+    } else {
+      const existing = fetchExistingKeys();
+      writeResult = writeToBitable(toWrite, existing);
+    }
   } else {
     log('ℹ️ --dry-run 模式，跳过飞书写入');
   }
