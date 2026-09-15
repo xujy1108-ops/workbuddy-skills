@@ -1,7 +1,15 @@
-"""步骤 6-7 — 每个大纲写完整脚本 + 多维度评分。
+"""步骤 6 — 写脚本 + 评分（SOP 文档驱动版，2026-09-09 改造）。
 
-输入：达人风格 JSON + 用户选中的大纲 + 素材库/历史数据库内容
-输出：每个大纲的完整脚本 + 评分
+改造要点：
+- 大纲步骤移除：directions → scripts 直通
+- 写稿依据按 track 分线注入 SOP 文档（运行时实时拉取）：
+  蹭热点方向 → 《度小满-脚本SOP-热点-V2》
+  其他方向   → 《度小满-脚本SOP-非热点-V2》
+- 评分依据：《度小满-口播脚本评分标准-V2》（第0条合规红线一票否决 + 8 维度各 0-2 分，满分 16）
+- 产品上下文：方向自带的植入策略/叙事策略 + source_material_ids 现拉网络素材库
+  （历史数据库、step2 依赖全部移除）
+
+产出：完整口播逐字稿（含【模块·打法】标签，220-390 字 / 60-90s）+ 合规检查 + 8 维度评分。
 """
 
 from __future__ import annotations
@@ -11,102 +19,77 @@ import logging
 from typing import Any
 
 from agents.base import AgentSpec
+from config.settings import (
+    SCORING_STANDARD_DOC_URL,
+    SOP_HOTSPOT_DOC_URL,
+    SOP_NONHOTSPOT_DOC_URL,
+)
 from providers.llm import run_llm
+from tools.feishu import fetch_doc_content, fetch_materials_by_ids
 
 logger = logging.getLogger(__name__)
 
-SPEC = AgentSpec(
-    name="script-writer",
-    instructions="""你是一位顶尖的短视频脚本写手兼内容评分专家。
+_HOTSPOT_TRACK = "蹭热点"
+
+_SPEC_COMMON_INSTRUCTIONS = """你是一位顶尖的短视频口播脚本写手兼内容评分专家，严格遵循度小满脚本 SOP 与评分标准工作。
 
 ## 任务
-为每个选中的大纲，撰写完整的短视频脚本，并按用户定义的 7 维度评分标准进行评分。
+为每个选中的创意方向，产出可直接配音拍摄的**完整口播逐字稿**，并按《口播脚本评分标准》评分。
 
-## 输入
-1. 达人风格 JSON（7 维度，尤其关注"脚本生成指南"中的开头/中段/结尾约束、语态、用词风格）
-2. 用户选中的大纲列表（每个含钩子、结构、情绪曲线、质检结果）
-3. 网络素材库内容（含素材脚本文案、广告可借鉴点、内容方向等）
-4. 历史投放数据（含脚本文案、播放量、转化是否达标等）
+## 工作方式（严格按注入的 SOP 文档执行）
+1. **先按 SOP 第三节"脚本生成推导流程"逐方向推导**：
+   Step 0 加载达人风格定基调 → Step 1 定钩子类与打法 → Step 2 定转折打法+链路收口
+   → Step 3 定度小满角色定位 → Step 4 套植入 SOP（场景触发→信任定调→反向对标→合规叠甲）
+   → Step 5 选收尾叠加 → Step 6 对照检验机制自检
+2. **产出物是逐字稿，不是要点**：按"钩子→承接→转折→植入→收尾"的功能顺序写满台词，
+   每个模块开头用标签标注钩子类与所选打法（如【钩子·B1反常识观点】【热点承接·A政策翻译】），
+   标签后紧跟成段台词，禁止只写要点。
+3. **硬约束**：总时长 60-90 秒，字数 220-390 字（220-260 字/分钟）；
+   钩子到植入叙事传动 ≤1 次；转折段收口必须落"普适选择原则 + 可验证标准"两件套；
+   植入 4 步不可跳，反向对标的卖点必须与转折收口的标准一一咬合。
+4. **达人口吻定基调**：创意/热点决定"讲什么"，达人风格决定"怎么讲"——
+   严格执行达人风格 JSON 中的语速、语气、用词习惯、口头禅、视觉符号；
+   是达人在解读热点/讲创意，不是念通稿。
+5. **场景落位**：按方向的「场景」字段确定画面发生地（在哪拍、什么场合、几个人），
+   逐字稿与场景相容——「对镜口播（无场景情节）」的方向不加剧情画面提示；
+   带具体场景的方向（酒席饭桌/职场办公/户外街头等）按该场景写画面提示与情绪落点。
+   关联素材的「场景+内容分析」只用于判断"这个方向在现实里长什么样"，
+   不是要逐句复刻素材文案——话术由你按 SOP 重写。
 
-## 写稿要求
-1. **完整脚本**：从第一句到最后一句，包含口播文案 + 画面/动作提示
-2. **风格还原**：严格遵循达人的语态、用词习惯、节奏特点
-3. **结构落地**：大纲中的每个段落都要在脚本中体现
-4. **商业自然**：植入内容与内容本身无缝融合
-5. **时长控制**：脚本总时长 60-90 秒（口播字数约 200-350 字）
-6. **产品匹配**：脚本必须围绕素材库中的产品/主题展开（如度小满借贷相关），不能偏离
+## 评分（写完自评，严格按注入的《口播脚本评分标准》）
+1. **第 0 条合规红线先行**：逐条检查红线清单，任何一条踩线 → compliance_check.passed=false
+   并列出违规项（该脚本标记为需重写）。
+2. 通过红线后按 **8 维度**评分（每维 0-2 分，满分 16）：
+   ①开头吸引力（按脚本所用 A-D 类对应标准）②创造需求准度（删名测试）③达人匹配度
+   （朗读去品牌名测试）④创造需求速度（按钩子类型时间窗）⑤植入逻辑链条
+   （四步完整+传动≤1+铺垫顺滑三重校验）⑥信息密度与节奏（逐句功能标注）⑦切入方向
+   （代入测试；蹭热点须第一段约10秒内落到个人利益）⑧收尾质量（替换测试）
+3. 每个维度必须在 score_notes 中给出具体评分理由（引用脚本原文佐证）。
 
-## 脚本格式
-```
-[画面：xxx]
-（口播文案）
-
-[画面：xxx]
-（口播文案）
-...
-```
-
-## 评分标准（7 维度，每维度 0-2 分，满分 14 分）
-
-### 1. 开头吸引力度（0-2 分）
-- **0 分**：看完前 3 秒就不想看了；和受众太遥远，不会有直接的利益相关，或者利益点大家不在乎
-- **1 分**：看完前 3 秒有点好奇；有钩子但偏弱或延迟出现；和受众利益相关但受众较小或不觉得重要
-- **2 分**：看完前 3 秒一定要看下去；强冲突/反常识/利益点直给，0 铺垫抓人；和受众利益息息相关
-
-### 2. 创造需求准度（0-2 分）
-场景内产生的问题和解决方案是否匹配，且匹配对应的场景卖点
-- **0 分**：别的产品更能满足
-- **1 分**：有好多个产品可以满足
-- **2 分**：只有你这个产品可以满足
-
-### 3. 达人匹配度（谁在说）（0-2 分）
-- **0 分**：人设割裂——内容风格、语气、价值观与达人日常视频明显不符；像品牌方硬塞的广告文案
-- **1 分**：形式贴合，内核生硬——使用了达人常用场景或口头禅，但产品植入突兀；逻辑和情绪不像真实分享
-- **2 分**：人设融合，自然流露——产品作为解决方案从达人真实经历/观点中自然生长出来；去掉品牌名仍符合其内容主线
-
-### 4. 创造需求速度（和钱相关，和个人相关）（0-2 分）
-- **0 分**：【资金、工资、借贷】/【意外、门诊保险相关话题】等围绕钱的要素在 10s 后露出
-- **1 分**：【资金、工资、借贷】/【意外、门诊保险相关话题】等围绕钱的要素 3-10s 后露出
-- **2 分**：【资金、工资、借贷】/【意外、门诊保险相关话题】等围绕钱的要素前 3 秒露出
-
-### 5. 植入逻辑链条（怎么说）（0-2 分）
-- **0 分**：无铺垫，直接说"用 xx 产品"
-- **1 分**：有痛点，但解决方案跳跃
-- **2 分**：痛点 → 原则 → 标准 → 产品（完整链路）
-
-### 6. 信息密度与节奏（0-2 分）
-- **0 分**：多处 >3 秒信息真空，节奏拖沓断档，同义反复/废话多，核心观点被稀释
-- **1 分**：存在 1-2 处平淡叙述，节奏平稳无亮点，核心清晰但夹杂过渡词或口语重复
-- **2 分**：每 5-8 秒必有钩子/数据/金句/画面/情绪转折，零废话，每句承担明确功能
-
-### 7. 剧情合理程度（如果是剧情号）（0-2 分）
-每个角色的台词和表达内容是否符合该人设的利益点
-- **0 分**：对白书面，行为不符合逻辑
-- **1 分**：对白和行为略显瑕疵
-- **2 分**：对白口语符合人设
-- 注：非剧情号（纯口播/科普类）此维度默认 2 分
-
-## 输出格式（严格 JSON）
-```json
+## 输出格式（严格 JSON，禁止 markdown 代码块包裹）
 {
   "scripts": [
     {
-      "outline_id": "1A",
-      "outline_title": "大纲标题",
-      "direction_title": "方向名称",
-      "script": "完整脚本文案（含画面提示和口播）",
-      "word_count": 280,
+      "direction_id": 1,
+      "direction_title": "来源方向标题",
+      "track": "蹭热点 或 其他方向",
+      "hook_class": "钩子类（A/B/C/D）+ 打法（如 A1权威事件开场）",
+      "title": "脚本标题",
+      "script": "完整口播逐字稿（含【模块·打法】标签与成段台词）",
+      "word_count": 300,
       "estimated_duration": "75s",
+      "compliance_check": {"passed": true, "violations": []},
       "score": {
         "hook_appeal": 2,
-        "demand_accuracy": 1,
+        "demand_accuracy": 2,
         "influencer_fit": 2,
         "demand_speed": 2,
         "placement_logic": 1,
         "info_density": 2,
-        "plot_rationality": 2,
-        "total": 12,
-        "total_max": 14
+        "entry_direction": 2,
+        "ending_quality": 2,
+        "total": 15,
+        "total_max": 16
       },
       "score_notes": {
         "hook_appeal": "评分理由",
@@ -115,86 +98,161 @@ SPEC = AgentSpec(
         "demand_speed": "评分理由",
         "placement_logic": "评分理由",
         "info_density": "评分理由",
-        "plot_rationality": "评分理由"
+        "entry_direction": "评分理由",
+        "ending_quality": "评分理由"
       },
-      "style_fit_analysis": "脚本如何匹配达人风格的说明"
+      "style_fit_analysis": "脚本如何匹配达人风格的说明（<=80字）"
     }
   ]
 }
-```
 
 ## 约束
-- 每个大纲产出 1 个完整脚本
-- script 字段必须是完整可用的脚本文案，不要缩写
-- 评分严格按上述标准，实事求是，不要全打满分
-- total = 7 个维度分数之和，total_max 固定 14
-- score_notes 中每个维度必须给出具体评分理由
+- 每个方向产出 1 个完整脚本，script 字段必须是完整可拍摄逐字稿，不要缩写
+- 评分实事求是，不要全打满分；不达标就如实扣分
+- compliance_check 与 8 维度评分分开：红线是门槛，评分是质量
 - 只输出 JSON，不要其他文字
-""",
-    max_tokens=8192,
+"""
+
+SPEC = AgentSpec(
+    name="script-writer",
+    instructions=_SPEC_COMMON_INSTRUCTIONS,
+    max_tokens=16384,
 )
 
 
 def run_script_writer(
     style_json: dict[str, Any],
-    selected_outlines: list[dict[str, Any]],
-    step2_result: dict[str, Any] | None = None,
+    selected_directions: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """步骤 6-7 主入口。
+    """步骤 6 主入口（SOP 驱动版）。
 
     Args:
         style_json: 达人风格 JSON
-        selected_outlines: 用户选中的大纲列表
-        step2_result: 步骤 2 的输出（含素材库/历史数据），用于提供产品上下文
+        selected_directions: 用户选中的创意方向列表（directions 步骤输出的子集）
 
     Returns:
         脚本 + 评分 JSON dict
     """
-    logger.info("步骤 6: 为 %d 个大纲写脚本...", len(selected_outlines))
+    logger.info("步骤 6: 为 %d 个方向写脚本（SOP 驱动）...", len(selected_directions))
 
-    user_text = _build_user_text(style_json, selected_outlines, step2_result)
+    # 1. 拉取 SOP 与评分标准文档（失败即报错：写稿依据缺失不应静默降级）
+    sop_docs = _load_sop_docs()
+
+    # 2. 反查网络素材库（方向的 source_material_ids）
+    materials_by_direction = _fetch_direction_materials(selected_directions)
+
+    # 3. 按 track 分线：蹭热点 → 热点 SOP；其他 → 非热点 SOP
+    hotspot_dirs = [d for d in selected_directions if d.get("track") == _HOTSPOT_TRACK]
+    other_dirs = [d for d in selected_directions if d.get("track") != _HOTSPOT_TRACK]
+    logger.info("分线: 蹭热点 %d 个 / 其他方向 %d 个", len(hotspot_dirs), len(other_dirs))
+
+    scripts: list[dict[str, Any]] = []
+    if hotspot_dirs:
+        scripts += _write_group(
+            style_json, hotspot_dirs, sop_docs["hotspot"], sop_docs["scoring"],
+            materials_by_direction,
+        )
+    if other_dirs:
+        scripts += _write_group(
+            style_json, other_dirs, sop_docs["nonhotspot"], sop_docs["scoring"],
+            materials_by_direction,
+        )
+
+    # 按原始方向顺序排列
+    order = {d.get("id"): i for i, d in enumerate(selected_directions)}
+    scripts.sort(key=lambda s: order.get(s.get("direction_id"), 99))
+    return {"scripts": scripts}
+
+
+def _load_sop_docs() -> dict[str, str]:
+    """拉取两套 SOP + 评分标准文档全文。"""
+    docs: dict[str, str] = {}
+    for key, url, name in [
+        ("hotspot", SOP_HOTSPOT_DOC_URL, "脚本SOP-热点"),
+        ("nonhotspot", SOP_NONHOTSPOT_DOC_URL, "脚本SOP-非热点"),
+        ("scoring", SCORING_STANDARD_DOC_URL, "口播脚本评分标准"),
+    ]:
+        try:
+            text = fetch_doc_content(url)
+            docs[key] = text
+            logger.info("已拉取《%s》（%d 字）", name, len(text))
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"拉取《{name}》失败（写稿依据缺失，不降级）: {e}") from e
+    return docs
+
+
+def _fetch_direction_materials(
+    directions: list[dict[str, Any]],
+) -> dict[int, list[dict]]:
+    """按方向的 source_material_ids 反查网络素材库，作为写稿参照。"""
+    result: dict[int, list[dict]] = {}
+    for d in directions:
+        ids = d.get("source_material_ids") or []
+        if not ids:
+            continue
+        mats = fetch_materials_by_ids(ids)
+        if mats:
+            result[d.get("id")] = mats
+            logger.info("方向 %s: 反查到 %d/%d 条素材", d.get("id"), len(mats), len(ids))
+    return result
+
+
+def _write_group(
+    style_json: dict[str, Any],
+    directions: list[dict[str, Any]],
+    sop_text: str,
+    scoring_text: str,
+    materials_by_direction: dict[int, list[dict]],
+) -> list[dict[str, Any]]:
+    """同一 track 的一组方向，注入对应 SOP，一次 LLM 调用产出。"""
+
+    def slim_direction(d: dict) -> dict:
+        did = d.get("id")
+        mats = materials_by_direction.get(did, [])
+        return {
+            "id": did,
+            "title": d.get("title"),
+            "track": d.get("track"),
+            "hotspot_id": d.get("hotspot_id") or "",
+            "内容方向定义": d.get("content_direction"),
+            "场景": d.get("scene") or "",
+            "植入策略": d.get("implant_strategy"),
+            "适合达人": d.get("suitable_influencer"),
+            "叙事策略": d.get("narrative_strategy") or "",
+            "source_material_ids": d.get("source_material_ids") or [],
+            "关联素材（场景+内容分析+可借鉴点）": [
+                {
+                    "素材id": m.get("素材id"),
+                    "场景": m.get("场景") or "",
+                    "内容分析": (m.get("内容分析") or "")[:800],
+                    "广告可借鉴点": (m.get("广告可借鉴点") or "")[:800],
+                }
+                for m in mats
+            ],
+            "风格适配说明": d.get("style_fit"),
+        }
+
+    user_text = json.dumps({
+        "达人风格": style_json,
+        "选中的创意方向": [slim_direction(d) for d in directions],
+        "组织要求": "每个方向产出 1 个完整口播逐字稿 + 合规检查 + 8 维度评分",
+    }, ensure_ascii=False, indent=2)
+
+    full_text = (
+        f"{user_text}\n\n"
+        f"## 脚本 SOP 文档全文（硬性依据，按推导流程执行）\n{sop_text}\n\n"
+        f"## 《口播脚本评分标准》全文（评分依据）\n{scoring_text}"
+    )
 
     result = run_llm(
         agent_name=SPEC.name,
         system=SPEC.instructions,
-        user_text=user_text,
+        user_text=full_text,
         max_tokens=SPEC.max_tokens,
         temperature=0.7,
     )
-
-    return _parse_json(result.text)
-
-
-def _build_user_text(
-    style_json: dict,
-    outlines: list[dict],
-    step2_result: dict | None,
-) -> str:
-    parts: list[str] = []
-
-    parts.append("## 达人风格 JSON\n")
-    parts.append(json.dumps(style_json, ensure_ascii=False, indent=2))
-
-    parts.append("\n\n## 用户选中的大纲\n")
-    parts.append(json.dumps(outlines, ensure_ascii=False, indent=2))
-
-    if step2_result:
-        parts.append("\n\n## 网络素材库（产品/主题上下文，脚本必须围绕这些内容展开）\n")
-        # 优先使用原始素材（含完整脚本文案），兜底用 LLM 匹配的摘要
-        materials = step2_result.get("raw_materials") or step2_result.get("matched_materials", [])
-        if materials:
-            parts.append(json.dumps(materials, ensure_ascii=False, indent=2))
-        else:
-            parts.append("（无素材库数据）\n")
-
-        parts.append("\n\n## 历史投放数据\n")
-        history = step2_result.get("raw_history") or step2_result.get("matched_history", [])
-        if history:
-            parts.append(json.dumps(history, ensure_ascii=False, indent=2))
-        else:
-            parts.append("（无历史数据）\n")
-
-    return "".join(parts)
+    parsed = _parse_json(result.text)
+    return parsed.get("scripts", [])
 
 
 def _parse_json(text: str) -> dict[str, Any]:

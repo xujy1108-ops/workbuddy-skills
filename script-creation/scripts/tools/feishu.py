@@ -27,8 +27,12 @@ import subprocess
 from config.settings import (
     FEISHU_HISTORY_BASE,
     FEISHU_HISTORY_TABLE_TOUTIAO,
+    FEISHU_HOTSPOT_BASE,
+    FEISHU_HOTSPOT_TABLE,
     FEISHU_MATERIALS_BASE,
     FEISHU_MATERIALS_TABLE,
+    FEISHU_STRATEGY_BASE,
+    FEISHU_STRATEGY_TABLE,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,6 +130,71 @@ def fetch_materials_by_type(
     )
     records = _parse_response(d)
     logger.info("网络素材库: 按类型 %s 命中 %d 条记录", material_match_text, len(records))
+    return records
+
+
+def fetch_strategy_table(limit: int = 200) -> list[dict]:
+    """创意策略表全量拉取（directions 步骤的驱动源）。
+
+    表字段：内容方向一/二（select）、策略等级、内容一方向定义、
+    植入策略、适合达人、正向案例、素材链接ids。
+    """
+    d = _lark_cli(
+        "base", "+record-list",
+        "--base-token", FEISHU_STRATEGY_BASE,
+        "--table-id", FEISHU_STRATEGY_TABLE,
+        "--limit", str(limit),
+        "--as", "user",
+    )
+    records = _parse_response(d)
+    logger.info("创意策略表: 拉取 %d 条策略记录", len(records))
+    return records
+
+
+def fetch_hotspot_table(limit: int = 200) -> list[dict]:
+    """热点素材库全量拉取（蹭热点线创意方向来源）。
+
+    表字段：热点ID/热点标题/热点概述/热点类型/植入方向/入库时间/素材评分。
+    排序（素材评分降序）在调用方处理——评分是 select 文本（优秀/良好/一般/劣质），
+    服务端排序语义不可靠，本地按定级顺序排。
+    """
+    d = _lark_cli(
+        "base", "+record-list",
+        "--base-token", FEISHU_HOTSPOT_BASE,
+        "--table-id", FEISHU_HOTSPOT_TABLE,
+        "--limit", str(limit),
+        "--as", "user",
+    )
+    records = _parse_response(d)
+    logger.info("热点素材库: 拉取 %d 条热点记录", len(records))
+    return records
+
+
+def fetch_materials_by_ids(material_ids: list[str]) -> list[dict]:
+    """网络素材库按「素材id」列表反查素材（策略行素材链接ids 的回查源）。
+
+    Args:
+        material_ids: 形如 ["dy_xxx", "dy_yyy"] 的素材 id 列表
+    """
+    if not material_ids:
+        return []
+    records: list[dict] = []
+    # 「素材id」是 text 字段，contains 只支持字符串值 → 逐 id 查询后合并
+    for mid in material_ids:
+        filter_json = {
+            "logic": "and",
+            "conditions": [["素材id", "contains", mid]],
+        }
+        d = _lark_cli(
+            "base", "+record-list",
+            "--base-token", FEISHU_MATERIALS_BASE,
+            "--table-id", FEISHU_MATERIALS_TABLE,
+            "--filter-json", json.dumps(filter_json, ensure_ascii=False),
+            "--limit", "5",
+            "--as", "user",
+        )
+        records.extend(_parse_response(d))
+    logger.info("网络素材库: 按 ids 反查命中 %d/%d 条", len(records), len(material_ids))
     return records
 
 
