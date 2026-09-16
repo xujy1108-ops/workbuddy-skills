@@ -31,6 +31,11 @@
  *   DEEPSEEK_MODEL     - DeepSeek 模型名（默认 deepseek-v4-pro）
  *   TRANSCRIBE_MODEL   - 视频转录模型（默认 qwen3-vl-plus；兼容旧变量名 DOUBAO_MODEL）
  *   SEARCH_PAGES       - 每个关键词搜索翻页数（默认 1，即每个词 10 条；2026-09-08 应用户要求由 2 调为 1 控制单次处理量）
+ *   SEARCH_SORT_TYPE   - 搜索结果排序（默认 0 综合排序；0=综合排序 / 1=最多点赞 / 2=最新发布。
+ *                        2026-09-16 应用户要求由 1 改为 0：实测"资金周转"题材上点赞门槛与贴题度负相关，
+ *                        最多点赞会把贴题的中小账号内容挤下去、留下跑题爆款）
+ *   MIN_DIGG_COUNT     - 最低点赞数门槛（默认 0 不过滤，全部交 AI 相关性判定；
+ *                        2026-09-16 应用户要求由 2000 改为 0，与综合排序配套）
  *   WORKFLOW_CONCURRENCY - 并行处理并发数（默认 3）
  *
  * 输出：JSON 格式结果到 stdout，进度日志输出到 stderr
@@ -568,7 +573,10 @@ const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro';
 // 兼容旧变量名 DOUBAO_MODEL；视频输入必须用直链（aweme_info 里的 play_addr），抖音页面 URL 已不稳定
 const TRANSCRIBE_MODEL = process.env.TRANSCRIBE_MODEL || process.env.DOUBAO_MODEL || 'qwen3-vl-plus';
 
-const MIN_DIGG_COUNT = 2000; // 最低点赞数
+// 最低点赞数门槛（0 = 不过滤，全部交 AI 相关性判定）
+// 2026-09-16 应用户要求由 2000 改为 0：搜索排序改为"综合排序"后按相关性排序而非点赞排序，
+// 贴题内容点赞天然偏低（实测综合排序第 1 名仅 1760 赞），保留 2000 会系统性误杀贴题素材
+const MIN_DIGG_COUNT = parseInt(process.env.MIN_DIGG_COUNT || '0', 10);
 const MAX_VIDEO_SIZE_MB = 50; // 豆包 API 视频文件大小限制
 // 高赞评论分析触发阈值：本轮新入库视频点赞 > 该值时，并行抓取高赞评论做创意策略分析
 const COMMENT_ANALYSIS_DIGG_THRESHOLD = parseInt(process.env.COMMENT_ANALYSIS_DIGG_THRESHOLD || '30000', 10);
@@ -1029,6 +1037,9 @@ async function generateKeywords(existingIds) {
 
 // Step 2: 搜索抖音视频（按 cursor 翻页，默认 2 页，扩大候选池）
 const SEARCH_PAGES = parseInt(process.env.SEARCH_PAGES || '1', 10);
+// 搜索排序：0=综合排序 / 1=最多点赞 / 2=最新发布
+// 2026-09-16 应用户要求由 '1'（最多点赞）改为 '0'（综合排序）
+const SEARCH_SORT_TYPE = process.env.SEARCH_SORT_TYPE || '0';
 
 async function searchDouyinPage(keyword, cursor, searchId) {
   const response = await fetch('https://api.tikhub.io/api/v1/douyin/search/fetch_video_search_v2', {
@@ -1040,7 +1051,7 @@ async function searchDouyinPage(keyword, cursor, searchId) {
     body: JSON.stringify({
       keyword,
       cursor,
-      sort_type: '1',
+      sort_type: SEARCH_SORT_TYPE,
       publish_time: '0',
       filter_duration: '0',
       content_type: '0',
@@ -2267,9 +2278,9 @@ async function main() {
         continue;
       }
 
-      // 点赞数过滤
+      // 点赞数过滤（MIN_DIGG_COUNT = 0 时不过滤，全部交 AI 相关性判定）
       const diggCount = aweme.statistics?.digg_count || 0;
-      if (diggCount < MIN_DIGG_COUNT) {
+      if (MIN_DIGG_COUNT > 0 && diggCount < MIN_DIGG_COUNT) {
         skipped.push({ aweme_id: awemeId, reason: 'low_digg_count', digg_count: diggCount });
         continue;
       }
