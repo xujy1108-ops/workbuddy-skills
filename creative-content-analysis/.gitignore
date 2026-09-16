@@ -11,6 +11,8 @@ bitable_payload_*.json
 .recent_keywords.json
 .keyword_stats.json
 .strategy_cache.json
+.strategy_growth.json
+.explore_ledger.json
 
 # 系统文件
 .DS_Store

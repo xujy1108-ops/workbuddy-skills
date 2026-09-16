@@ -8,8 +8,9 @@
  *
  * 默认行为（一条命令跑完）：
  *   1. 自动查询飞书多维表格已有素材 ID（去重）
- *   2. 生成 4 个搜索关键词（策略直搜1 + 策略衍生1 + 开放探索2；探索素材接入飞书热点素材表。
- *      连续 2 轮零新策略产出时自动进入加强模式：直搜1 + 探索3，策略衍生通道暂停——反内循环）
+ *   2. 生成 4 个搜索关键词（策略直搜1 + 策略衍生1 + 开放探索2；探索素材 = 热点翻译（0-1 跳门控，
+ *      无则坐标系补位）+ 邻接域反推，格子/话题由 .explore_ledger.json 登记轮转、扫过即销。
+ *      连续 2 轮零新策略产出时自动进入加强模式：直搜1 + 探索3（+1 坐标系格子），策略衍生通道暂停——反内循环）
  *      → 搜索抖音 → 提取脚本 → 分析创意
  *   3. 自动将结果写入飞书多维表格
  *   4. 如果 API 余额不足，自动给飞书发消息通知
@@ -176,6 +177,7 @@ function buildHitRateFeedback() {
 
   const sourceNames = {
     strategy_direct: '策略直搜', strategy_derive: '策略衍生',
+    explore_hotspot: '热点翻译', explore_coordinate: '处境坐标系', explore_adjacent: '邻接域反推',
     explore_suggest: '搜索联想词', explore_comments: '高赞评论', explore_ai: 'AI衍生'
   };
 
@@ -481,14 +483,100 @@ function fetchStrategyDoc() {
   }
 }
 
-// ============ 开放探索来源（来源3）：飞书热点素材表 + AI 自由衍生 ============
-// 2026-09-15 反内循环改造：探索素材接入热点素材表（duxiaoman-hotspot 抓取沉淀的近期热点），
-// 为关键词生成注入策略文档之外的外部信号，打断"关键词←策略文档→验证老策略"的闭环。
-// 热点表读取失败 / 无新鲜热点时降级为 AI 自由衍生（旧行为）。
+// ============ 开放探索来源（来源3）：处境坐标系 + 邻接域反推 + 热点翻译（跳数门控） ============
+// 2026-09-16 探索策略重构（目标：每次探索完全新的话题、有概率产生新策略、围绕借钱展开，
+// 「从话题到借钱」的转折链由配额设计显式保证，不再依赖 AI 即兴翻译热点）：
+//   - 热点翻译（配额A，外部信号优先）：热点素材表中 0-1 跳新鲜热点（跳数门控 + 同义去重），
+//     翻译成热点牵出的具体用钱处境词
+//   - 处境坐标系（配额A 补位 / 加强模式配额C）：人群 × 缺钱时刻格子，借钱需求原生场景（0-1 跳），
+//     格子由登记表轮转、扫过即销；每个新格子天然对应策略库新方向（新人群×新处境）
+//   - 邻接域反推（配额B）：「缺钱但没借钱的人怎么办」的反推域（卖黄金/典当/亲友开口…，1-2 跳），
+//     供给新钩子公式（"你以为的退路其实更贵"类反差转折）
+// 热点表读取失败 / 无 0-1 跳热点时配额A 由坐标系补位；素材全空才降级 AI 自由衍生（旧行为）。
+// 探索措辞铁律（实测教训：议题化词搜到的是"有资产要做决策的人"，不是缺钱周转的人）：
+//   必须处境化（具体的人 + 具体的难处），禁止议题化（"XX该不该/怎么看/贬值/意味着什么"）
 const HOTSPOT_BASE_TOKEN = process.env.HOTSPOT_BASE_TOKEN || 'STMrbQgqma35dksI3WsclJlNnlc';
 const HOTSPOT_TABLE_ID = process.env.HOTSPOT_TABLE_ID || 'tblDpxkM7psozqeO';
 const HOTSPOT_MAX_AGE_DAYS = 7;   // 只取入库 7 天内的热点（过老的热点已过传播窗口）
-const HOTSPOT_MAX_COUNT = 8;      // 每轮最多注入 8 条热点，防止 prompt 过长
+const HOTSPOT_MAX_COUNT = 3;      // 每轮最多注入 3 条热点候选（配额A 只翻 1 条）
+const HOTSPOT_MAX_HOPS = 1;       // 跳数门控：只取 0-1 跳热点（≥2 跳离借钱需求太远，实测全被 AI 判不相关）
+
+// 探索登记表（已扫格子/已用邻接话题，注入即销，保证"每次探索完全新的话题"）
+const EXPLORE_LEDGER_FILE = path.join(__dirname, '..', '.explore_ledger.json');
+
+// 坐标系种子：人群轴 × 时刻轴（三大类），格子扫过即销
+// 时刻轴刻意不含看病/上学/彩礼等禁止方向（红线）与公检法方向
+const POPULATION_AXIS = [
+  '小餐馆老板', '奶茶店店主', '便利店老板', '批发档口老板', '民宿主', '网约车司机',
+  '货车司机', '代驾司机', '外卖骑手站长', '快递驿站老板', '水果摊主', '夜市摊主',
+  '烘焙私房店主', '美容美发店老板', '健身房教练', '装修队包工头', '工程垫资老板',
+  '建材老板', '汽修店老板', '宝妈', '应届毕业生', '海淘代购', '直播带货小主播',
+  '婚庆从业者', '培训机构老师', '工厂小老板', '农产品种植户', '养殖户', '出租车司机',
+  '房产中介', '保险代理人', '小微电商卖家'
+];
+const MOMENT_AXIS = [
+  { group: '收入断裂', moments: ['工资被拖欠', '生意亏了', '客户跑单', '货款收不回', '降薪裁员'] },
+  { group: '支出突增', moments: ['房租到期涨租', '押一付三', '设备坏了要修', '进货要压钱', '旺季前备货'] },
+  { group: '现金流错配', moments: ['账期错配下游欠款上游要现款', '旺季前垫资', '淡季硬撑', '月底工资日缺口'] }
+];
+// 邻接域清单：「缺钱但没借钱的人怎么办」的反推域（不缺钱的人不会卖金镯子——话题自带缺钱语境）
+const ADJACENT_DOMAINS = [
+  '卖黄金首饰回血', '典当行典当', '二手平台卖闲置', '信用卡分期还款', '花呗白条额度',
+  '找亲戚朋友开口借钱', '银行理财赎回', '基金割肉离场', '省钱攻略极简生活', '直播薅羊毛',
+  '花呗白条被关', '信用卡降额'
+];
+
+function loadExploreLedger() {
+  try {
+    if (fs.existsSync(EXPLORE_LEDGER_FILE)) {
+      return JSON.parse(fs.readFileSync(EXPLORE_LEDGER_FILE, 'utf-8'));
+    }
+  } catch (error) {
+    log(`   ⚠️ 探索登记表读取失败，按空表处理: ${error.message.substring(0, 80)}`);
+  }
+  return { scanned_cells: [], adjacent_used: [], updated_at: '' };
+}
+
+function saveExploreLedger(ledger) {
+  ledger.updated_at = new Date().toISOString();
+  fs.writeFileSync(EXPLORE_LEDGER_FILE, JSON.stringify(ledger, null, 2));
+}
+
+// 全量格子（人群 × 时刻），人群在前的顺序即轮转顺序
+function allCoordinateCells() {
+  const cells = [];
+  for (const person of POPULATION_AXIS) {
+    for (const m of MOMENT_AXIS) {
+      for (const moment of m.moments) cells.push({ person, group: m.group, moment });
+    }
+  }
+  return cells;
+}
+
+// 取 n 个未扫描格子；每轮优先覆盖不同人群（避免连续同人格子）；池耗尽则重置进入第二轮
+function pickCoordinateCells(ledger, n) {
+  const all = allCoordinateCells();
+  const scanned = new Set(ledger.scanned_cells);
+  const unscanned = all.filter(c => !scanned.has(`${c.person}|${c.moment}`));
+  if (unscanned.length === 0) {
+    log('   🔄 坐标系格子已全部扫描一轮，登记表重置（进入第二轮轮转）');
+    ledger.scanned_cells = [];
+    return all.slice(0, n);
+  }
+  const picked = [];
+  const usedPersons = new Set();
+  for (const c of unscanned) {
+    if (usedPersons.has(c.person)) continue;
+    picked.push(c);
+    usedPersons.add(c.person);
+    if (picked.length >= n) return picked;
+  }
+  for (const c of unscanned) {
+    if (picked.length >= n) break;
+    if (!picked.includes(c)) picked.push(c);
+  }
+  return picked.slice(0, n);
+}
 
 // 视频高赞评论（按点赞排序）
 async function fetchVideoComments(awemeId, count = 20) {
@@ -505,7 +593,12 @@ async function fetchVideoComments(awemeId, count = 20) {
     .sort((a, b) => b.digg - a.digg);
 }
 
-// 拉取热点素材表中的新鲜热点（入库 ≤ 7 天且未过到期复查日）
+// 拉取热点素材表中的新鲜热点（入库 ≤ 7 天、未过到期复查日、转折跳数 ≤ HOTSPOT_MAX_HOPS）
+// 2026-09-16 修复两处硬缺陷：
+//   1) 旧版按"入库时间倒序取前 8"，但入库时间是日期粒度（天内无先后）→ 实际是最新一天包场 +
+//      按表内原始顺序凑数；现改为跳数升序优先（0 跳直接阐述 > 1 跳隐喻），同跳数再按时间
+//   2) 旧版无同义去重，实测「花呗白条将不再列入默认支付选项」+「花呗白条将退出支付选项」
+//      两条同义热点各占一个注入位；现按标题字符 bigram Jaccard ≥ 0.5 去重
 function fetchRecentHotspots() {
   const output = runLarkCli([
     'base', '+record-list',
@@ -519,7 +612,7 @@ function fetchRecentHotspots() {
   const fieldNames = data.fields || [];
   const rows = data.data || [];
   const idx = {};
-  ['热点标题', '热点概述', '热点类型', '入库时间', '到期复查日'].forEach(name => {
+  ['热点标题', '热点概述', '热点类型', '入库时间', '到期复查日', '转折跳数'].forEach(name => {
     idx[name] = fieldNames.indexOf(name);
   });
   const cell = (row, name) => {
@@ -527,41 +620,125 @@ function fetchRecentHotspots() {
     if (Array.isArray(v)) return v.filter(Boolean).join('、');
     return cellText(v);
   };
+  // 跳数解析不走 cellText——cellText 会把数字 0 当 falsy 吞成空串，导致 0 跳热点全部被
+  // 误过滤（实测 2026-09-16：6 条 0 跳热点因 hops=NaN 全部出局，只剩 1 跳候选）
+  const hopValue = row => {
+    const v = idx['转折跳数'] >= 0 ? row[idx['转折跳数']] : null;
+    const s = Array.isArray(v)
+      ? v.map(x => (typeof x === 'string' ? x : x?.text || '')).join('')
+      : String(v ?? '');
+    return parseInt(s.replace(/[^0-9]/g, ''), 10);
+  };
   const now = Date.now();
   const cutoff = now - HOTSPOT_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
-  return rows
+  const fresh = rows
     .map(row => ({
       title: cell(row, '热点标题'),
       summary: cell(row, '热点概述').split('\n')[0], // 概述首段（去掉溯源信息尾巴）
       type: cell(row, '热点类型'),
       storedAt: Date.parse(cell(row, '入库时间')) || 0,
-      reviewAt: Date.parse(cell(row, '到期复查日')) || 0
+      reviewAt: Date.parse(cell(row, '到期复查日')) || 0,
+      hops: hopValue(row)
     }))
     .filter(h => h.title && h.storedAt >= cutoff && (!h.reviewAt || h.reviewAt >= now))
-    .sort((a, b) => b.storedAt - a.storedAt)
-    .slice(0, HOTSPOT_MAX_COUNT);
+    .filter(h => Number.isFinite(h.hops) && h.hops <= HOTSPOT_MAX_HOPS);
+
+  // 同义去重：标题 bigram Jaccard ≥ 0.35 视为同一热点
+  // （阈值实测校准：「花呗白条将不再列入默认支付选项」vs「花呗白条将退出支付选项」J≈0.41 需命中；
+  //   「8月国民经济运行平稳」vs「8月经济数据出炉…」J≈0.27 不命中——同话题不同表述属可接受的候选冗余）
+  const bigrams = s => {
+    const n = normalizeKeyword(s);
+    const b = new Set();
+    for (let i = 0; i < n.length - 1; i++) b.add(n.substring(i, i + 2));
+    return b;
+  };
+  const jaccard = (a, b) => {
+    let inter = 0;
+    for (const x of a) if (b.has(x)) inter++;
+    return inter / (a.size + b.size - inter);
+  };
+  const kept = [];
+  const keptBgs = [];
+  for (const h of fresh.sort((a, b) => a.hops - b.hops || b.storedAt - a.storedAt)) {
+    const bg = bigrams(h.title);
+    if (keptBgs.some(kb => jaccard(bg, kb) >= 0.35)) continue;
+    kept.push(h);
+    keptBgs.push(bg);
+    if (kept.length >= HOTSPOT_MAX_COUNT) break;
+  }
+  return kept;
 }
 
-// 构建开放探索素材：优先注入热点素材表新鲜热点；失败/为空降级 AI 自由衍生
-function buildExploreMaterial() {
+// 构建开放探索素材（2026-09-16 探索策略重构）：
+//   配额A：热点翻译（有 0-1 跳新鲜热点时），否则由处境坐标系补位
+//   配额B：邻接域反推
+//   配额C（仅加强模式 exploreQuota≥3）：处境坐标系第二格
+// 格子/邻接话题在注入时即登记消费（扫过即销，即使本轮后续失败也不重复用）
+async function buildExploreMaterial(exploreQuota) {
+  const ledger = loadExploreLedger();
+  const blocks = [];
+  const slotOrder = [];
+
+  // 热点翻译（外部信号优先，跳数门控保证离借钱 0-1 跳）
+  let hotspots = [];
   try {
-    const hotspots = fetchRecentHotspots();
-    if (hotspots.length === 0) {
-      log('   热点素材表无 7 天内新鲜热点，探索来源降级为 AI 自由衍生');
-      return { type: 'explore_ai', text: '' };
-    }
-    const lines = hotspots.map((h, i) =>
-      `${i + 1}. [${h.type || '热点'}] ${h.title}——${(h.summary || '').substring(0, 120)}`
-    );
-    const text = `# 开放探索素材：近期热点素材表（来自热点抓取流程，${hotspots.length} 条新鲜热点）
-优先从下列热点中找与借钱/缺钱/资金周转有真实关联的角度，把热点话题翻译成普通用户会搜的搜索词——注意不是搜热点事件本身，而是搜热点牵出的用钱场景或人群处境（热点概述里已包含植入思路可参考）。每个热点最多衍生 1 个搜索词，多个探索词必须来自不同热点或不同角度：
-${lines.join('\n')}`;
-    log(`   热点素材表注入 ${hotspots.length} 条新鲜热点作为探索素材`);
-    return { type: 'explore_hotspot', text };
+    hotspots = fetchRecentHotspots();
+    if (hotspots.length === 0) log('   热点素材表无 0-1 跳新鲜热点，配额A 由处境坐标系补位');
   } catch (error) {
-    log(`   ⚠️ 热点素材表读取失败（${error.message.substring(0, 120)}），探索来源降级为 AI 自由衍生`);
-    return { type: 'explore_ai', text: '' };
+    log(`   ⚠️ 热点素材表读取失败（${error.message.substring(0, 120)}），配额A 由处境坐标系补位`);
   }
+
+  const boostExtra = exploreQuota >= 3 ? 1 : 0;          // 加强模式第 3 个探索配额 = 坐标系
+  const coordinateCount = (hotspots.length === 0 ? 1 : 0) + boostExtra;
+
+  if (hotspots.length > 0) {
+    slotOrder.push('explore_hotspot');
+    const lines = hotspots.map((h, i) =>
+      `${i + 1}. [跳数${h.hops}·${h.type || '热点'}] ${h.title}——${(h.summary || '').substring(0, 100)}`);
+    blocks.push(`## 探索配额A（1 个，source 填 explore_hotspot）：热点翻译（已按转折跳数门控，均为 0-1 跳）
+从下列热点中选 1 条，把它翻译成该热点牵出的**具体用钱处境**搜索词——搜的是"热点里的人缺了钱怎么办"，不是热点事件本身。禁止用热点标题原词组词、禁止议题化措辞（"XX该不该""XX怎么看""XX意味着什么"）。
+风格示例（仅示范翻译方向，禁止照抄）：热点「拖欠工资的公司」→ 搜"公司拖欠工资 房贷怎么交"；热点「中小企业回款难」→ 搜"下游欠货款 工人工资发不出"。
+${lines.join('\n')}`);
+    log(`   热点素材表注入 ${hotspots.length} 条 0-1 跳热点候选（配额A 热点翻译）`);
+  }
+
+  if (coordinateCount > 0) {
+    const cells = pickCoordinateCells(ledger, coordinateCount);
+    for (const c of cells) ledger.scanned_cells.push(`${c.person}|${c.moment}`);
+    const cellLines = cells.map(c => `- 人群「${c.person}」× 缺钱时刻「${c.moment}」（${c.group}类）`);
+    const label = hotspots.length > 0 ? 'C' : 'A';
+    slotOrder.push(...cells.map(() => 'explore_coordinate'));
+    blocks.push(`## 探索配额${label}（${cells.length} 个，source 填 explore_coordinate）：处境坐标系扫描
+下列是本轮指定的「人群 × 缺钱时刻」格子（借钱需求的原生场景，格子扫过即销不再重复）。每个格子生成 1 个处境化搜索词：词里要能看出"具体的人 + 具体的难处"，词本身不必含"借钱"。
+风格示例（仅示范处境化措辞，禁止照抄、禁止与示例共享句式片段）：「档口进货被压了货款」「工地垫资 结不到账」。
+禁止：议题化措辞（"XX该不该""XX怎么看""XX贬值"）；用身份/政策标签做词根（如"退役军人政策"）；与格子无关的自由发挥。
+${cellLines.join('\n')}`);
+    log(`   坐标系注入 ${cells.length} 个未扫格子（${cells.map(c => `${c.person}×${c.moment}`).join('、')}）`);
+  }
+
+  // 邻接域反推（话题用后即销）
+  let adjacentPool = ADJACENT_DOMAINS.filter(t => !ledger.adjacent_used.includes(t));
+  if (adjacentPool.length === 0) {
+    log('   🔄 邻接域清单已用完一轮，登记表重置（进入第二轮轮转）');
+    ledger.adjacent_used = [];
+    adjacentPool = [...ADJACENT_DOMAINS];
+  }
+  const adjacent = adjacentPool[0];
+  ledger.adjacent_used.push(adjacent);
+  slotOrder.push('explore_adjacent');
+  blocks.push(`## 探索配额B（1 个，source 填 explore_adjacent）：邻接域反推 —— 本轮话题「${adjacent}」
+逻辑：不缺钱的人不会做这件事——该话题自带缺钱语境，受众与借钱人群高度重叠。围绕这个话题生成 1 个真实处境搜索词（用户视角的真实困扰，不是教程词）。
+风格示例（仅示范，禁止照抄）：话题「卖黄金首饰」→"结婚金镯子 卖了值不值"；话题「典当行」→"典当行 真的能救急吗"。
+禁止：教程化/攻略化措辞（"XX怎么做""XX攻略"）；与话题无关的自由发挥。`);
+  log(`   邻接域注入话题「${adjacent}」`);
+
+  saveExploreLedger(ledger);
+
+  if (blocks.length === 0) return { type: 'explore_ai', text: '', slotOrder: [] };
+  const text = `# 开放探索素材（${blocks.length} 个配额块，逐块各生成 1 个词，多个探索词必须来自不同配额块）\n\n${blocks.join('\n\n')}`;
+  const labelMap = { explore_hotspot: '热点翻译', explore_coordinate: '处境坐标系', explore_adjacent: '邻接域反推' };
+  log(`   探索素材组合：${slotOrder.map(s => labelMap[s] || s).join(' + ')}（格子/话题已登记，下轮不重复）`);
+  return { type: 'explore_multi', text, slotOrder };
 }
 
 // ============ 配置 ============
@@ -628,16 +805,17 @@ function buildKeywordPrompt(directQuota, deriveQuota, exploreQuota) {
 公式示例（仅示范"如何从策略抽象公式"，禁止套用句式模板）：「揭秘自己」的核心公式 = 高收入表象 vs 现金流紧张的反差；「网贷测评」的核心公式 = 较真打假替粉丝实测。生成时必须基于策略自身逻辑构造全新表达——同一句式骨架仅替换职业/人群/平台名也算重复（如近期已用过"花店老板缺现金吗"，就禁止再生成"XX老板缺现金吗"）。`);
   }
   if (exploreQuota > 0) {
-    sources.push(`【来源：开放探索】${exploreQuota} 个（source 填 explore）
-按下方"开放探索素材"的指示执行；若素材为空，则 AI 自主衍生与借钱/缺钱/用钱相关的新方向（可从这些维度切入：不同人群的借钱处境、不同关系的金钱摩擦、不同心理状态的缺钱体验、社会现象与钱的交织），不要困在策略清单里。多个探索词之间必须覆盖互不相同的新方向，来自不同热点或不同角度。`);
+    sources.push(`【来源：开放探索】${exploreQuota} 个
+下方"开放探索素材"包含多个配额块（热点翻译 / 处境坐标系 / 邻接域反推），逐块按各块自己的指示生成，每块产出 1 个词；source 按所在块标注填 explore_hotspot / explore_coordinate / explore_adjacent。若素材为空，则 AI 自主衍生与借钱/缺钱/用钱相关的新方向（可从这些维度切入：不同人群的借钱处境、不同关系的金钱摩擦、不同心理状态的缺钱体验、社会现象与钱的交织），不要困在策略清单里。多个探索词之间必须覆盖互不相同的新方向。`);
   }
 
   const exampleItems = [];
   let eid = 1;
   if (directQuota > 0) exampleItems.push(`    { "id": ${eid++}, "keyword": "搜索关键词", "source": "strategy_direct", "direction": "所属方向" }`);
   if (deriveQuota > 0) exampleItems.push(`    { "id": ${eid++}, "keyword": "搜索关键词", "source": "strategy_derive", "direction": "所属方向" }`);
+  const exploreExamples = ['explore_hotspot', 'explore_coordinate', 'explore_adjacent'];
   for (let i = 0; i < exploreQuota; i++) {
-    exampleItems.push(`    { "id": ${eid++}, "keyword": "搜索关键词", "source": "explore", "direction": "所属方向" }`);
+    exampleItems.push(`    { "id": ${eid++}, "keyword": "搜索关键词", "source": "${exploreExamples[i] || 'explore_coordinate'}", "direction": "所属方向" }`);
   }
 
   return `你是抖音内容素材策划专家，熟悉抖音平台的内容生态、用户情绪和话题传播逻辑。请围绕"资金周转困难"这个核心场景，生成 ${total} 个抖音搜索关键词，按下列来源分配：
@@ -670,7 +848,7 @@ __RECENT_KEYWORDS__
 
 __HIT_RATE_FEEDBACK__
 
-输出格式：严格按以下JSON格式输出，不要增加任何额外字段、注释或说明文字。source 必须是 strategy_direct / strategy_derive / explore 三者之一；direction 填写该关键词所属的场景方向（用简短方向名，如：揭秘自己-生意赚多少钱、策略衍生-反差职业收入、热点素材-公共数据开放）：
+输出格式：严格按以下JSON格式输出，不要增加任何额外字段、注释或说明文字。source 必须是 strategy_direct / strategy_derive / explore_hotspot / explore_coordinate / explore_adjacent 之一；direction 填写该关键词所属的场景方向（用简短方向名，如：揭秘自己-生意赚多少钱、策略衍生-反差职业收入；探索词请带上配额块信息，如：探索-坐标系：小餐馆老板×货款收不回、探索-邻接：卖黄金、探索-热点：回款难）：
 
 {
   "keywords": [
@@ -922,11 +1100,15 @@ async function generateKeywords(existingIds) {
     .map(s => `- ${s.l1}-${s.l2}（${s.level}级）：${s.definition}`)
     .join('\n');
 
-  // 来源3：构建开放探索素材（热点素材表新鲜热点优先，失败降级 AI 自由衍生）
-  const explore = await buildExploreMaterial(existingIds || []);
-  const exploreLabel = explore.type === 'explore_hotspot' ? '热点素材表' :
-    explore.type === 'explore_suggest' ? '搜索联想词' :
-      explore.type === 'explore_comments' ? '高赞评论' : 'AI 自由衍生';
+  // 来源3：构建开放探索素材（热点翻译 + 处境坐标系 + 邻接域反推，多配额块）
+  const explore = await buildExploreMaterial(exploreQuota);
+  const exploreLabelMap = {
+    explore_hotspot: '热点翻译', explore_coordinate: '处境坐标系', explore_adjacent: '邻接域反推',
+    explore_suggest: '搜索联想词', explore_comments: '高赞评论', explore_ai: 'AI 自由衍生'
+  };
+  const exploreLabel = explore.type === 'explore_multi'
+    ? (explore.slotOrder || []).map(s => exploreLabelMap[s] || s).join(' + ')
+    : (exploreLabelMap[explore.type] || 'AI 自由衍生');
   log(`   开放探索素材来源：${exploreLabel}（配额 ${exploreQuota} 个）`);
 
   let prompt = buildKeywordPrompt(directQuota, deriveQuota, exploreQuota)
@@ -985,10 +1167,17 @@ async function generateKeywords(existingIds) {
     }
 
     const parsed = JSON.parse(jsonMatch[0]);
+    // source 归一化：explore 子来源未按块标注时，按配额块顺序（slotOrder）逐个指派
+    const validSources = ['strategy_direct', 'strategy_derive', 'explore_hotspot', 'explore_coordinate', 'explore_adjacent'];
+    let exploreSlotIdx = 0;
     return parsed.keywords.map(k => {
-      // source 归一化：explore 统一为 AI 自由衍生（explore_ai）
       let source = k.source || '';
-      if (source === 'explore' || !source) source = explore.type;
+      if (source === 'explore' || !source) {
+        source = (explore.slotOrder && explore.slotOrder[exploreSlotIdx]) || 'explore_ai';
+      } else if (!validSources.includes(source)) {
+        source = 'explore_ai';
+      }
+      if (source.startsWith('explore_') && source !== 'explore_ai') exploreSlotIdx++;
       return { keyword: k.keyword, direction: k.direction || '', source };
     });
   };
