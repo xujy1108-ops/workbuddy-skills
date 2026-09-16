@@ -15,16 +15,19 @@
 
   "tables": {
     "material": {
+      "baseUrl": "TODO_素材表URL(https://<租户>.feishu.cn/base/<base_token>)",
       "baseToken": "TODO_素材表base_token",
       "tableId": "TODO_素材表table_id"
     },
     "strategy": {
+      "baseUrl": "TODO_策略表URL",
       "docUrl": "TODO_内容策略文档URL",
       "baseToken": "TODO_策略表base_token",
       "tableId": "TODO_策略表table_id",
       "excludeL1": ["回应解释"]
     },
     "hotspot": {
+      "baseUrl": "TODO_热点素材表URL",
       "baseToken": "TODO_热点素材表base_token",
       "tableId": "TODO_热点素材表table_id"
     }
@@ -45,6 +48,7 @@
   },
 
   "strategy": {
+    "_TODO": "兜底清单必须从策略 Base 实际记录导出（口径：策略等级 S/A 且内容方向一不在 excludeL1 内），方向枚举必须与该 Base「内容方向一/二」字段的 select 选项逐项对齐；对齐做法见 duxiaoman 配置",
     "fallbackStrategies": [],
     "fallbackDirectionEnums": "TODO_策略表读取失败时的兜底方向枚举文本"
   },

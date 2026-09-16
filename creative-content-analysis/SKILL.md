@@ -37,6 +37,10 @@ config/
 - env 变量（`BITABLE_BASE_TOKEN` 等）可覆盖品牌配置里的表 token 默认值
 - 运行状态文件（关键词统计/近期词/策略缓存/探索登记表）按品牌隔离在 `.state/<brand>/`，首次运行自动从根目录旧文件迁移
 - 新增品牌步骤：复制 duxiaoman 目录 → 改 config.json（品牌名/表 token/过滤词/坐标系）→ 改 3 个 prompt 模板中的品牌段落 → 无需改任何代码
+- **配置与飞书表对齐口径**（新增品牌/改表后必做）：
+  - `tables.*.baseUrl` 只作核对用（点开即可对表），实际调用只用 `baseToken` + `tableId`
+  - `strategy.fallbackStrategies` 必须与策略 Base 的「S/A 级 且 内容方向一 ∉ excludeL1」记录集逐行一致
+  - `strategy.fallbackDirectionEnums` 的一级/二级枚举必须与策略 Base「内容方向一/内容方向二」字段的 select 选项逐项一致（忽略带换行的脏重复选项）
 
 ## 前置条件
 
