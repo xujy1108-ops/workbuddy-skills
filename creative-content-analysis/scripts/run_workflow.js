@@ -1,25 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * 度小满创意分析 - 抖音工作流主脚本
+ * 创意分析 - 抖音工作流主脚本（多品牌配置化）
+ *
+ * 品牌私有内容（品牌名、飞书表、过滤规则、探索坐标系、prompt 模板）全部外置在
+ * config/<brand>/ 目录，代码只保留通用流程逻辑；运行时按 --brand 选择品牌配置。
  *
  * 使用方法：
- *   node run_workflow.js [--keywords "kw1,kw2"] [--existing-ids "id1,id2"] [--skip-bitable] [--resume]
- *
- * 默认行为（一条命令跑完）：
- *   1. 自动查询飞书多维表格已有素材 ID（去重）
- *   2. 生成 4 个搜索关键词（策略直搜1 + 策略衍生1 + 开放探索2；探索素材 = 热点翻译（0-1 跳门控，
- *      无则坐标系补位）+ 邻接域反推，格子/话题由 .explore_ledger.json 登记轮转、扫过即销。
- *      连续 2 轮零新策略产出时自动进入加强模式：直搜1 + 探索3（+1 坐标系格子），策略衍生通道暂停——反内循环）
- *      → 搜索抖音 → 提取脚本 → 分析创意
- *   3. 自动将结果写入飞书多维表格
- *   4. 如果 API 余额不足，自动给飞书发消息通知
- *
- * 断点续跑：
- *   如果运行被沙箱中断（Exit 137），可加 --resume 重新运行，
- *   脚本会从 checkpoint 恢复候选列表，跳过已处理的视频，继续处理剩余的。
+ *   node run_workflow.js [--brand duxiaoman] [--keywords "kw1,kw2"] [--existing-ids "id1,id2"] [--skip-bitable] [--resume]
  *
  * 参数：
+ *   --brand <name>           品牌配置目录名（config/<name>/，默认 duxiaoman；env WORKFLOW_BRAND 可兜底）
  *   --keywords "kw1,kw2"     使用自定义搜索关键词（跳过 AI 生成）
  *   --existing-ids "id1,id2" 手动传入已有素材 ID（跳过自动查询）
  *   --skip-bitable           跳过飞书多维表格读写（仅跑分析，不写入）
@@ -46,6 +37,67 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
+
+// ============ 品牌配置加载（配置化改造 2026-09-16） ============
+// 品牌选择：--brand 参数 > env WORKFLOW_BRAND > 默认 duxiaoman
+const BRAND = (() => {
+  const argv = process.argv.slice(2);
+  const idx = argv.indexOf('--brand');
+  return (idx >= 0 && argv[idx + 1] && !argv[idx + 1].startsWith('--')) ? argv[idx + 1] : (process.env.WORKFLOW_BRAND || 'duxiaoman');
+})();
+const CONFIG_DIR = path.join(__dirname, '..', 'config', BRAND);
+
+function loadBrandConfig() {
+  const configFile = path.join(CONFIG_DIR, 'config.json');
+  if (!fs.existsSync(configFile)) {
+    process.stderr.write(`❌ 品牌配置不存在: ${configFile}\n`);
+    try {
+      const available = fs.readdirSync(path.join(__dirname, '..', 'config'))
+        .filter(f => !f.startsWith('.') && fs.statSync(path.join(__dirname, '..', 'config', f)).isDirectory());
+      process.stderr.write(`   可用品牌: ${available.join(', ') || '（config 目录为空）'}\n`);
+    } catch { /* config 目录不存在 */ }
+    process.exit(1);
+  }
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+  } catch (error) {
+    process.stderr.write(`❌ 品牌配置解析失败（${configFile}）: ${error.message}\n`);
+    process.exit(1);
+  }
+  const requiredKeys = ['brandName', 'workflowTitle', 'notificationTitle', 'strategyTableLabel', 'bitable', 'tables', 'filters', 'explore', 'strategy', 'prompts'];
+  const missing = requiredKeys.filter(k => cfg[k] === undefined);
+  if (missing.length > 0) {
+    process.stderr.write(`❌ 品牌配置缺少必填字段: ${missing.join(', ')}（文件: ${configFile}）\n`);
+    process.exit(1);
+  }
+  return cfg;
+}
+const BRAND_CONFIG = loadBrandConfig();
+
+// 品牌级 prompt 模板加载（config/<brand>/prompts/<name>）
+function loadPromptFile(name) {
+  const file = path.join(CONFIG_DIR, 'prompts', name);
+  if (!fs.existsSync(file)) {
+    process.stderr.write(`❌ 品牌 prompt 模板不存在: ${file}\n`);
+    process.exit(1);
+  }
+  return fs.readFileSync(file, 'utf-8');
+}
+
+// 品牌级运行状态文件（关键词统计/近期词/缓存/登记表按品牌隔离，避免多品牌互相污染）
+// 兼容迁移：duxiaoman 首次运行时若根目录存在旧状态文件，自动迁入 .state/duxiaoman/
+const STATE_DIR = path.join(__dirname, '..', '.state', BRAND);
+function stateFile(name) {
+  if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
+  const newPath = path.join(STATE_DIR, name);
+  const legacyPath = path.join(__dirname, '..', name);
+  if (!fs.existsSync(newPath) && fs.existsSync(legacyPath)) {
+    try { fs.renameSync(legacyPath, newPath); } catch { return legacyPath; }
+  }
+  return newPath;
+}
+
 
 // ============ Checkpoint 断点续跑 ============
 const CHECKPOINT_DIR = path.join(os.tmpdir(), 'duxiaoman-workflow');
@@ -362,27 +414,14 @@ function updateStrategyGrowth(strategyResult, itemCount) {
 // 运行时动态拉取内容策略文档，解析 S/A 级策略方向注入 prompt。
 // 缓存 24h；拉取失败用过期缓存；缓存也没有用内置兜底清单。
 // 这样以后只需要在文档里加新方向，搜索策略自动跟上，代码不用改。
-const STRATEGY_DOC_URL = 'https://kwza968lz1u.feishu.cn/docx/WmZfdDUZKod80NxCKULccMM4n9d';
-const STRATEGY_CACHE_FILE = path.join(__dirname, '..', '.strategy_cache.json');
+const STRATEGY_DOC_URL = BRAND_CONFIG.tables.strategy.docUrl;
+const STRATEGY_CACHE_FILE = stateFile('.strategy_cache.json');
 const STRATEGY_CACHE_TTL = 24 * 60 * 60 * 1000;
 // 整类排除：接广告后的回应内容，不是可搜的素材场景
-const STRATEGY_EXCLUDE_L1 = ['回应解释'];
+const STRATEGY_EXCLUDE_L1 = BRAND_CONFIG.tables.strategy.excludeL1 || ['回应解释'];
 
-// 内置兜底策略清单（文档拉取失败时使用，与策略文档保持同步）
-const FALLBACK_STRATEGIES = [
-  { l1: '蹭热点', l2: '时政新闻', level: 'S', definition: '国家发布最新的政策新闻，先吸睛再衔接到借钱话题' },
-  { l1: '揭秘自己', l2: '生意赚多少钱', level: 'S', definition: '聚焦表面光鲜、实则重资产/高现金流压力的特定人群，揭秘真实收入与资产结构，打破高收入=高存款的刻板印象' },
-  { l1: '揭秘自己', l2: '炒股是否财富自由', level: 'A', definition: '揭秘炒股博主的真实财务状况，打破暴富滤镜' },
-  { l1: '借钱高性价比', l2: '借便宜的钱', level: 'S', definition: '向普通人揭秘低利率时代借到便宜的钱就是优势的财富真相，破除借钱羞耻' },
-  { l1: '借钱高性价比', l2: '利息计算', level: 'A', definition: '揭秘网贷真实利率的计算陷阱（等额本息/IRR），打破利息认知盲区' },
-  { l1: '有钱人借钱', l2: '对比富人', level: 'S', definition: '对比富人借钱让钱流动与普通人死存钱的思维差异，打破借钱羞耻' },
-  { l1: '网贷测评', l2: '反向测评', level: 'S', definition: '以较真打假的反向测评视角，替粉丝找茬挑刺，亲自实测拆解网贷文案' },
-  { l1: '鸡汤', l2: '中年人借网贷不是堕落', level: 'S', definition: '共情中年人上有老下有小的生存重压，为中年人借网贷正名' },
-  { l1: '鸡汤', l2: '求人不如靠自己', level: 'S', definition: '揭露借钱伤感情、求人看脸色的残酷社交真相' },
-  { l1: '鸡汤', l2: '我为你们感到着急', level: 'S', definition: '以知心人身份共情粉丝缺钱时翻通讯录不敢打电话的卑微与窘境' },
-  { l1: '避坑', l2: '不要贪便宜', level: 'S', definition: '盘点普通人极易中招的钱财陷阱，以人间清醒视角硬核科普避坑指南' },
-  { l1: '拒绝借钱', l2: '如何有效拒绝借钱', level: 'A', definition: '解决借钱抹不开面子又伤人情、最后人财两空的问题' }
-];
+// 内置兜底策略清单（文档拉取失败时使用，与策略文档保持同步；品牌配置化后来自 config/<brand>/config.json）
+const FALLBACK_STRATEGIES = BRAND_CONFIG.strategy.fallbackStrategies || [];
 
 // 解析策略文档 markdown 中的表格（处理 rowspan 合并单元格）
 function parseStrategyTable(markdown) {
@@ -495,8 +534,8 @@ function fetchStrategyDoc() {
 // 热点表读取失败 / 无 0-1 跳热点时配额A 由坐标系补位；素材全空才降级 AI 自由衍生（旧行为）。
 // 探索措辞铁律（实测教训：议题化词搜到的是"有资产要做决策的人"，不是缺钱周转的人）：
 //   必须处境化（具体的人 + 具体的难处），禁止议题化（"XX该不该/怎么看/贬值/意味着什么"）
-const HOTSPOT_BASE_TOKEN = process.env.HOTSPOT_BASE_TOKEN || 'STMrbQgqma35dksI3WsclJlNnlc';
-const HOTSPOT_TABLE_ID = process.env.HOTSPOT_TABLE_ID || 'tblDpxkM7psozqeO';
+const HOTSPOT_BASE_TOKEN = process.env.HOTSPOT_BASE_TOKEN || BRAND_CONFIG.tables.hotspot.baseToken;
+const HOTSPOT_TABLE_ID = process.env.HOTSPOT_TABLE_ID || BRAND_CONFIG.tables.hotspot.tableId;
 const HOTSPOT_MAX_AGE_DAYS = 7;   // 只取入库 7 天内的热点（过老的热点已过传播窗口）
 const HOTSPOT_MAX_COUNT = 3;      // 每轮最多注入 3 条热点候选（配额A 只翻 1 条）
 const HOTSPOT_MAX_HOPS = 1;       // 跳数门控：只取 0-1 跳热点（≥2 跳离借钱需求太远，实测全被 AI 判不相关）
@@ -757,33 +796,18 @@ const MIN_DIGG_COUNT = parseInt(process.env.MIN_DIGG_COUNT || '0', 10);
 const MAX_VIDEO_SIZE_MB = 50; // 豆包 API 视频文件大小限制
 // 高赞评论分析触发阈值：本轮新入库视频点赞 > 该值时，并行抓取高赞评论做创意策略分析
 const COMMENT_ANALYSIS_DIGG_THRESHOLD = parseInt(process.env.COMMENT_ANALYSIS_DIGG_THRESHOLD || '30000', 10);
-const FORBIDDEN_KEYWORDS = ['催收', '医疗', '看病', '住院', '手术', '上学', '学费', '开学', '助学贷款', '助学',
-  '结婚', '彩礼',
-  // 公检法/政府人群
-  '民警', '警察', '公安', '法院', '法官', '检察', '检察院', '公检法', '派出所', '执法', '立案', '起诉', '诉讼', '强制执行', '失信名单', '支付令', '缺席判决',
-  // 房贷断供类（大量政策/法律分析内容）
-  '法拍', '法拍房', '信用破产', '个人破产'];
+// 内容过滤禁止词（品牌配置化后来自 config/<brand>/config.json filters 段）
+const FORBIDDEN_KEYWORDS = BRAND_CONFIG.filters.forbiddenKeywords;
 
-// 标题级禁止关键词：导师说教/成功学/负债翻身类 + 公检法/政府人群 + 突发用钱非经营类，在过滤阶段直接跳过
-const TITLE_FORBIDDEN_KEYWORDS = [
-  '负债翻身', '怎么翻身', '逆天改命', '翻身秘籍', '成功学',
-  '教你翻身', '负债逆袭', '以贷养贷', '保你逆天', '教你赚钱',
-  '带你赚钱', '带你翻身', '逆袭翻身',
-  // 公检法/政府人群
-  '民警', '警察', '公安', '法院', '法官', '检察', '公检法', '派出所',
-  '普法', '法律科普', '维权干货', '报警', '报案', '诉讼', '起诉', '立案',
-  '强制执行', '失信名单', '限制高消费', '支付令',
-  // 房贷断供类（政策/法律分析为主，偏离借钱核心）
-  '断供', '弃房', '法拍房',
-  // 突发用钱非经营类（看病/上学/结婚彩礼/助学贷款等，不纳入素材范围）
-  '结婚', '彩礼', '助学贷款', '助学'];
+// 标题级禁止关键词：在过滤阶段直接跳过
+const TITLE_FORBIDDEN_KEYWORDS = BRAND_CONFIG.filters.titleForbiddenKeywords;
 
-// 飞书多维表格配置
-const BITABLE_BASE_TOKEN = process.env.BITABLE_BASE_TOKEN;
-const BITABLE_TABLE_ID = process.env.BITABLE_TABLE_ID;
-// 内容策略表（度小满-网络创意策略）：素材创意同步沉淀为内容策略行
-const STRATEGY_BASE_TOKEN = process.env.STRATEGY_BASE_TOKEN || 'EPYhbxo9TaUclysWuM0cgjkdnFf';
-const STRATEGY_TABLE_ID = process.env.STRATEGY_TABLE_ID || 'tblSZ8LbahG9GnCH';
+// 飞书多维表格配置（env 可覆盖品牌配置默认值）
+const BITABLE_BASE_TOKEN = process.env.BITABLE_BASE_TOKEN || BRAND_CONFIG.tables.material.baseToken;
+const BITABLE_TABLE_ID = process.env.BITABLE_TABLE_ID || BRAND_CONFIG.tables.material.tableId;
+// 内容策略表：素材创意同步沉淀为内容策略行
+const STRATEGY_BASE_TOKEN = process.env.STRATEGY_BASE_TOKEN || BRAND_CONFIG.tables.strategy.baseToken;
+const STRATEGY_TABLE_ID = process.env.STRATEGY_TABLE_ID || BRAND_CONFIG.tables.strategy.tableId;
 const LARK_CLI = 'lark-cli';
 // ==============================
 
@@ -791,22 +815,21 @@ const LARK_CLI = 'lark-cli';
 
 // 关键词生成 prompt（2026-09-15 反内循环改造：固定 3 词改为动态配额）
 // 常规模式：直搜1 + 衍生1 + 探索2 = 4 词；加强模式（连续 2 轮零新策略）：直搜1 + 探索3 = 4 词（衍生暂停）
+// 模板外置在 config/<brand>/prompts/keyword.md；各来源指示片段来自 config 的 prompts.keywordSources
+const KEYWORD_PROMPT_TEMPLATE = fs.readFileSync(path.join(CONFIG_DIR, 'prompts', 'keyword.md'), 'utf-8');
+
 function buildKeywordPrompt(directQuota, deriveQuota, exploreQuota) {
   const total = directQuota + deriveQuota + exploreQuota;
+  const ks = BRAND_CONFIG.prompts.keywordSources || {};
   const sources = [];
   if (directQuota > 0) {
-    sources.push(`【来源：策略直搜】${directQuota} 个（source 填 strategy_direct）
-从下方内容策略清单中选策略方向，把它"翻译"成普通用户真实会搜的词。不是照抄策略名，而是想：对这个话题感兴趣的真实用户，会在抖音搜什么。
-例：策略「揭秘自己-生意赚多少钱」→ 搜词"开店一年赚多少"；策略「借钱高性价比-利息计算」→ 搜词"网贷利息怎么算"；策略「拒绝借钱-如何有效拒绝借钱」→ 搜词"如何拒绝借钱"。`);
+    sources.push(`【来源：策略直搜】${directQuota} 个（source 填 strategy_direct）\n${ks.direct || ''}`);
   }
   if (deriveQuota > 0) {
-    sources.push(`【来源：策略衍生】${deriveQuota} 个（source 填 strategy_derive）
-从策略清单中选另一个策略（必须与策略直搜不同的策略方向，且不得选择下方"近期已使用的方向"里出现过的策略），先抽象出该策略的核心钩子公式，再实例化成全新搜索词。
-公式示例（仅示范"如何从策略抽象公式"，禁止套用句式模板）：「揭秘自己」的核心公式 = 高收入表象 vs 现金流紧张的反差；「网贷测评」的核心公式 = 较真打假替粉丝实测。生成时必须基于策略自身逻辑构造全新表达——同一句式骨架仅替换职业/人群/平台名也算重复（如近期已用过"花店老板缺现金吗"，就禁止再生成"XX老板缺现金吗"）。`);
+    sources.push(`【来源：策略衍生】${deriveQuota} 个（source 填 strategy_derive）\n${ks.derive || ''}`);
   }
   if (exploreQuota > 0) {
-    sources.push(`【来源：开放探索】${exploreQuota} 个
-下方"开放探索素材"包含多个配额块（热点翻译 / 处境坐标系 / 邻接域反推），逐块按各块自己的指示生成，每块产出 1 个词；source 按所在块标注填 explore_hotspot / explore_coordinate / explore_adjacent。若素材为空，则 AI 自主衍生与借钱/缺钱/用钱相关的新方向（可从这些维度切入：不同人群的借钱处境、不同关系的金钱摩擦、不同心理状态的缺钱体验、社会现象与钱的交织），不要困在策略清单里。多个探索词之间必须覆盖互不相同的新方向。`);
+    sources.push(`【来源：开放探索】${exploreQuota} 个\n${ks.explore || ''}`);
   }
 
   const exampleItems = [];
@@ -818,43 +841,10 @@ function buildKeywordPrompt(directQuota, deriveQuota, exploreQuota) {
     exampleItems.push(`    { "id": ${eid++}, "keyword": "搜索关键词", "source": "${exploreExamples[i] || 'explore_coordinate'}", "direction": "所属方向" }`);
   }
 
-  return `你是抖音内容素材策划专家，熟悉抖音平台的内容生态、用户情绪和话题传播逻辑。请围绕"资金周转困难"这个核心场景，生成 ${total} 个抖音搜索关键词，按下列来源分配：
-
-${sources.join('\n\n')}
-
-内容策略清单（来自内容策略文档，S=已验证成功 / A=可继续尝试）：
-__STRATEGY_LIST__
-
-__EXPLORE_MATERIAL__
-
-选取规则：
-- 关键词严格按上述来源配额分配
-- 策略直搜和策略衍生（如启用）必须选择不同的策略方向，不可重复同一策略
-- ${total} 个关键词覆盖互不相同的场景方向，不可重复同一方向
-- 开放探索不得选取与近期已用词同词族的联想词（共享核心短语的变体均算重复，如近期已用过"借钱伤感情"，则"借钱伤感情XX"类联想词全部禁选）
-- 避免与近期已使用的关键词重复或高度相似
-
-通用要求：
-
-话题原生性：关键词必须来自真实用户在抖音上自发讨论的内容方向，不能带有任何品牌卖点、产品功能或推广意图，要像普通用户会搜索的词一样自然。
-
-关键词形式：以2-8个字的搜索词为主，优先选择高搜索量的短词；策略直搜类允许最长10字的自然短语（如"开店一年真的能赚多少"）。不要过于宽泛（如单个字"钱"）。
-
-内容聚焦性：关键词必须围绕"借钱、缺钱、资金周转、收入真相、用钱痛点"本身展开，借钱/缺钱是内容的核心议题而非引子。禁止生成"借钱见人心""借钱看清一个人""借钱试人品""借钱考验感情"这类把借钱当由头去讨论人心、人品、善良、信任的泛化话题——它们搜索量虽大，但结果严重偏离资金周转核心。
-
-禁止方向：不要生成「当下负债怎么翻身」「负债几十万怎么办」「以贷养贷」等引导负债人群继续借贷的关键词。不要生成与公检法、法律科普、维权诉讼相关的关键词（如"怎么起诉老赖""报警立案"）。不要生成看病、上学、助学贷款、结婚彩礼等方向的突发用钱关键词。此外，以下方向搜索结果几乎全是法律科普/催收/维权干货类内容，会被内容过滤规则100%拦截，禁止生成："朋友借钱不还"/"借钱不还怎么办"/"老赖"/"欠钱不还"/"网贷逾期"/"网贷催收"/"讨债"/"怎么要回钱"/"收不回款"/"房贷断供"/"法拍房"；"中年人压力"等泛化情感方向也禁止。
-
-__RECENT_KEYWORDS__
-
-__HIT_RATE_FEEDBACK__
-
-输出格式：严格按以下JSON格式输出，不要增加任何额外字段、注释或说明文字。source 必须是 strategy_direct / strategy_derive / explore_hotspot / explore_coordinate / explore_adjacent 之一；direction 填写该关键词所属的场景方向（用简短方向名，如：揭秘自己-生意赚多少钱、策略衍生-反差职业收入；探索词请带上配额块信息，如：探索-坐标系：小餐馆老板×货款收不回、探索-邻接：卖黄金、探索-热点：回款难）：
-
-{
-  "keywords": [
-${exampleItems.join(',\n')}
-  ]
-}`;
+  return KEYWORD_PROMPT_TEMPLATE
+    .replace(/__TOTAL__/g, String(total))
+    .replace('__SOURCES__', sources.join('\n\n'))
+    .replace('__EXAMPLE_ITEMS__', exampleItems.join(',\n'));
 }
 
 const VIDEO_SCRIPT_PROMPT = `你是专业的视频脚本转录助手。请将视频中的所有对话和台词完整转录为文字。
@@ -906,21 +896,8 @@ function getDirectionSnapshot() {
   return _directionSnapshot;
 }
 
-// 内置兜底枚举（策略表读取失败时用，与策略表初始方向保持一致）
-const FALLBACK_DIRECTION_ENUMS = `## 内容方向一（一级方向，优先从以下枚举中选，不满足时可新建）
-- 蹭热点：借时政/政策新闻的注意力，先吸睛再承接
-- 揭秘自己：博主自曝真实收入与资产结构，打破刻板印象
-- 借钱高性价比：揭秘「借到便宜的钱就是优势」的财富真相
-- 利息计算：硬核数学计算拆解利率陷阱，建立专业信任
-- 有钱人借钱：对比富人/普通人的资金思维差异
-- 网贷测评：较真打假视角反向实测，欲扬先抑
-- 回应解释：承接上期广告话题，回应质疑或做常规科普
-- 鸡汤：共情中年人处境，先理解再劝告
-- 避坑：守财导师视角，盘点钱财陷阱
-- 拒绝借钱：解决「抹不开面子又伤人情」的社交痛点
-
-## 内容方向二（二级方向，优先选所属一级方向下的枚举，不满足时可新建）
-蹭热点：时政新闻｜揭秘自己：生意赚多少钱、炒股是否财富自由｜借钱高性价比：借便宜的钱｜利息计算：详细计算｜有钱人借钱：对比富人｜网贷测评：反向测评｜回应解释：回怼回应、常规回应｜鸡汤：中年人借网贷不是堕落、求人不如靠自己、我为你们感到着急｜避坑：不要贪便宜｜拒绝借钱：如何有效拒绝借钱`;
+// 内置兜底枚举（策略表读取失败时用，与策略表初始方向保持一致；来自 config/<brand>/config.json）
+const FALLBACK_DIRECTION_ENUMS = BRAND_CONFIG.strategy.fallbackDirectionEnums || '';
 
 function buildDirectionEnumSection() {
   const snap = getDirectionSnapshot();
@@ -952,130 +929,8 @@ function buildCommentAnalysisPrompt() {
   return COMMENT_ANALYSIS_PROMPT.replace('__DIRECTION_ENUMS__', buildDirectionEnumSection());
 }
 
-const ANALYSIS_PROMPT = `# 角色
-你是一位资深短视频编导，擅长拆解爆款素材的叙事逻辑，并为品牌广告提供可落地的植入策略。
-
-# 任务
-分析用户提供的脚本素材，完成七项输出（六项素材分析 + 一项内容策略分析），直接输出JSON。
-
-# 输出格式
-{
-  "内容相关性": "强相关/弱相关/不相关",
-  "时效性": "长青 / 时效话题-未过气 / 时效话题-已过气",
-  "内容方向": "用一句大白话总结整个脚本的叙事逻辑和核心主张，让观众一听就懂",
-  "场景": ["对镜口播"],
-  "素材逻辑分析": "从叙事视角、双方行为画像、核心结论三个维度综合分析，一段话写清楚，直接给结论",
-  "对度小满的借鉴": "从情绪借势、反向论证、核心策略三个维度综合分析，一段话写清楚核心策略",
-  "植入修改建议": "包含植入锚点、修改后话术（用引号标出）、植入逻辑三个要素，一段话写清楚",
-  "适配达人": {
-    "达人类型": "按达人类型分类标准判断，粒度规则：整个一级类型都适合就只写一级分类（如「财经」=财经下所有二级类型都适合）；仅当适配范围限定在某一二级类型时才写「一级-二级」（如：剧情-剧情搞笑）",
-    "表现形式": "口播/剧情/AI生成/其他",
-    "语速与风格": "语速快慢+说话风格，如：快、犀利",
-    "口吻": "老登说教/犀利点评/真挚分享等",
-    "推荐达人类型": "基于以上三点推导，2-3个类型，如：财经、职场、母婴亲子"
-  },
-  "内容策略": {
-    "内容方向一": "一级方向，优先从下方内容策略分析标准给出的枚举中选；确实不满足时新建（命名简短，与现有枚举风格一致）",
-    "内容方向二": "二级方向，优先从所属一级方向下属的二级枚举中选；确实不满足时新建（命名具体，能独立区分一批素材）",
-    "方向定义": "1-3句：目标人群+核心叙事+内容落点，讲清这个素材体现的方向边界",
-    "植入策略": "一句话打法概括+具体示例（讲清从内容到产品的完整推理链），沿用本素材实际的植入方式",
-    "适合达人": "达人类型（粒度同适配达人.达人类型：整个一级都适合只写一级，如「财经」；仅限某二级才写「一级-二级」），可附简要风格说明"
-  }
-}
-
-# 内容相关性判断标准
-判断脚本内容是否真正围绕"借钱、缺钱、资金周转、债务、真实收入"等核心议题展开：
-- 强相关：脚本核心主题是借钱/缺钱/还钱/债务/资金周转；或者脚本核心是"揭秘真实收入与现金流压力"（如生意人揭秘年收入、打破高收入=高存款的刻板印象、收入构成与垫资压力），且借钱/周转是内容主线之一；或者是网贷平台实测/利息计算类内容
-- 弱相关：脚本提到了借钱或收入，但只是作为众多情节之一，主线是其他主题（如正能量、心灵鸡汤、搞笑段子等）。或者：如果是"过来人"类内容，但当事人还在还债路上挣扎、尚未成功翻身，也算弱相关——我们需要的是已经走出来的成功者视角
-- 不相关：脚本与借钱/资金周转/收入真相完全无关
-
-# 时效性判断标准
-判断素材是"永远不过期的人性/财务话题"还是"依赖特定时间窗口的时效内容"——这不是看发布时间，而是看内容内核：
-- **长青**：内容核心是人性、人情世故、普遍财务困境——不论什么时候拍都有共鸣，老视频反而沉淀好。典型：借钱伤感情、求人不如靠自己、有钱人借钱vs普通人死存钱、中年人借网贷不是堕落、不要给别人借钱、熟人借钱风险、借钱看清人心、守财避坑等。这类素材发布时间不参与判断，越老越好
-- **时效话题-已过气**：内容依赖某个特定时间窗口的平台功能/政策细则/阶段性热点/具体事件，发布时是热点，现在已经没人关注。典型：抖音小店先采后付（已过电商红利期）、某个具体平台的具体活动（活动已结束）、某条已落地的阶段性政策（后续已有更新）、某个具体人物的具体风波（热度已退）。判断关键：如果把素材里的"时间锚点"换成今天，观众还会关心吗？不会 → 已过气
-- **时效话题-未过气**：时效内容但当前仍处传播窗口内（如本季度的金融新规、本月的热点事件），仍有讨论价值
-
-# 场景判断标准（用于输出「场景」字段）
-判断这条素材的画面/情节发生在哪里——供后续按达人拍摄能力匹配素材（能拍剧情的、只能对镜口播的、能出户外的）。
-- 只能从以下枚举中选，可多选（一条素材跨多个场景时全部列出）：
-  **对镜口播**（全片为博主/讲师/女主等对镜讲述，无场景情节）、**酒席饭桌**、**居家室内**、**职场办公**、**户外街头**、**店铺商户**、**车内出行**、**线上通话**（电话/微信对话推进）、**工地工厂**、**其他**
-- 判定依据是脚本里的场景动作与地点线索（如"酒席上""从单元门走出""在办公室""在电话里"），不是内容主题；不要输出"借钱""职场故事"这类主题词
-- 纯对镜讲述、无任何场景情节的，必须选「对镜口播」，不要归入「其他」；确实无法判断具体场所、又不是纯口播的，才选「其他」
-- 场景是"物理/情境发生地"，不要编造脚本中没出现的地点
-
-# 达人类型分类标准（用于输出「达人类型」字段）
-根据脚本文案对照以下标准判断素材适配的达人类型。输出粒度规则：**如果素材内容适配整个一级类型（该一级下所有二级都适合），只输出一级分类（如「财经」）；仅当适配范围确实限定在某一二级类型时才输出「一级-二级」（如只适配剧情-剧情搞笑、不适配剧情-常规剧情）**。
-
-## 标准类型（全部类型，只能从中选择）
-- 财经-泛财经：商业故事、个人财富、消费决策、搞钱思路、时政要闻等一切与金钱/财富/商业相关的点评输出观点，不含投资
-- 财经-高价值：主讲投资（股票/债券/基金/贵金属/房产等金融投资），垂直赛道，政策分析、市场洞察
-- 财经-小微企业主：本人是老板/合伙人，创业日常vlog、产业点评、创业吐槽
-- 财经-常规：真实借贷故事分享（借贷用途非小微企业方向），自己或别人的经历都算
-- 财经-鸡汤：情感共鸣切入、无故事讲述、金句为主，大概描述借贷场景（人情债、借钱难等），讲述整体观点
-- 三农-三农美食：围绕指定食材展开剧情演绎+爽感做饭，人物出镜口播，农村/城乡结合部场景
-- 三农-三农建造：建房/家具/生活用具等手工建造记录，人物出镜口播
-- 剧情-常规剧情：1分钟以上、多人（非一人分饰多角）多场景演出，有完整叙事结构（人物关系、核心冲突、起承转合），环环相扣
-- 剧情-剧情搞笑：相比常规剧情逻辑可不严谨、可不到1分钟，无脑耍丑肢体搞笑为主，可有万万没想到式转折
-
-判断规则：必须且只能从上述 9 个标准类型（或其一级分类）中选择，以脚本文案的内容形态（叙事结构、表现形式、主题方向）为准判断，不是判断视频作者本人是什么达人。先判断适配粒度：内容适配整个一级类型下所有二级 → 只输出一级分类（如「财经」）；内容只适配其中某一个二级 → 输出「一级-二级」。即使素材与所有标准类型的匹配度都不高，也必须选择范围最接近的那一个，禁止自创类型、禁止输出标准列表之外的类型。
-
-# 适配达人分析要求
-- 达人类型：严格按「达人类型分类标准」判断，从 9 个标准类型中选范围最接近的；整个一级类型都适合时输出一级分类（如「财经」），仅限某一二级适合时才输出「一级-二级」，禁止自创类型
-- 表现形式：如输入中已提供「视频表现特征」，直接引用；否则从脚本结构推断（单人长段=口播，多人对话=剧情）。提示中列举的类型仅为参考，可根据实际情况自行补充其他类型
-- 语速与风格：如输入中已提供「视频表现特征」，直接引用；否则从脚本语言密度和标点推断。提示中列举的档位和风格仅为参考，可根据实际情况自行补充其他描述
-- 口吻：从脚本内容的说话态度和立场判断，提示中列举的类型仅为参考，可根据实际情况自行补充其他口吻描述
-- 推荐达人类型：综合表现形式、语速风格、口吻三个维度，推导什么类型的达人适合演绎这类脚本（自由描述，不受达人类型分类标准约束）
-
-# 内容策略分析标准（用于输出「内容策略」字段）
-把这条素材沉淀为一条内容策略：回答「这条内容走什么叙事方向、产品怎么植入、找什么达人拍」。
-
-__DIRECTION_ENUMS__
-
-## 判断规则
-1. 优先复用已有方向：内容方向一和内容方向二先对照上述方向判断，能贴合就选最贴切的那个（内容方向二必须在所选一级方向下属的二级方向中选；切入角度不完全贴合时选语义最接近的，并在「方向定义」中说明具体角度）
-2. 新建判断标准：仅当素材的核心叙事在所有对应层级方向中都找不到容身之处（强行套用会让方向失真、误导后续策略沉淀）时才新建。新建一级方向：命名简短（2-6字，与现有方向风格一致），并在「方向定义」开头注明【新建方向】+一句话说明为什么已有方向都不适用；新建二级方向：必须挂靠一个一级方向（优先已有一级），命名要具体到能独立区分一批素材，同样在「方向定义」开头注明【新建方向】+理由。素材的切入角度（人群、情绪入口、论证路径）与现有方向实质不同时，应倾向新建而不是硬套；只是措辞和锚点不同但方向内核相同的，才复用并在定义中说明角度
-3. 方向定义：1-3句，覆盖目标人群（给谁看）、核心叙事（讲什么故事/打破什么认知）、内容落点（最终引向什么）；只讲内容是什么，不要把植入逻辑写进定义
-4. 植入策略：一句话打法概括 + 具体示例，示例要展现完整的「内容→痛点→产品」推理链（参考本素材实际的植入方式或植入修改建议）；只写打法不给示例视为不合格
-5. 适合达人：按「达人类型分类标准」输出，粒度同「适配达人.达人类型」——整个一级类型都适合只写一级类型（如「财经」），仅限某二级适合才写「一级-二级」；可附 20 字以内的风格说明（如年龄段/职业身份/讲话风格）
-6. 策略等级由程序自动填写（新沉淀的策略初始为 X=创意洞察未验证），无需输出
-
-# 约束条件
-- 场景只能从枚举中选（可多选，禁止自创场景名）；纯对镜讲述选「对镜口播」
-- 内容方向，总字数在30字以内
-- 适配达人的达人类型选范围最接近的一个（整个一级类型适合输出一级分类如「财经」，仅限某二级适合才输出「一级-二级」），推荐达人类型控制在20字以内，其余3个子项各15字以内
-- 植入话术单独不计入总字数，素材逻辑分析、对度小满的借鉴、植入修改建议三项总字数控制在100字以内
-- 不要分点罗列，每项一段话连贯输出
-- 语言精炼直接，不给铺垫过程
-- 植入顺着原素材情绪走，不自夸不生硬
-
-# 品牌名称
-品牌名称：度小满
-品牌卖点：新人首借年华利率4.9%，借一万一年利息约271元；不用不收费
-目标人群：24-50岁的新锐白领、中产阶级，资深中产等方向的男性
-
-# 输出示例
-{
-  "内容相关性": "强相关",
-  "内容方向": "不想既丢钱又丢朋友，就记住：没做好送钱的准备，一分都别借。",
-  "场景": ["对镜口播"],
-  "素材逻辑分析": "被借钱者受害者视角，借钱方占便宜、试探底线、施压人情，被借方羞耻绑架、承担风险、人财两空。核心结论：借钱＝拿钱买仇人，赠予心态才可例外。",
-  "对度小满的借鉴": "借势熟人借贷伤感情高风险的情绪，反向论证正规平台是正向替代方案。核心策略：品牌接住观众'不伤感情+不求人'的需求，成为两难后的最优解。",
-  "植入修改建议": "在'找银行借钱要付利息'处接入'找银行借钱要付利息，但银行还不一定借给你；找度小满，明码标价，利息清楚，到账快，不欠人情不伤感情。那你说，你为啥还要找朋友开口？'核心逻辑：把'向朋友借'的熟人借贷痛点转化为'用正规平台'的解决方案。",
-  "适配达人": {
-    "达人类型": "口播-观点输出",
-    "表现形式": "口播",
-    "语速与风格": "中速、犀利、利落",
-    "口吻": "犀利点评",
-    "推荐达人类型": "财经、职场、情感观点"
-  },
-  "内容策略": {
-    "内容方向一": "拒绝借钱",
-    "内容方向二": "如何有效拒绝借钱",
-    "方向定义": "给被熟人开口借钱、抹不开面子又怕伤感情的普通人看；核心叙事是拒绝借钱的实操方法与人情边界；落点是把「借出去是仇人」的恐惧转化为守住钱包的行动指南。",
-    "植入策略": "打法：先立「借钱=买仇人」的恐惧共识，再衔接到正规平台的替代方案。示例——在「没做好送钱的准备，一分都别借」处接入「真要帮，也要帮得明明白白：自己周转不开时，找度小满，新人首借年化4.9%，不欠人情。把借出去的钱收回来，比什么都强」。推理链：拒绝借钱的痛点→拒绝不了时的兜底→正规平台补位。",
-    "适合达人": "财经-鸡汤，30-50岁、有生活阅历、讲话接地气的口播博主"
-  }
-}`;
+// 分析 prompt 模板（品牌配置化：外置在 config/<brand>/prompts/analysis.md）
+const ANALYSIS_PROMPT = loadPromptFile('analysis.md');
 
 // ==============================
 
@@ -1433,7 +1288,7 @@ ${script}${metaSection}`;
   const jsonMatch = content.match(/\{[\s\S]*\}/);
   if (!jsonMatch) {
     log(`   ⚠️ 分析返回格式异常，使用原始文本`);
-    return { 内容方向: content.substring(0, 50), 素材逻辑分析: '', 对度小满的借鉴: '', 植入修改建议: '' };
+    return { 内容方向: content.substring(0, 50), 素材逻辑分析: '', [BRAND_CONFIG.bitable.borrowInsightField]: '', 植入修改建议: '' };
   }
 
   return JSON.parse(jsonMatch[0]);
@@ -1445,69 +1300,12 @@ ${script}${metaSection}`;
 // 产出：与脚本分析同结构（内容方向一/二 + 植入策略 + 适合达人等），来源标记 comment_insight
 // 沉淀：现有策略表，与脚本来源的策略按方向聚合
 
-const COMMENT_ANALYSIS_PROMPT = `# 角色
-你是一位资深短视频编导，擅长从用户评论区的真实情绪和讨论中提炼创意方向，为品牌广告提供可落地的植入策略。
-
-# 任务
-分析用户提供的高赞评论列表（来自一条资金周转/借钱主题的爆款视频），提炼用户真实痛点与情绪共鸣，输出创意策略分析，直接输出JSON。输出结构与脚本创意分析完全一致。
-
-# 输出格式
-{
-  "内容相关性": "强相关/弱相关/不相关",
-  "时效性": "长青 / 时效话题-未过气 / 时效话题-已过气",
-  "内容方向": "用一句大白话总结评论区反映的核心情绪和讨论主张",
-  "素材逻辑分析": "从评论的主要情绪、典型讨论路径、核心共鸣点三个维度综合分析，一段话写清楚，直接给结论",
-  "对度小满的借鉴": "从评论暴露的真实痛点出发，反向论证度小满如何承接这些痛点，核心策略一段话写清楚",
-  "植入修改建议": "基于评论洞察设计的创意方向（不是修改某条具体话术，而是给出可落地的创意切入点），一段话写清楚",
-  "适配达人": {
-    "达人类型": "按达人类型分类标准判断，粒度规则：整个一级类型都适合就只写一级分类（如「财经」）；仅限某二级适合才写「一级-二级」（如剧情-剧情搞笑）",
-    "表现形式": "口播/剧情/AI生成/其他",
-    "语速与风格": "语速快慢+说话风格",
-    "口吻": "老登说教/犀利点评/真挚分享等",
-    "推荐达人类型": "基于以上三点推导，2-3个类型"
-  },
-  "内容策略": {
-    "内容方向一": "一级方向，优先从枚举中选；确实不满足时新建（注明【新建方向】+理由）",
-    "内容方向二": "二级方向，优先选所属一级方向下属的枚举；确实不满足时新建",
-    "方向定义": "1-3句：目标人群+核心叙事+内容落点",
-    "植入策略": "一句话打法概括+具体示例（讲清从评论痛点到产品的完整推理链）",
-    "适合达人": "达人类型（粒度同适配达人.达人类型：整个一级都适合只写一级，如「财经」；仅限某二级才写「一级-二级」），可附简要风格说明"
-  }
-}
-
-# 内容相关性判断标准
-- 强相关：评论区核心讨论围绕借钱/缺钱/还钱/债务/资金周转/借钱伤感情等核心议题，有真实用户情绪共鸣
-- 弱相关：评论里提到借钱或收入，但只是零星提及，主线是其他主题
-- 不相关：评论区与借钱/资金周转/收入真相完全无关
-
-# 时效性判断标准
-- 长青：评论反映的人性、人情世故、普遍财务困境——不论何时都有共鸣
-- 时效话题-已过气：评论围绕的平台功能/阶段性热点/具体事件已经过气
-- 时效话题-未过气：时效内容但仍在传播窗口内
-
-# 达人类型分类标准（与脚本分析一致，从 9 个标准类型中选范围最接近的一个）
-- 财经-泛财经 / 财经-高价值 / 财经-小微企业主 / 财经-常规 / 财经-鸡汤 / 三农-三农美食 / 三农-三农建造 / 剧情-常规剧情 / 剧情-剧情搞笑
-- 输出粒度：整个一级类型都适合就只输出一级分类（如「财经」）；仅限某二级适合才输出「一级-二级」
-
-# 内容策略分析标准（与脚本分析一致）
-__DIRECTION_ENUMS__
-内容方向二优先选所属一级方向下属的现有方向，不满足时新建并注明【新建方向】+理由；素材切入角度与饱和方向实质不同时优先新建二级方向
-植入策略：一句话打法概括 + 具体示例，示例展现完整的「评论痛点→产品」推理链
-
-# 约束条件
-- 适配达人的达人类型选范围最接近的一个（整个一级类型适合输出一级分类如「财经」，仅限某二级适合才输出「一级-二级」）
-- 不要分点罗列，每项一段话连贯输出
-- 语言精炼直接，不给铺垫过程
-
-# 品牌名称
-品牌名称：度小满
-品牌卖点：新人首借年华利率4.9%，借一万一年利息约271元；不用不收费
-目标人群：24-50岁的新锐白领、中产阶级，资深中产等方向的男性
-`;
+// 评论分析 prompt 模板（品牌配置化：外置在 config/<brand>/prompts/comment_analysis.md）
+const COMMENT_ANALYSIS_PROMPT = loadPromptFile('comment_analysis.md');
 
 async function analyzeCommentsInsight(videoDesc, comments, videoMeta) {
-  // 1. 过滤：去掉空评论、纯表情、过短（<4字）、命中禁止方向的评论
-  const forbiddenPatterns = [/催收/, /上门催/, /起诉/, /立案/, /律师函/, /支付令/, /看病/, /治病/, /学费/, /彩礼/, /结婚/, /房贷断供/, /法拍/];
+  // 1. 过滤：去掉空评论、纯表情、过短（<4字）、命中禁止方向的评论（禁止词来自品牌配置）
+  const forbiddenPatterns = (BRAND_CONFIG.filters.commentForbiddenPatterns || []).map(p => new RegExp(p));
   const cleaned = comments
     .map(c => (c.text || '').trim())
     .filter(t => t.length >= 4)
@@ -1831,13 +1629,13 @@ function writeToBitable(results) {
   const todayStr = getTodayDateStr();
   const createRecords = results.map(r => {
     const analysis = r.analysis || {};
-    const borrowInsight = analysis['对度小满的借鉴'] || '';
+    const borrowInsight = analysis[BRAND_CONFIG.bitable.borrowInsightField] || '';
     const implantSuggestion = analysis['植入修改建议'] || '';
     const adInsight = [borrowInsight, implantSuggestion].filter(Boolean).join('\n\n');
 
     return {
-      '素材id': `dy_${r.aweme_id}`,
-      '素材渠道': '抖音',
+      '素材id': `${BRAND_CONFIG.bitable.materialIdPrefix}${r.aweme_id}`,
+      '素材渠道': BRAND_CONFIG.bitable.materialChannel,
       '关键词': r.keyword || '',
       '素材链接': r.video_url,
       '素材脚本文案': r.script,
@@ -1883,7 +1681,7 @@ function writeToBitable(results) {
   }
 }
 
-// ============ 内容策略表同步（度小满-网络创意策略） ============
+// ============ 内容策略表同步（品牌策略表） ============
 // 唯一性判断标准：内容方向一|内容方向二 组合。同方向多条素材 →
 // 补充完善该方向的植入策略 + 素材id 追加进「素材链接ids」（用、分隔）；新方向 → 新建策略行（等级 X）
 
@@ -2272,7 +2070,7 @@ function sendFeishuNotification(summary, quotaExhausted) {
     }
 
     const lines = [
-      '📊 度小满创意分析 - 执行结果通知',
+      `📊 ${BRAND_CONFIG.notificationTitle}`,
       ''
     ];
 
@@ -2347,7 +2145,7 @@ async function main() {
   }
 
   log('============================================');
-  log('🎬 度小满创意分析 - 抖音工作流启动');
+  log(`🎬 ${BRAND_CONFIG.workflowTitle}`);
   log('============================================\n');
 
   // 检查必需的环境变量
@@ -2717,7 +2515,7 @@ async function main() {
   }
 
   // Step 6: 内容策略沉淀（按内容方向一/二聚合去重，写入策略表）
-  log('🔹 Step 6: 内容策略沉淀（度小满-网络创意策略表）...');
+  log(`🔹 Step 6: 内容策略沉淀（${BRAND_CONFIG.strategyTableLabel}）...`);
   let strategyResult = { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: 0, skipped: 0 };
   try {
     strategyResult = await syncStrategyTable(results);

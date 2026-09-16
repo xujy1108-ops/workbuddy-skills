@@ -1,6 +1,6 @@
 ---
 name: creative-content-analysis
-description: "度小满品牌创意素材自动分析工作流。围绕资金周转困难场景，自动生成抖音搜索关键词、搜索抖音视频、提取视频脚本、分析创意价值并同步到飞书多维表格。当用户提到创意分析、素材分析、抖音创意、跑一下创意、度小满素材等关键词时触发。当前支持抖音渠道，小红书和微信渠道后续补充。"
+description: "品牌创意素材自动分析工作流（多品牌配置化，当前支持度小满、微业贷）。围绕资金周转困难等品牌核心场景，自动生成抖音搜索关键词、搜索抖音视频、提取视频脚本、分析创意价值并同步到飞书多维表格。当用户提到创意分析、素材分析、抖音创意、跑一下创意、度小满素材、微业贷素材等关键词时触发。运行时用 --brand 指定品牌（默认 duxiaoman），品牌私有配置全部外置在 config/<brand>/。当前支持抖音渠道，小红书和微信渠道后续补充。"
 agent_created: true
 ---
 
@@ -8,11 +8,35 @@ agent_created: true
 
 ## 概述
 
-围绕"资金周转困难"核心场景，从抖音搜索真实用户内容视频，提取完整脚本，分析创意价值，为广告植入提供建议，最终将结果同步到飞书多维表格。
+围绕品牌核心场景（如度小满的"资金周转困难"），从抖音搜索真实用户内容视频，提取完整脚本，分析创意价值，为广告植入提供建议，最终将结果同步到飞书多维表格。
 
 **一条命令跑完全流程**：查重 → 生成关键词 → 搜索抖音 → 提取脚本 → 分析创意 → 写入飞书表格 → 飞书通知执行结果。
 
 当前支持 **抖音** 渠道。小红书和微信渠道后续补充。
+
+## 品牌配置化（2026-09-16 改造）
+
+所有品牌私有内容外置在 `config/<brand>/`，代码零品牌硬编码；换个品牌 = 新增一个配置目录：
+
+```
+config/
+  duxiaoman/
+    config.json            # 品牌名/飞书表 token/素材id前缀/渠道名/过滤禁止词/
+                           # 处境坐标系（人群轴×时刻轴）/邻接域/策略兜底清单/关键词来源片段
+    prompts/
+      keyword.md           # 关键词生成 prompt 模板（占位符：__TOTAL__ __SOURCES__ __STRATEGY_LIST__
+                           #   __EXPLORE_MATERIAL__ __RECENT_KEYWORDS__ __HIT_RATE_FEEDBACK__ __EXAMPLE_ITEMS__）
+      analysis.md          # 创意分析 prompt 模板（占位符 __DIRECTION_ENUMS__）
+      comment_analysis.md  # 评论分析 prompt 模板（占位符 __DIRECTION_ENUMS__）
+  weiyedai/
+    (同结构骨架，待补齐)
+```
+
+- **品牌选择**：`--brand <name>` 参数 > env `WORKFLOW_BRAND` > 默认 `duxiaoman`
+- 配置缺失/缺必填字段/模板文件缺失 → 启动即报错并列出可用品牌，不会白烧 API
+- env 变量（`BITABLE_BASE_TOKEN` 等）可覆盖品牌配置里的表 token 默认值
+- 运行状态文件（关键词统计/近期词/策略缓存/探索登记表）按品牌隔离在 `.state/<brand>/`，首次运行自动从根目录旧文件迁移
+- 新增品牌步骤：复制 duxiaoman 目录 → 改 config.json（品牌名/表 token/过滤词/坐标系）→ 改 3 个 prompt 模板中的品牌段落 → 无需改任何代码
 
 ## 前置条件
 
@@ -26,21 +50,22 @@ agent_created: true
 | `AIHUBMIX_API_KEY` | AIHubMix API 密钥 | 无（必填） |
 | `AIHUBMIX_BASE_URL` | AIHubMix API 地址 | `https://api.inferera.com/v1` |
 | `TIKHUB_TOKEN` | TikHub 抖音搜索 API 令牌 | 无（必填） |
-| `BITABLE_BASE_TOKEN` | 飞书多维表格 Base Token | 无（必填） |
-| `BITABLE_TABLE_ID` | 飞书多维表格 Table ID | 无（必填） |
+| `WORKFLOW_BRAND` | 品牌配置目录名（可被 `--brand` 覆盖） | `duxiaoman` |
+| `BITABLE_BASE_TOKEN` | 飞书素材表 Base Token（覆盖品牌配置默认值） | 来自 `config/<brand>/config.json` |
+| `BITABLE_TABLE_ID` | 飞书素材表 Table ID（覆盖品牌配置默认值） | 来自 `config/<brand>/config.json` |
 | `DEEPSEEK_MODEL` | 关键词生成与分析模型 | `deepseek-v4-pro` |
 | `DOUBAO_MODEL` | 视频脚本提取模型 | `doubao-seed-2-1-pro` |
 | `WORKFLOW_CONCURRENCY` | 并行处理并发数 | `3` |
 | `SEARCH_PAGES` | 每个关键词搜索翻页数 | `1`（每页 10 条，即每词 10 条） |
-| `HOTSPOT_BASE_TOKEN` | 热点素材表 Base Token（探索配额A 热点翻译的素材源，按 0-1 跳门控） | `STMrbQgqma35dksI3WsclJlNnlc` |
-| `HOTSPOT_TABLE_ID` | 热点素材表 Table ID | `tblDpxkM7psozqeO` |
+| `HOTSPOT_BASE_TOKEN` | 热点素材表 Base Token（探索配额A 热点翻译的素材源，按 0-1 跳门控；覆盖品牌配置默认值） | 来自 `config/<brand>/config.json` |
+| `HOTSPOT_TABLE_ID` | 热点素材表 Table ID（覆盖品牌配置默认值） | 来自 `config/<brand>/config.json` |
 
 ## 执行方式
 
 ### 完整运行（默认）
 
 ```bash
-node scripts/run_workflow.js
+node scripts/run_workflow.js --brand duxiaoman
 ```
 
 这一条命令会自动完成全部步骤：
@@ -62,6 +87,7 @@ node scripts/run_workflow.js
 
 | 参数 | 说明 |
 |------|------|
+| `--brand <name>` | 品牌配置目录名（默认 `duxiaoman`；也可用 env `WORKFLOW_BRAND`） |
 | `--keywords "kw1,kw2"` | 使用自定义搜索关键词（跳过 AI 生成） |
 | `--existing-ids "id1,id2"` | 手动传入已有素材 ID（跳过自动查重） |
 | `--skip-bitable` | 跳过飞书多维表格读写（仅跑分析，不写入） |
@@ -179,7 +205,7 @@ Step 4 的视频脚本提取 + 创意分析使用 `Promise.all` 并行执行（�
 ### 内容策略沉淀（Step 6）
 创意分析时 AI 会额外产出「内容策略」子对象（内容方向一/二、方向定义、植入策略、适合达人），分析方法按《内容策略表字段填写指南》（https://kwza968lz1u.feishu.cn/docx/SuLudPWPDoz0ZcxLFwccZpKNnqh）：
 - 内容方向一/二**优先复用**策略表已有枚举（一级 10 个、二级 14 个）；当素材核心叙事在对应层级枚举中确实找不到容身之处时，AI 可新建一级或二级方向（新建时在「方向定义」开头注明【新建方向】+理由，命名与现有枚举风格一致）
-- 运行结束后脚本自动同步到策略表（`STRATEGY_BASE_TOKEN=EPYhbxo9TaUclysWuM0cgjkdnFf`，`STRATEGY_TABLE_ID=tblSZ8LbahG9GnCH`）
+- 运行结束后脚本自动同步到策略表（token 来自品牌配置 `tables.strategy`，env `STRATEGY_BASE_TOKEN`/`STRATEGY_TABLE_ID` 可覆盖）
 - **唯一性判断标准：内容方向一|内容方向二 组合**
   - 同方向已有策略行 → **先查重再补充**：用 LLM 判断每条新素材的「打法+推理链」与已有策略是否同一套逻辑——重复的只把素材 id 并入「素材链接ids」（用、分隔），不追加段落；有实质差异（不同情绪入口/论证路径/植入时机）的才追加「【素材补充 dy_xxx】+ 新打法」段落。查重失败时只并入素材链接ids、不追加任何策略文字（宁少勿堆：追加错误的重复段是粘性的，需人工清理；错过的真新策略仍可从素材库追溯）。**同时合并「适合达人」**：新素材（含查重为重复、只并入 ids 的素材）的达人类型若在行上未覆盖，自动并入「达人类型：」行；**粒度遵循「宽一级优先」**——行上有一级类型则其下二级都视为覆盖；新素材判定为一级类型（如「剧情」）而行上只有它的二级窄类型时，把窄类型收敛为该一级类型；无新类型则不改该字段
   - 同方向新出现 → 新建策略行：策略等级固定 X（创意洞察未验证），正向案例填完整脚本原文，素材链接ids 填本轮该方向全部素材 id；多条素材时同样先查重，以第 1 条为基准去重
@@ -187,19 +213,19 @@ Step 4 的视频脚本提取 + 创意分析使用 `Promise.all` 并行执行（�
 - 同步失败不影响主流程，仅记录警告
 
 ### 飞书多维表格写入
-脚本通过 `child_process.execFileSync` 调用 `lark-cli base +record-batch-create` 自动写入。字段映射：
+脚本通过 `child_process.execFileSync` 调用 `lark-cli base +record-batch-create` 自动写入。字段映射（素材id前缀、素材渠道、「对品牌」字段名均来自品牌配置 `bitable` 段）：
 
 | 字段名 | 写入值 |
 |--------|--------|
-| 素材id | `dy_` + aweme_id |
-| 素材渠道 | `抖音` |
+| 素材id | 品牌配置 `bitable.materialIdPrefix`（duxiaoman: `dy_`）+ aweme_id |
+| 素材渠道 | 品牌配置 `bitable.materialChannel`（duxiaoman: `抖音`） |
 | 关键词 | 搜索该素材时使用的关键词 |
 | 素材链接 | `https://www.douyin.com/video/` + aweme_id |
 | 素材脚本文案 | script 字段完整内容 |
 | 内容方向 | analysis.内容方向 |
 | 场景 | analysis.场景（多选，从枚举中选，可多选；程序侧 formatScenes 过滤掉自创值）。枚举：对镜口播 / 酒席饭桌 / 居家室内 / 职场办公 / 户外街头 / 店铺商户 / 车内出行 / 线上通话 / 工地工厂 / 其他。**纯对镜讲述（博主/讲师对镜、无场景情节）必须标「对镜口播」，不要混进「其他」**；该字段供 script-creation 按达人拍摄能力匹配素材、并在创意方向里输出场景要求 |
 | 内容分析 | analysis.素材逻辑分析 |
-| 广告可借鉴点 | analysis.对度小满的借鉴 + "\n\n" + analysis.植入修改建议 |
+| 广告可借鉴点 | analysis.对品牌的借鉴（字段名取品牌配置 `bitable.borrowInsightField`，duxiaoman 为「对度小满的借鉴」） + "\n\n" + analysis.植入修改建议 |
 | 适配达人 | analysis.适配达人 5 个子项格式化为多行文本（达人类型 / 表现形式 / 语速与风格 / 口吻 / 推荐达人类型）。达人类型按「度小满-达人类型基础标准」（财经5类/三农2类/剧情2类），必须从 9 个标准类型中选范围最接近的一个，禁止自创类型；**粒度规则：整个一级类型都适合只输出一级分类（如「财经」=财经下所有二级都适合），仅当适配范围限定在某二级类型时才输出「一级-二级」（如剧情-剧情搞笑）** |
 | 更新时间 | 写入时的日期（yyyy/MM/dd 格式字符串） |
 
@@ -226,7 +252,9 @@ node scripts/video_script.js "https://视频下载链接"
 
 ## 参考文档
 
-- [`references/prompts.md`](references/prompts.md) — 全部 LLM 提示词（关键词生成、脚本提取、创意分析）
+- [`config/<brand>/prompts/`](config/) — **生效中的 LLM 提示词模板**（关键词生成、创意分析、评论分析，按品牌隔离）
+- [`config/<brand>/config.json`](config/) — **生效中的品牌配置**（表 token、过滤词、坐标系、策略兜底）
+- [`references/prompts.md`](references/prompts.md) — 提示词设计说明（参考副本，实际以 config 下模板为准）
 - [`references/bitable_config.md`](references/bitable_config.md) — 飞书多维表格字段映射
 
 ## 后续扩展

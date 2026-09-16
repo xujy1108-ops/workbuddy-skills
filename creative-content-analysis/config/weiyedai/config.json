@@ -1,0 +1,59 @@
+{
+  "_TODO": "微业贷品牌配置骨架——所有带 TODO 的字段需补齐后才能运行 weiyedai 品牌；结构对齐 config/duxiaoman/config.json",
+
+  "brand": "weiyedai",
+  "brandName": "微业贷",
+  "workflowTitle": "微业贷创意分析 - 抖音工作流启动",
+  "notificationTitle": "微业贷创意分析 - 执行结果通知",
+  "strategyTableLabel": "微业贷-网络创意策略表",
+
+  "bitable": {
+    "materialIdPrefix": "dy_",
+    "materialChannel": "抖音",
+    "borrowInsightField": "对微业贷的借鉴"
+  },
+
+  "tables": {
+    "material": {
+      "baseToken": "TODO_素材表base_token",
+      "tableId": "TODO_素材表table_id"
+    },
+    "strategy": {
+      "docUrl": "TODO_内容策略文档URL",
+      "baseToken": "TODO_策略表base_token",
+      "tableId": "TODO_策略表table_id",
+      "excludeL1": ["回应解释"]
+    },
+    "hotspot": {
+      "baseToken": "TODO_热点素材表base_token",
+      "tableId": "TODO_热点素材表table_id"
+    }
+  },
+
+  "filters": {
+    "_TODO": "按微业贷产品合规红线调整，参考 duxiaoman 的分类（脚本内容禁止词 / 标题禁止词 / 评论禁止词）",
+    "forbiddenKeywords": [],
+    "titleForbiddenKeywords": [],
+    "commentForbiddenPatterns": []
+  },
+
+  "explore": {
+    "coreScene": "TODO_核心场景（如：小微企业融资困难）",
+    "populationAxis": [],
+    "momentAxis": [],
+    "adjacentDomains": []
+  },
+
+  "strategy": {
+    "fallbackStrategies": [],
+    "fallbackDirectionEnums": "TODO_策略表读取失败时的兜底方向枚举文本"
+  },
+
+  "prompts": {
+    "keywordSources": {
+      "direct": "TODO_策略直搜来源指示与搜词示例",
+      "derive": "TODO_策略衍生来源指示与公式示例",
+      "explore": "TODO_开放探索来源指示"
+    }
+  }
+}
