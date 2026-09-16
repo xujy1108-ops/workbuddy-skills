@@ -41,6 +41,7 @@ config/
   - `tables.*.baseUrl` 只作核对用（点开即可对表），实际调用只用 `baseToken` + `tableId`
   - `strategy.fallbackStrategies` 必须与策略 Base 的「S/A 级 且 内容方向一 ∉ excludeL1」记录集逐行一致
   - `strategy.fallbackDirectionEnums` 的一级/二级枚举必须与策略 Base「内容方向一/内容方向二」字段的 select 选项逐项一致（忽略带换行的脏重复选项）
+  - **方向值归一化兜底**：脚本读表、AI 回填、落表前均对「内容方向一/二」做空白归一化（`normalizeDirectionValue`，折叠空格并 trim）。飞书 select 按全字符串精确匹配、不做 trim，若 AI 吐出带换行的方向值会被当成新选项落表，导致同一方向分裂成两个选项。Base 侧若已有带换行的脏选项（如 `中年人借网贷不是堕落\n`），属历史脏数据，建议手动删除
 
 ## 前置条件
 

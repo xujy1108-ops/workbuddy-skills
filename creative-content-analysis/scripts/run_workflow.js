@@ -1291,7 +1291,7 @@ ${script}${metaSection}`;
     return { 内容方向: content.substring(0, 50), 素材逻辑分析: '', [BRAND_CONFIG.bitable.borrowInsightField]: '', 植入修改建议: '' };
   }
 
-  return JSON.parse(jsonMatch[0]);
+  return normalizeAnalysisDirections(JSON.parse(jsonMatch[0]));
 }
 
 // ============ 高赞评论创意策略分析（独立第二条线） ============
@@ -1365,7 +1365,7 @@ ${topComments}${metaSection}`;
       return null;
     }
 
-    const analysis = JSON.parse(jsonMatch[0]);
+    const analysis = normalizeAnalysisDirections(JSON.parse(jsonMatch[0]));
 
     // 相关性判断：弱相关/不相关 → 不入库
     if (analysis.内容相关性 && analysis.内容相关性 !== '强相关') {
@@ -1693,6 +1693,26 @@ function cellText(val) {
   return String(val);
 }
 
+// 方向值归一化（脏数据兜底，2026-09-16）：AI 回填或人工录入的「内容方向一/二」若带首尾换行、
+// 多余空白，写入飞书 select 字段时无法与已有选项精确匹配（飞书按全字符串匹配，不做 trim），
+// 会被 ensureSelectOptions 当作新选项落表，导致同一方向分裂成「干净选项」与「带空白选项」两份
+// （策略表已有此脏数据：内容方向二 存在 '中年人借网贷不是堕落\n' 选项）。故读/写两侧统一归一化。
+function normalizeDirectionValue(val) {
+  if (val == null) return '';
+  const raw = Array.isArray(val) ? (val.length > 0 ? val[0] : '') : val;
+  return String(raw).replace(/\s+/g, ' ').trim();
+}
+
+// 归一化分析结果中的内容方向（原地处理并返回，分析结果后续在聚合/写入多处复用）
+function normalizeAnalysisDirections(analysis) {
+  const s = analysis && analysis['内容策略'];
+  if (s) {
+    s['内容方向一'] = normalizeDirectionValue(s['内容方向一']);
+    s['内容方向二'] = normalizeDirectionValue(s['内容方向二']);
+  }
+  return analysis;
+}
+
 // 读取策略表现有记录，返回 Map「方向一|方向二」-> { recordId, 植入策略, 素材链接ids }
 function fetchStrategyRecords() {
   const output = runLarkCli([
@@ -1714,8 +1734,8 @@ function fetchStrategyRecords() {
 
   const map = new Map();
   rows.forEach((row, i) => {
-    const dir1 = cellText(idx['内容方向一'] >= 0 ? row[idx['内容方向一']] : null);
-    const dir2 = cellText(idx['内容方向二'] >= 0 ? row[idx['内容方向二']] : null);
+    const dir1 = normalizeDirectionValue(idx['内容方向一'] >= 0 ? cellText(row[idx['内容方向一']]) : '');
+    const dir2 = normalizeDirectionValue(idx['内容方向二'] >= 0 ? cellText(row[idx['内容方向二']]) : '');
     if (!dir1 || !dir2) return;
     map.set(`${dir1}|${dir2}`, {
       recordId: recordIds[i] || null,
@@ -1790,7 +1810,8 @@ function mergeSuitedInfluencers(existing, items) {
 // 确保策略表 select 字段包含给定选项（新方向落表的前提：飞书不会自动创建不存在的选项）
 // fieldName: 字段名；values: 需要的选项值数组。返回实际新增的选项列表。
 function ensureSelectOptions(fieldName, values) {
-  const needed = [...new Set(values.filter(v => v && String(v).trim()))];
+  // 归一化后再比对：避免带换行/空白的脏值绕过 existingNames 精确匹配，重复落一个脏选项
+  const needed = [...new Set(values.map(v => normalizeDirectionValue(v)).filter(Boolean))];
   if (needed.length === 0) return [];
 
   // 1) 读全量字段定义（field-update 是全量 PUT，必须先读后改）
@@ -1999,8 +2020,9 @@ async function syncStrategyTable(results) {
       }
       const ids = newIds.join('、');
       createRecords.push({
-        '内容方向一': [dir1],
-        '内容方向二': [dir2],
+        // 落表前再归一化一次：写入值必须与飞书已有选项精确匹配，否则会分裂出新选项
+        '内容方向一': [normalizeDirectionValue(dir1)],
+        '内容方向二': [normalizeDirectionValue(dir2)],
         '内容一方向定义': s['方向定义'] || '',
         '植入策略': 植入策略,
         '策略等级': ['X'],
