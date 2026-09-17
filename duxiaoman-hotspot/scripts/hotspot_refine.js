@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * 度小满热点手动精筛脚本（hotspot_refine.js）
+ * 热点手动精筛脚本（hotspot_refine.js）
  *
  * 对已入飞书热点素材表的热点做"优秀度检验"并回填素材评分：
  *   1. 读取素材表第 N 行的热点标题
@@ -10,12 +10,17 @@
  *   4. 定级：≥10 优秀 / 5-9 良好 / 3-5 一般 / <3 劣质
  *   5. 回填该行的"素材评分"字段
  *
+ * 品牌配置化（2026-09-17）：
+ *   定级阈值/天数/点赞门槛/取样条数、飞书表均来自 config/<brand>/；
+ *   品牌选择：--brand > env WORKFLOW_BRAND > duxiaoman。
+ *
  * 使用方法：
  *   node hotspot_refine.js --row 23            # 精筛第 23 行
  *   node hotspot_refine.js --record-id recXXX  # 直接指定记录 ID
  *   node hotspot_refine.js --row 23 --dry-run  # 只检验不入表
  *
  * 参数：
+ *   --brand <name>   品牌配置（默认 duxiaoman）
  *   --row N          精筛素材表第 N 行（1-based，默认视图顺序）
  *   --record-id ID   直接指定记录 ID（优先于 --row）
  *   --dry-run        只检验并打印结果，不回填评分
@@ -23,29 +28,32 @@
  *
  * 环境变量：
  *   TIKHUB_TOKEN / TIKHUB_BASE_URL     抖音搜索
- *   HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID  飞书热点素材表读写
+ *   HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID  可选，覆盖品牌配置里的飞书热点素材表
+ *   WORKFLOW_BRAND                     品牌（被 --brand 覆盖）
  *
  * 输出：JSON 到 stdout，进度日志到 stderr
  */
 
 const { execFileSync } = require('child_process');
+const brandConfig = require('./brand_config');
 
 // ============ 配置 ============
+// 品牌私有内容全部来自 config/<brand>/，本文件不写死品牌内容
+const CFG = brandConfig.load();
+const BRAND = CFG.brand;
+const BRAND_NAME = CFG.brandName;
 const TIKHUB_TOKEN = process.env.TIKHUB_TOKEN;
 const TIKHUB_BASE_URL = (process.env.TIKHUB_BASE_URL || 'https://api.tikhub.io').replace(/\/+$/, '');
-const HOTSPOT_BASE_TOKEN = process.env.HOTSPOT_BASE_TOKEN;
-const HOTSPOT_TABLE_ID = process.env.HOTSPOT_TABLE_ID;
+const HOTSPOT_BASE_TOKEN = CFG.table.baseToken;
+const HOTSPOT_TABLE_ID = CFG.table.tableId;
 const LARK_CLI = 'lark-cli';
 
-// 检验阈值（度小满需求文档第三部分）
-const GRADE_THRESHOLDS = {
-  EXCELLENT: 10,  // >=10 优秀
-  GOOD: 5,        // 5-9 良好
-  NORMAL: 3       // 3-5 一般（含5）；<3 劣质
-};
-const DAYS_RECENT = 7;     // 近7天
-const MIN_DIGG = 10000;    // 点赞>1万
-const TOP_N = 20;          // 看前20条
+// 检验阈值（品牌配置 config/<brand>/config.json → refine）
+const GRADE_THRESHOLDS = CFG.refine.gradeThresholds;
+const GRADE_LABELS = CFG.refine.gradeLabels;
+const DAYS_RECENT = CFG.refine.daysRecent;   // 近 N 天
+const MIN_DIGG = CFG.refine.minDigg;         // 点赞 > N
+const TOP_N = CFG.refine.topN;               // 看前 N 条
 // ==============================
 
 function log(msg) {
@@ -200,10 +208,10 @@ function countQualified(videos) {
 
 // ============ 定级 ============
 function grade(count) {
-  if (count >= GRADE_THRESHOLDS.EXCELLENT) return '优秀';
-  if (count >= GRADE_THRESHOLDS.GOOD) return '良好';
-  if (count >= GRADE_THRESHOLDS.NORMAL) return '一般';
-  return '劣质';
+  if (count >= GRADE_THRESHOLDS.EXCELLENT) return GRADE_LABELS.EXCELLENT;
+  if (count >= GRADE_THRESHOLDS.GOOD) return GRADE_LABELS.GOOD;
+  if (count >= GRADE_THRESHOLDS.NORMAL) return GRADE_LABELS.NORMAL;
+  return GRADE_LABELS.BELOW;
 }
 
 // ============ 回填素材评分 ============
@@ -235,7 +243,8 @@ async function main() {
   const args = process.argv.slice(2);
   const opts = { row: null, recordId: null, dryRun: false, debug: false };
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--row' && args[i + 1]) opts.row = Number(args[++i]);
+    if (args[i] === '--brand' && args[i + 1]) { /* 品牌已由 brand_config 解析，跳过其值 */ i++; }
+    else if (args[i] === '--row' && args[i + 1]) opts.row = Number(args[++i]);
     else if (args[i] === '--record-id' && args[i + 1]) opts.recordId = args[++i];
     else if (args[i] === '--dry-run') opts.dryRun = true;
     else if (args[i] === '--debug') opts.debug = true;
@@ -250,12 +259,12 @@ async function main() {
     process.exit(1);
   }
   if (!HOTSPOT_BASE_TOKEN || !HOTSPOT_TABLE_ID) {
-    log('❌ 缺少 HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID，无法读取素材表');
+    log(`❌ 品牌配置 [${BRAND}] 缺飞书素材表 baseToken/tableId（config/${BRAND}/config.json 或环境变量 HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID）`);
     process.exit(1);
   }
 
   log('============================================');
-  log('🔬 度小满热点精筛（优秀度检验）');
+  log(`🔬 ${BRAND_NAME}热点精筛（优秀度检验｜品牌配置：${BRAND}）`);
   log('============================================\n');
 
   // Step 1: 读取热点
@@ -279,9 +288,9 @@ async function main() {
   log(`   搜到 ${videos.length} 条\n`);
 
   if (videos.length === 0) {
-    log('⚠️ 未搜到视频，评为"劣质"');
-    const result = { title, total: 0, qualified: 0, grade: '劣质', videos: [] };
-    if (!opts.dryRun) updateScore(record.record_id, '劣质');
+    log(`⚠️ 未搜到视频，评为"${GRADE_LABELS.BELOW}"`);
+    const result = { title, total: 0, qualified: 0, grade: GRADE_LABELS.BELOW, videos: [] };
+    if (!opts.dryRun) updateScore(record.record_id, GRADE_LABELS.BELOW);
     console.log(JSON.stringify(result, null, 2));
     return;
   }

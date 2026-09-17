@@ -1,23 +1,26 @@
 #!/usr/bin/env node
 
 /**
- * 度小满热点筛选 + 入表脚本（hotspot_filter.js）
+ * 热点筛选 + 入表脚本（hotspot_filter.js）
  *
- * 流程：采集热点（复用 hotspot_collect.js）→ AI 判断是否符合度小满时事政策热点
+ * 流程：采集热点（复用 hotspot_collect.js）→ AI 判断是否符合本品牌时事政策热点
  *       → 选语义锚点 + 数转折跳数 → 定植入方式 + 生成植入策略
  *       → 按素材表 11 字段写入飞书多维表格
  *
- * 判断标准（度小满需求文档第二部分）：
- *   1. 和金融经济、民生经济相关；排除娱乐/网络游戏&赛事/汽车/美妆/时尚等非金融经济领域
- *   2. 和普罗大众相关且和钱直接/间接相关（养老/公积金/社保/国补/投资新政策等）；
- *      排除美国伊朗打仗、日韩摩擦等与普通人无关的宏大叙事
+ * 品牌配置化（2026-09-17）：
+ *   品牌私有内容（飞书表、预筛词表、锚点池、复查间隔、AI prompt、judge system）全部在
+ *   config/<brand>/ 下，本文件零品牌硬编码。品牌选择：--brand > env WORKFLOW_BRAND > duxiaoman。
  *
- * 转折判据（2026-09-15 新增）：
- *   锚点 = 热点与「借钱」共用的语义公共项，候选池：钱/收入/支出/借贷/征信/被骗
- *   跳数 = 从热点到「借钱需求」的显式转折次数，**不算到品牌名**（度小满＝借钱渠道，同义替换不计跳）
- *   植入方式由跳数决定：0 跳→直接阐述 / 1 跳→隐喻植入 / ≥2 跳→仅蹭热度（不生成植入策略）
+ * 判断标准（品牌 prompt 模板 config/<brand>/prompts/judge.md 定义）：
+ *   领域（金融经济/民生经济）+ 相关性（和钱相关、非宏大叙事）+ 受众重合（围观人群可能有周转需求）
+ *   禁止方向：涉具体人/公司品牌（舆情）、看病上学彩礼、涉军红线
  *
- * 到期复查（2026-09-15 新增，汰换=状态复查而非删除）：
+ * 转折判据：
+ *   锚点 = 热点与「借钱」共用的语义公共项，候选池闭口（config: strategy.anchorPool）
+ *   跳数 = 从热点到「借钱需求」的显式转折次数，**不算到品牌名**（品牌＝借钱渠道，同义替换不计跳）
+ *   植入方式由跳数硬判定（config: strategy.placementByHops），不采信 AI 自我判断
+ *
+ * 到期复查（汰换=状态复查而非删除，间隔见 config: strategy.reviewDays）：
  *   时事政策 +7 天（查有无新进展：细则/执行日，有则续期）
  *   头部达人 +7 天（查是否仍在讲同一话题）
  *   平台热榜 +3 天（冷却淘汰，到期直接下线）
@@ -27,10 +30,14 @@
  *   已存在则跳过——修复"每轮全量重写入表导致同题重复"的问题。
  *   需要强制全量写入时加 --force-write。
  *
+ * 二次复核（2026-09-16 新增）：
+ *   首轮 fit=true 的再判一遍，两次一致才入库，复核轮结果为权威；JUDGE_RECHECK=0 关闭。
+ *
  * 使用方法：
- *   node hotspot_filter.js [--input <collect.json>] [--channels ...] [--top 20] [--dry-run] [--force-write] [--debug]
+ *   node hotspot_filter.js [--brand <品牌>] [--input <collect.json>] [--channels ...] [--top 20] [--dry-run] [--force-write] [--debug]
  *
  * 参数：
+ *   --brand <name>   品牌配置（默认 duxiaoman，可用 config/ 下任意品牌目录名）
  *   --input <file>   直接读取 hotspot_collect.js 已生成的 JSON 结果（跳过采集）
  *   --channels       采集渠道（仅未指定 --input 时生效），默认 douyin,xhs,kuaishou,weibo,bilibili,gov,creator
  *   --top N          每渠道取前 N 条送 AI 判断（默认 20）
@@ -40,8 +47,9 @@
  *
  * 环境变量：
  *   AIHUBMIX_API_KEY / AIHUBMIX_BASE_URL / DEEPSEEK_MODEL
- *   HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID  （飞书热点素材表，--dry-run 时可不配）
+ *   HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID  （可选，覆盖品牌配置里的飞书热点素材表；--dry-run 时可不配）
  *   TIKHUB_TOKEN / TIKHUB_BASE_URL         （仅采集时需要）
+ *   WORKFLOW_BRAND                         （品牌，被 --brand 覆盖）
  *
  * 输出：JSON 到 stdout（含 fit/strategy/write 结果），进度日志到 stderr
  */
@@ -49,13 +57,18 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
+const brandConfig = require('./brand_config');
 
 // ============ 配置 ============
+// 品牌私有内容全部来自 config/<brand>/（见 brand_config.js），本文件不写死任何品牌内容
+const CFG = brandConfig.load();
+const BRAND = CFG.brand;
+const BRAND_NAME = CFG.brandName;
 const AIHUBMIX_API_KEY = process.env.AIHUBMIX_API_KEY;
 const AIHUBMIX_BASE_URL = (process.env.AIHUBMIX_BASE_URL || 'https://api.inferera.com/v1').replace(/\/+$/, '');
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro';
-const HOTSPOT_BASE_TOKEN = process.env.HOTSPOT_BASE_TOKEN;
-const HOTSPOT_TABLE_ID = process.env.HOTSPOT_TABLE_ID;
+const HOTSPOT_BASE_TOKEN = CFG.table.baseToken;
+const HOTSPOT_TABLE_ID = CFG.table.tableId;
 const LARK_CLI = 'lark-cli';
 const SCRIPT_DIR = __dirname;
 
@@ -72,21 +85,19 @@ function log(msg) {
   process.stderr.write(msg + '\n');
 }
 
-// ============ 预筛规则（A 方案 + 第五点禁止） ============
+// ============ 预筛规则（A 方案 + 第五点禁止，词表来自品牌配置） ============
 // 抖音 category 白名单：只送这些类目给 AI（跳过娱乐/游戏/汽车/美食/旅行/体育/站内玩法/话题互动）
-const DOUYIN_CATEGORY_WHITELIST = ['时政', '财经', '社会', '科技', '金融', '经济', '民生'];
+const DOUYIN_CATEGORY_WHITELIST = CFG.filters.douyinCategoryWhitelist;
 
-// 第五点禁止关键词：标题含这些的预筛排除（借贷产品不允许给看病/上学/结婚彩礼提供借贷）
-const FORBIDDEN_KEYWORDS = ['看病', '治病', '医疗', '住院', '手术', '医药', '医院',
-  '上学', '学费', '开学', '开学季', '升学',
-  '结婚', '彩礼', '婚嫁', '婚宴', '嫁妆'];
+// 第五点禁止关键词（分组，标题命中即预筛排除；含各品牌自有红线，如涉军）
+const FORBIDDEN_GROUPS = CFG.filters.forbiddenGroups;
 
 function preFilter(item) {
   const topic = item.topic || '';
-  // 第五点禁止关键词（所有渠道）
-  const hit = FORBIDDEN_KEYWORDS.find(k => topic.includes(k));
-  if (hit) {
-    return { pass: false, reason: `含禁止关键词[${hit}]（第五点：看病/上学/结婚彩礼不允许）` };
+  // 第五点禁止关键词（所有渠道，分组匹配）
+  for (const g of FORBIDDEN_GROUPS) {
+    const hit = g.words.find(k => topic.includes(k));
+    if (hit) return { pass: false, reason: `含禁止关键词[${hit}]（第五点：${g.reason}）` };
   }
   // 抖音渠道按 category 预筛（白名单）
   if ((item.platform === 'douyin' || item.platform === 'douyin_creator') && item.category) {
@@ -99,34 +110,28 @@ function preFilter(item) {
 }
 
 // ============ 转折判据：语义锚点 + 跳数 → 植入方式 ============
-// 锚点候选池（与飞书「语义锚点」字段的 select 选项严格一致，AI 只能从这里选）
-const ANCHOR_POOL = ['钱', '收入', '支出', '借贷', '征信', '被骗'];
+// 锚点候选池（与品牌飞书「语义锚点」字段的 select 选项严格一致，AI 只能从这里选）
+const ANCHOR_POOL = CFG.strategy.anchorPool;
 
-// 锚点别名归一（AI 偶尔写成同义词，按最长优先映射回候选池；'钱' 兜底放最后）
-const ANCHOR_ALIASES = [
-  ['借贷', '借贷'], ['贷款', '借贷'], ['借钱', '借贷'], ['信贷', '借贷'], ['融资', '借贷'],
-  ['征信', '征信'], ['信用记录', '征信'], ['信用', '征信'],
-  ['被骗', '被骗'], ['受骗', '被骗'], ['诈骗', '被骗'], ['反诈', '被骗'], ['骗子', '被骗'],
-  ['收入', '收入'], ['工资', '收入'], ['收益', '收入'], ['利息', '收入'], ['养老金', '收入'], ['补贴', '收入'],
-  ['支出', '支出'], ['消费', '支出'], ['花费', '支出'], ['开销', '支出'], ['月供', '支出'], ['还款', '支出'],
-  ['钱', '钱'], ['资金', '钱'], ['现金', '钱'], ['资产', '钱']
-];
+// 锚点别名归一（AI 偶尔写成同义词，按最长优先映射回候选池；兜底项放最后）
+const ANCHOR_ALIASES = CFG.strategy.anchorAliases;
+const ANCHOR_FALLBACK = CFG.strategy.anchorFallback;
 
 function normalizeAnchor(raw) {
   const s = String(raw == null ? '' : raw).trim();
-  if (!s) return '钱';
+  if (!s) return ANCHOR_FALLBACK;
   if (ANCHOR_POOL.includes(s)) return s;
   for (const [alias, canonical] of ANCHOR_ALIASES) {
     if (s.includes(alias)) return canonical;
   }
-  return '钱';
+  return ANCHOR_FALLBACK;
 }
 
 // 跳数 → 植入方式（由规则硬判定，覆盖 AI 的自我判断，避免口径漂移）
 function placementFromHops(hops) {
-  if (hops <= 0) return '直接阐述';
-  if (hops === 1) return '隐喻植入';
-  return '仅蹭热度';
+  if (hops <= 0) return CFG.strategy.placementByHops['0'];
+  if (hops === 1) return CFG.strategy.placementByHops['1'];
+  return CFG.strategy.placementByHops['2+'];
 }
 
 // 热点类型（决定到期复查口径）：时事政策 / 头部达人 / 平台热榜
@@ -140,90 +145,23 @@ function classifyHotspotType(item) {
   return '平台热榜';
 }
 
-// 到期复查间隔（天）：热榜短、政策与达人长
-const REVIEW_DAYS = { '平台热榜': 3, '时事政策': 7, '头部达人': 7 };
+// 到期复查间隔（天，来自品牌配置）：热榜短、政策与达人长
+const REVIEW_DAYS = CFG.strategy.reviewDays;
+const REVIEW_DAYS_DEFAULT = CFG.strategy.reviewDaysDefault;
 
 function reviewDate(hotspotType, from) {
-  const days = REVIEW_DAYS[hotspotType] || 3;
+  const days = REVIEW_DAYS[hotspotType] || REVIEW_DAYS_DEFAULT;
   const d = new Date(from.getTime() + days * 86400000);
   return d.toISOString().substring(0, 10); // yyyy-MM-dd，飞书 datetime 字段接受
 }
 // =============================================================
 
-// ============ AI 判断 prompt（度小满时事政策热点 + 植入策略） ============
-const JUDGE_SYSTEM = '你是度小满金融信息流的资深选题编辑，只输出 JSON，不输出任何额外说明文字。';
+// ============ AI 判断 prompt（品牌模板：config/<brand>/prompts/judge.md） ============
+const JUDGE_SYSTEM = CFG.judgeSystem;
 
-const JUDGE_PROMPT = `# 角色
-你是度小满的金融热点选题编辑。你要做四件事：① 判断热点是否符合度小满；② 选出热点与「借钱」共用的语义锚点；③ 数出从热点到「借钱需求」的转折跳数；④ 按跳数给出植入方式与植入策略。
-
-# 第一步：符合度判断（两条硬条件必须同时满足）
-1. 领域：必须是金融经济、民生经济相关。排除娱乐、网络游戏及赛事、汽车、美妆、时尚等非金融经济领域。
-2. 受众与相关性：必须和普罗大众相关，且和"钱"直接或间接相关——如养老、公积金、社保、国补、投资市场新政策、借贷、利率、税收、消费补贴等与大众息息相关的经济内容。
-   - 排除宏大叙事：美国伊朗打仗、日本韩国摩擦等与普通人钱袋子无关的国际政治内容不要。
-
-# 禁止方向（第五点，命中任一即 fit=false，不可植入）
-1. 涉及具体个人（明星/网红/企业家本人）或具体公司品牌的热点不要——蹭此类热点会产生舆情。
-2. 涉及看病治病、小孩上学、结婚彩礼的相关热点或政策不要——借贷产品不允许给这些需求提供借贷。
-
-只有 fit=true 时才继续做第二至第四步；fit=false 时后面字段一律按"输出格式"里的占位规则填。
-
-# 第二步：选语义锚点（决定转折难度的关键变量）
-锚点 = 热点与「借钱」之间共用的那个语义公共项。**必须从下面这个候选池里选一个，不要自造**：
-钱 / 收入 / 支出 / 借贷 / 征信 / 被骗
-
-找锚点的方法：先看这个热点里"和钱有关的那一层"，再判断哪一层能最直接地通向「借钱」。
-- 贷款贴息类 → 锚点「借贷」（贴息本身就是借钱成本，这条最近）
-- 货币/支付/存钱类 → 锚点「钱」（都要用钱、都关心钱怎么用）
-- 收入/工资/利息/补贴类 → 锚点「收入」
-- 消费/物价/月供类 → 锚点「支出」
-- 征信/信用体系类 → 锚点「征信」
-- 反诈/骗局/黑产类 → 锚点「被骗」
-
-**同一个热点通常能挂多个锚点，优先选离「借钱」最近的那个。**锚点选得越近，后面要转折的次数就越少。
-
-# 第三步：数转折跳数（口径必须严格遵守，这是判定的核心）
-跳数 = 从热点到「借钱需求」之间，**需要显式说出来的转折次数**。三条硬规则：
-
-规则一：**终点是「借钱」，不是品牌名。**
-度小满本身就是借钱渠道，所以"借钱 → 度小满"这一段是同义替换，**不计跳**。数到「借钱」就停。
-反例（错误算法）：把"借钱渠道 → 度小满"也算一跳，会凭空多出一跳。
-
-规则二：**先定锚点，再数跳数。**
-如果数出来 ≥2 跳，不要直接下结论，先回头换一个更近的锚点重新数一遍（见第二步）。很多时候不是热点太远，是锚点选远了。
-
-规则三：**区分「显式跳转」和「隐含前提」。**
-- 显式跳转 = 必须由文案说出来、听众需要被带着走的理解步骤 → 计入跳数
-- 隐含前提 = 听众默认成立、不必陈述的背景（例如"人都有支出"）→ 不计入跳数，**但也不许真的删掉**：它要在转折句里一笔带过，否则会出现"刚说你有钱、转头让你借钱"的逻辑断裂
-
-判例：
-- 贷款贴息 → 借钱：锚点「借贷」，贴息本身就是借钱成本。**0 跳**
-- 数字人民币（会给利息）→ 借钱：锚点「钱」，从"国家给你利息"一次转折到"急用钱的周转"。**1 跳**
-  隐含前提是"支出"——不单独陈述，用"收入能靠利息慢慢攒，支出等不起"这类从句一笔带过。
-- 网络反诈新规 → 借钱：锚点「被骗」，被骗过/怕被骗的人更需要正规借钱渠道。**1 跳**
-
-# 第四步：定植入方式（由跳数决定，不可自行改判）
-- 0 跳 → 直接阐述：概念同源，热点本身就是借钱话题，直接讲产品
-- 1 跳 → 隐喻植入：标准做法，用一次转折把热点引到借钱
-- ≥2 跳 → 仅蹭热度：只借热度做泛内容，**不做产品落点，strategy 必须填空字符串**
-
-# 当前待判断的热点
-平台：{platform}
-来源：{source}
-热点标题：{topic}
-热度/热度文本：{heat} {heat_text}
-（如为达人视频，创作者：{creator}）
-
-# 输出格式（严格 JSON，不要额外文字）
-{
-  "fit": true 或 false,
-  "reason": "用一两句说明是否满足两条硬条件，引用具体领域和相关性；不符合时说明违反哪条",
-  "semantic_anchor": "钱|收入|支出|借贷|征信|被骗 中的一个；fit=false 时填 钱",
-  "hop_count": 整数，从热点到「借钱需求」的显式转折次数；fit=false 时填 0,
-  "hop_path": "用一个箭头串起显式转折节点，如：数字人民币（利息收入）→ 借钱需求；fit=false 时填空字符串",
-  "implicit_premise": "隐含前提节点（不计跳但必须在转折句里一笔带过）；没有则填空字符串",
-  "placement": "直接阐述|隐喻植入|仅蹭热度（必须与 hop_count 对应）；fit=false 时填空字符串",
-  "strategy": "hop_count 为 0 或 1 时写植入策略（含噱头/角度 + 度小满衔接逻辑，并体现锚点与转折句）；hop_count ≥2 或 fit=false 时必须填空字符串"
-}`;
+const JUDGE_PROMPT = brandConfig.loadPrompt('judge', [
+  '{platform}', '{source}', '{topic}', '{heat}', '{heat_text}', '{creator}'
+]);
 
 // ============ 标题归一化（去重用） ============
 function normalizeTopic(t) {
@@ -470,10 +408,10 @@ function runCollect(channels, top) {
   const nodeBin = process.execPath;
   const collectScript = path.join(SCRIPT_DIR, 'hotspot_collect.js');
   const envFile = path.join(SCRIPT_DIR, '..', '.env');
-  const args = [collectScript, '--channels', channels, '--top', String(top)];
+  const args = [collectScript, '--channels', channels, '--top', String(top), '--brand', BRAND];
   if (fs.existsSync(envFile)) args.unshift('--env-file=' + envFile);
 
-  log(`🔹 调用 hotspot_collect.js 采集（渠道：${channels}）...`);
+  log(`🔹 调用 hotspot_collect.js 采集（渠道：${channels}｜品牌：${BRAND}）...`);
   const r = spawnSync(nodeBin, args, { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 });
   if (r.status !== 0) {
     log(r.stderr.substring(0, 800));
@@ -513,7 +451,7 @@ async function main() {
   }
 
   log('============================================');
-  log('🎯 度小满热点筛选 + 入表 启动');
+  log(`🎯 ${BRAND_NAME}热点筛选 + 入表 启动（品牌配置：${BRAND}）`);
   log(`   ${opts.input ? '输入文件: ' + opts.input : '实时采集: ' + opts.channels} | 每渠道Top ${opts.top} | ${opts.dryRun ? '干跑不入表' : '写飞书表'}`);
   log('============================================\n');
 
@@ -579,8 +517,42 @@ async function main() {
   };
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, toJudge.length) }, worker));
 
-  const fitOnes = judged.filter(x => x.judge.fit);
-  log(`\n✅ 符合度小满热点 ${fitOnes.length} / ${judged.length} 条`);
+  // Step 2.5: 二次复核（首轮 fit=true 的再判一遍，两次一致才入库；设 JUDGE_RECHECK=0 可关闭）
+  const fitOnesFirst = judged.filter(x => x.judge.fit);
+  let fitOnes = fitOnesFirst;
+  const recheckInfo = { enabled: false, rechecked: 0, overturned: 0 };
+  if (fitOnesFirst.length > 0 && (process.env.JUDGE_RECHECK ?? '1') !== '0') {
+    recheckInfo.enabled = true;
+    log(`\n🔍 二次复核 ${fitOnesFirst.length} 条（两次一致才入库）...`);
+    const rechecked = new Array(fitOnesFirst.length);
+    let rcursor = 0;
+    const rworker = async () => {
+      while (true) {
+        const i = rcursor++;
+        if (i >= fitOnesFirst.length) break;
+        const x = fitOnesFirst[i];
+        try {
+          const j2 = await judgeHotspot(x.item, opts.debug);
+          rechecked[i] = j2;
+          process.stderr.write(`   [${i + 1}/${fitOnesFirst.length}] ${x.item.topic?.substring(0, 30)} ... ${j2.fit ? '✓一致' : '✗翻案'}\n`);
+        } catch (e) {
+          rechecked[i] = x.judge; // 复核调用失败时保守保留首轮结果
+          process.stderr.write(`   [${i + 1}/${fitOnesFirst.length}] ${x.item.topic?.substring(0, 30)} ... ⚠️复核失败，保留首轮\n`);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, fitOnesFirst.length) }, rworker));
+    fitOnes = fitOnesFirst.filter((x, i) => rechecked[i].fit);
+    recheckInfo.rechecked = fitOnesFirst.length;
+    recheckInfo.overturned = fitOnesFirst.length - fitOnes.length;
+    // 复核通过的，锚点/跳数/策略以复核轮结果为准
+    for (let i = 0; i < fitOnesFirst.length; i++) {
+      if (rechecked[i].fit) fitOnesFirst[i].judge = rechecked[i];
+    }
+    if (recheckInfo.overturned > 0) log(`   复核翻案 ${recheckInfo.overturned} 条，不入库`);
+  }
+
+  log(`\n✅ 符合${BRAND_NAME}热点 ${fitOnes.length} / ${judged.length} 条${recheckInfo.enabled ? `（复核后，翻案 ${recheckInfo.overturned} 条）` : ''}`);
 
   // Step 3: 归一锚点/跳数、按跳数硬判定植入方式、生成热点ID + 概述 + 到期复查日
   const now = new Date();
@@ -667,12 +639,16 @@ async function main() {
       topic: x.item.topic, reason: x.judge.reason.substring(0, 80)
     })),
     bitable_write: writeResult,
+    recheck: recheckInfo,
     dry_run: opts.dryRun
   };
   console.log(JSON.stringify(output, null, 2));
 }
 
-main().catch(e => {
-  log(`\n❌ 热点筛选失败: ${e.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(e => {
+    log(`\n❌ 热点筛选失败: ${e.message}`);
+    process.exit(1);
+  });
+}
+module.exports = { judgeHotspot, preFilter };

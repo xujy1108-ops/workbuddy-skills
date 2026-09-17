@@ -1,0 +1,44 @@
+{
+  "brand": "weiyedai",
+  "brandName": "TODO_品牌名",
+  "_note": "品牌私有内容全部在此。带 TODO_ 的字段为占位值，未补齐前脚本会启动即报错并列出待填字段。参考 config/duxiaoman/config.json 的结构填写。",
+
+  "tables": {
+    "hotspot": {
+      "baseToken": "TODO_热点素材表 baseToken",
+      "tableId": "TODO_热点素材表 tableId",
+      "baseUrl": "TODO_仅供人工核对，可留空"
+    }
+  },
+
+  "filters": {
+    "_note": "A 方案预筛：抖音 category 白名单 + 禁止关键词分组（标题命中即排除）",
+    "douyinCategoryWhitelist": ["TODO_类目1", "TODO_类目2"],
+    "forbiddenGroups": [
+      { "words": ["TODO_词1", "TODO_词2"], "reason": "TODO_该组排除原因" }
+    ]
+  },
+
+  "strategy": {
+    "_note": "锚点候选池须与本品牌飞书「语义锚点」select 选项严格一致；跳数→植入方式由代码硬判定",
+    "anchorPool": ["TODO_锚点1", "TODO_锚点2"],
+    "anchorAliases": [
+      ["TODO_别名", "TODO_锚点1"]
+    ],
+    "anchorFallback": "TODO_锚点1",
+    "placementByHops": { "0": "TODO_0跳植入方式", "1": "TODO_1跳植入方式", "2+": "TODO_2跳以上植入方式" },
+    "reviewDays": { "TODO_热点类型": 3 },
+    "reviewDaysDefault": 3
+  },
+
+  "refine": {
+    "_note": "优秀度检验阈值与定级档位",
+    "gradeThresholds": { "EXCELLENT": 10, "GOOD": 5, "NORMAL": 3 },
+    "gradeLabels": { "EXCELLENT": "优秀", "GOOD": "良好", "NORMAL": "一般", "BELOW": "劣质" },
+    "daysRecent": 7,
+    "minDigg": 10000,
+    "topN": 20
+  },
+
+  "judgeSystem": "TODO_AI 系统消息（角色设定 + 只输出 JSON）"
+}

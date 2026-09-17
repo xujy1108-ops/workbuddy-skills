@@ -8,23 +8,30 @@
  *   2. 政策热点：中国政府网 gov.cn 政策解读（官方 JSON 接口，零成本）
  *   3. 头部达人导向：抖音头部达人近 N 天视频，按点赞数排序（TikHub API）
  *
+ * 品牌配置化（2026-09-17）：
+ *   达人清单是品牌私有内容，默认读 config/<brand>/hotspot_creators.json；
+ *   品牌选择：--brand > env WORKFLOW_BRAND > duxiaoman。
+ *   平台渠道与政策源是通用能力，留在本文件，不随品牌变化。
+ *
  * 使用方法：
- *   node hotspot_collect.js [--channels douyin,xhs,kuaishou,weibo,bilibili,gov,creator] [--top 10] [--days 3] [--creators ./hotspot_creators.json] [--write-bitable] [--notify] [--debug]
+ *   node hotspot_collect.js [--brand <品牌>] [--channels douyin,xhs,kuaishou,weibo,bilibili,gov,creator] [--top 10] [--days 3] [--creators ~/.workbuddy/.../config/<brand>/hotspot_creators.json] [--write-bitable] [--notify] [--debug]
  *
  * 参数：
+ *   --brand         品牌配置名（默认 duxiaoman），决定达人清单来源
  *   --channels      采集渠道，逗号分隔：douyin,xhs,kuaishou,weibo,bilibili,gov,creator（默认全开）
  *   --top N         每个渠道取前 N 条（默认 10）
  *   --days N        达人视频时间窗口（天，默认 3）
- *   --creators      达人清单 JSON 文件路径（默认 ./hotspot_creators.json）
- *   --write-bitable 写入飞书多维表格（需环境变量 HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID）
+ *   --creators      达人清单 JSON 文件路径（默认 config/<brand>/hotspot_creators.json）
+ *   --write-bitable 写入飞书多维表格（表来自品牌配置，可用 HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID 覆盖）
  *   --notify        发送飞书 IM 通知（Top 5 热点摘要）
  *   --debug         输出原始响应片段，便于排查字段结构
  *
  * 环境变量：
  *   TIKHUB_TOKEN        - TikHub API 令牌
  *   TIKHUB_BASE_URL     - TikHub API 地址（大陆用户建议 https://api.tikhub.dev，默认 https://api.tikhub.io）
- *   HOTSPOT_BASE_TOKEN  - 热点表多维表格 Base token（--write-bitable 时必填）
- *   HOTSPOT_TABLE_ID    - 热点表 table id（--write-bitable 时必填）
+ *   HOTSPOT_BASE_TOKEN  - 热点表多维表格 Base token（覆盖品牌配置，--write-bitable 时需有值）
+ *   HOTSPOT_TABLE_ID    - 热点表 table id（覆盖品牌配置，--write-bitable 时需有值）
+ *   WORKFLOW_BRAND      - 品牌（被 --brand 覆盖）
  *
  * 输出：JSON 到 stdout，进度日志到 stderr
  */
@@ -32,12 +39,17 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const brandConfig = require('./brand_config');
 
 // ============ 配置 ============
+// 品牌私有内容（达人清单 + 飞书表）来自 config/<brand>/，本文件不写死品牌内容
+const CFG = brandConfig.load();
+const BRAND = CFG.brand;
+const BRAND_NAME = CFG.brandName;
 const TIKHUB_TOKEN = process.env.TIKHUB_TOKEN;
 const TIKHUB_BASE_URL = (process.env.TIKHUB_BASE_URL || 'https://api.tikhub.io').replace(/\/+$/, '');
-const HOTSPOT_BASE_TOKEN = process.env.HOTSPOT_BASE_TOKEN;
-const HOTSPOT_TABLE_ID = process.env.HOTSPOT_TABLE_ID;
+const HOTSPOT_BASE_TOKEN = CFG.table.baseToken;
+const HOTSPOT_TABLE_ID = CFG.table.tableId;
 const LARK_CLI = 'lark-cli';
 
 // 政策热点源（gov.cn 官方 JSON 接口；国务院文件 + 要闻已按需求移除）
@@ -575,7 +587,7 @@ function sendNotify(topItems) {
       return;
     }
 
-    const lines = ['🔥 全网热点聚合 - Top 5', ''];
+    const lines = [`🔥 ${BRAND_NAME}全网热点聚合 - Top 5`, ''];
     topItems.forEach((it, i) => {
       lines.push(`${i + 1}. [${it.source}] ${it.topic}`);
       if (it.creator) lines.push(`   达人: ${it.creator}`);
@@ -608,13 +620,14 @@ async function main() {
     channels: 'douyin,xhs,kuaishou,weibo,bilibili,gov,creator',
     top: 10,
     days: 3,
-    creators: './hotspot_creators.json',
+    creators: process.env.CREATORS_FILE || CFG.creatorsFile,
     writeBitable: false,
     notify: false,
     debug: false
   };
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--channels' && args[i + 1]) { opts.channels = args[++i]; }
+    if (args[i] === '--brand' && args[i + 1]) { /* 品牌已由 brand_config 解析，跳过其值 */ i++; }
+    else if (args[i] === '--channels' && args[i + 1]) { opts.channels = args[++i]; }
     else if (args[i] === '--top' && args[i + 1]) { opts.top = Number(args[++i]); }
     else if (args[i] === '--days' && args[i + 1]) { opts.days = Number(args[++i]); }
     else if (args[i] === '--creators' && args[i + 1]) { opts.creators = args[++i]; }
@@ -625,8 +638,9 @@ async function main() {
   const channels = opts.channels.split(',').map(s => s.trim()).filter(Boolean);
 
   log('============================================');
-  log('🔥 全网热点聚合采集启动');
+  log(`🔥 ${BRAND_NAME}全网热点聚合采集启动（品牌配置：${BRAND}）`);
   log(`   渠道: ${channels.join(', ')} | Top: ${opts.top} | 达人窗口: ${opts.days}天`);
+  if (channels.includes('creator')) log(`   达人清单: ${opts.creators}`);
   log('============================================\n');
 
   if (channels.some(c => ['douyin', 'xhs', 'kuaishou', 'weibo', 'bilibili', 'creator'].includes(c)) && !TIKHUB_TOKEN) {

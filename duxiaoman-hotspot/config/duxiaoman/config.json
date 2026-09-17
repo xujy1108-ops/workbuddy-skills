@@ -1,0 +1,52 @@
+{
+  "brand": "duxiaoman",
+  "brandName": "度小满",
+  "_note": "品牌私有内容全部在此。代码零品牌硬编码：scripts/brand_config.js 按 --brand 加载本文件，缺失/缺必填字段/含 TODO_ 占位值即启动报错。tables.hotspot 优先被同名环境变量 HOTSPOT_BASE_TOKEN / HOTSPOT_TABLE_ID 覆盖；baseUrl 仅供人工核对，实际调用只用 baseToken + tableId。",
+
+  "tables": {
+    "hotspot": {
+      "baseToken": "STMrbQgqma35dksI3WsclJlNnlc",
+      "tableId": "tblDpxkM7psozqeO",
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/STMrbQgqma35dksI3WsclJlNnlc?table=tblDpxkM7psozqeO"
+    }
+  },
+
+  "filters": {
+    "_note": "A 方案预筛：抖音 category 白名单（只送金融时政类给 AI）；第五点禁止关键词分组，标题命中即预筛排除",
+    "douyinCategoryWhitelist": ["时政", "财经", "社会", "科技", "金融", "经济", "民生"],
+    "forbiddenGroups": [
+      { "words": ["看病", "治病", "医疗", "住院", "手术", "医药", "医院"], "reason": "借贷产品不允许给看病治病需求提供借贷" },
+      { "words": ["上学", "学费", "开学", "开学季", "升学"], "reason": "借贷产品不允许给上学需求提供借贷" },
+      { "words": ["结婚", "彩礼", "婚嫁", "婚宴", "嫁妆"], "reason": "借贷产品不允许给结婚彩礼需求提供借贷" },
+      { "words": ["军人", "退役军人", "部队", "军队", "武警", "征兵", "服役", "军营", "退伍", "军属", "军官", "军工", "国防动员"], "reason": "涉军内容严格红线，借贷产品不允许任何涉军营销" }
+    ]
+  },
+
+  "strategy": {
+    "_note": "转折判据：锚点候选池与飞书「语义锚点」select 选项严格一致；跳数→植入方式由代码硬判定不采信 AI；到期复查间隔按热点类型",
+    "anchorPool": ["钱", "收入", "支出", "借贷", "征信", "被骗"],
+    "anchorAliases": [
+      ["借贷", "借贷"], ["贷款", "借贷"], ["借钱", "借贷"], ["信贷", "借贷"], ["融资", "借贷"],
+      ["征信", "征信"], ["信用记录", "征信"], ["信用", "征信"],
+      ["被骗", "被骗"], ["受骗", "被骗"], ["诈骗", "被骗"], ["反诈", "被骗"], ["骗子", "被骗"],
+      ["收入", "收入"], ["工资", "收入"], ["收益", "收入"], ["利息", "收入"], ["养老金", "收入"], ["补贴", "收入"],
+      ["支出", "支出"], ["消费", "支出"], ["花费", "支出"], ["开销", "支出"], ["月供", "支出"], ["还款", "支出"],
+      ["钱", "钱"], ["资金", "钱"], ["现金", "钱"], ["资产", "钱"]
+    ],
+    "anchorFallback": "钱",
+    "placementByHops": { "0": "直接阐述", "1": "隐喻植入", "2+": "仅蹭热度" },
+    "reviewDays": { "平台热榜": 3, "时事政策": 7, "头部达人": 7 },
+    "reviewDaysDefault": 3
+  },
+
+  "refine": {
+    "_note": "优秀度检验（度小满需求文档第三部分）：抖音搜索热点→按点赞排序→前 N 条中统计近 D 天且点赞>minDigg 的数量→定级",
+    "gradeThresholds": { "EXCELLENT": 10, "GOOD": 5, "NORMAL": 3 },
+    "gradeLabels": { "EXCELLENT": "优秀", "GOOD": "良好", "NORMAL": "一般", "BELOW": "劣质" },
+    "daysRecent": 7,
+    "minDigg": 10000,
+    "topN": 20
+  },
+
+  "judgeSystem": "你是度小满金融信息流的资深选题编辑，只输出 JSON，不输出任何额外说明文字。"
+}
