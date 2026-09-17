@@ -21,7 +21,6 @@
     },
     "strategy": {
       "baseUrl": "TODO_策略表URL",
-      "docUrl": "TODO_内容策略文档URL",
       "baseToken": "TODO_策略表base_token",
       "tableId": "TODO_策略表table_id",
       "excludeL1": ["回应解释"]
@@ -48,7 +47,7 @@
   },
 
   "strategy": {
-    "_TODO": "兜底清单必须从策略 Base 实际记录导出（口径：策略等级 S/A 且内容方向一不在 excludeL1 内），方向枚举必须与该 Base「内容方向一/二」字段的 select 选项逐项对齐；对齐做法见 duxiaoman 配置",
+    "_TODO": "唯一权威源 = 飞书策略表（内容策略文档已废弃，不作任何数据源）。fallbackStrategies 是策略表读取失败时的静态快照，口径：策略表全量行副本（不按等级过滤），运行时仍按 excludeL1 过滤；方向枚举必须与该表「内容方向一/二」字段的 select 选项逐项对齐；对齐做法见 duxiaoman 配置",
     "fallbackStrategies": [],
     "fallbackDirectionEnums": "TODO_策略表读取失败时的兜底方向枚举文本"
   },

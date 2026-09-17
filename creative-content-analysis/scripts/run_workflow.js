@@ -71,6 +71,27 @@ function loadBrandConfig() {
     process.stderr.write(`❌ 品牌配置缺少必填字段: ${missing.join(', ')}（文件: ${configFile}）\n`);
     process.exit(1);
   }
+  // 未补齐检测：骨架品牌（复制 duxiaoman 目录改配置）在补齐前不应能跑起来，
+  // 否则会一路跑到读表/调 LLM 才炸出难懂的飞书报错。键名以 _ 开头的是说明字段，跳过。
+  const unfilled = [];
+  (function scan(node, prefix) {
+    if (Array.isArray(node)) {
+      node.forEach((v, i) => scan(v, `${prefix}[${i}]`));
+    } else if (node && typeof node === 'object') {
+      Object.entries(node).forEach(([k, v]) => {
+        if (k.startsWith('_')) return;
+        scan(v, prefix ? `${prefix}.${k}` : k);
+      });
+    } else if (typeof node === 'string' && node.startsWith('TODO_')) {
+      unfilled.push(prefix);
+    }
+  })(cfg, '');
+  if (unfilled.length > 0) {
+    process.stderr.write(`❌ 品牌配置未补齐（仍含 TODO_ 占位值）: ${configFile}\n`);
+    process.stderr.write(`   待填字段: ${unfilled.slice(0, 12).join(', ')}${unfilled.length > 12 ? ` 等 ${unfilled.length} 处` : ''}\n`);
+    process.stderr.write(`   补齐后方可使用 --brand ${BRAND} 运行\n`);
+    process.exit(1);
+  }
   return cfg;
 }
 const BRAND_CONFIG = loadBrandConfig();
@@ -82,7 +103,15 @@ function loadPromptFile(name) {
     process.stderr.write(`❌ 品牌 prompt 模板不存在: ${file}\n`);
     process.exit(1);
   }
-  return fs.readFileSync(file, 'utf-8');
+  const text = fs.readFileSync(file, 'utf-8');
+  // 骨架品牌的模板是纯说明性注释，去注释后为空 → 视为未补齐，直接报错
+  const body = text.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).join('\n');
+  if (!body.trim()) {
+    process.stderr.write(`❌ 品牌 prompt 模板未补齐（除注释外无内容）: ${file}\n`);
+    process.stderr.write(`   参考模板: config/duxiaoman/prompts/${name}\n`);
+    process.exit(1);
+  }
+  return text;
 }
 
 // 品牌级运行状态文件（关键词统计/近期词/缓存/登记表按品牌隔离，避免多品牌互相污染）
@@ -410,116 +439,87 @@ function updateStrategyGrowth(strategyResult, itemCount) {
   return growth;
 }
 
-// ============ 内容策略文档（关键词来源1/2：策略直搜 + 策略衍生） ============
-// 运行时动态拉取内容策略文档，解析 S/A 级策略方向注入 prompt。
-// 缓存 24h；拉取失败用过期缓存；缓存也没有用内置兜底清单。
-// 这样以后只需要在文档里加新方向，搜索策略自动跟上，代码不用改。
-const STRATEGY_DOC_URL = BRAND_CONFIG.tables.strategy.docUrl;
-const STRATEGY_CACHE_FILE = stateFile('.strategy_cache.json');
-const STRATEGY_CACHE_TTL = 24 * 60 * 60 * 1000;
-// 整类排除：接广告后的回应内容，不是可搜的素材场景
+// ============ 内容策略清单（关键词来源1/2：策略直搜 + 策略衍生） ============
+// 数据源（2026-09-16 用户口径）：一律以「策略表」飞书多维表格为唯一权威源，**不再读内容策略文档**。
+// 纳入范围：策略表全部行，仅整类排除 STRATEGY_EXCLUDE_L1（回应解释——接广告后的回应内容，
+//   不是可搜的素材场景，属业务口径与数据源无关）。
+// 不再按等级过滤：S=已验证成功 / A=可继续尝试 / X=工作流自建·待验证
+//   （B 级只出现在被排除的「回应解释」类，实际不会进清单）。
+// 好处：表里加/改方向、升降级都自动跟上，代码与配置都不用动；也没有 24h 缓存造成的滞后。
+// 策略表读取失败 → 退到 config/<brand>/config.json 的 strategy.fallbackStrategies 静态快照。
 const STRATEGY_EXCLUDE_L1 = BRAND_CONFIG.tables.strategy.excludeL1 || ['回应解释'];
+const STRATEGY_FIELDS = ['内容方向一', '内容方向二', '策略等级', '内容一方向定义', '植入策略', '素材链接ids', '适合达人'];
 
-// 内置兜底策略清单（文档拉取失败时使用，与策略文档保持同步；品牌配置化后来自 config/<brand>/config.json）
-const FALLBACK_STRATEGIES = BRAND_CONFIG.strategy.fallbackStrategies || [];
+// 静态快照兜底（策略表读取失败时使用；口径与策略表一致：全部行 - excludeL1）
+const FALLBACK_STRATEGIES = (BRAND_CONFIG.strategy.fallbackStrategies || [])
+  .filter(s => !STRATEGY_EXCLUDE_L1.includes(s.l1));
 
-// 解析策略文档 markdown 中的表格（处理 rowspan 合并单元格）
-function parseStrategyTable(markdown) {
-  const tableStart = markdown.indexOf('<table>');
-  const tableEnd = markdown.indexOf('</table>');
-  if (tableStart === -1 || tableEnd === -1) return [];
-  const table = markdown.substring(tableStart, tableEnd);
-  const rows = table.match(/<tr>[\s\S]*?<\/tr>/g) || [];
+// 读策略表原始行——全流程唯一的策略表读取入口（策略清单 / 方向枚举 / 写表合并三处共用）。
+// 进程内缓存：同一次运行内，策略清单与方向枚举共用同一份快照，避免两次读表结果不一致；
+// 写表路径（Step 6 策略沉淀）必须传 { fresh: true } 实时读，绝不能用旧快照做合并写入。
+let _strategyRowsSnapshot = null;
+function fetchStrategyRows({ fresh = false } = {}) {
+  if (!fresh && _strategyRowsSnapshot) return _strategyRowsSnapshot;
+  const output = runLarkCli([
+    'base', '+record-list',
+    '--base-token', STRATEGY_BASE_TOKEN,
+    '--table-id', STRATEGY_TABLE_ID,
+    '--limit', '200',
+    '--as', 'user',
+    '--format', 'json'
+  ]);
+  const data = JSON.parse(output)?.data || {};
+  const fieldNames = data.fields || [];
+  const rawRows = data.data || [];
+  const recordIds = data.record_id_list || [];
+  const idx = {};
+  STRATEGY_FIELDS.forEach(name => { idx[name] = fieldNames.indexOf(name); });
+  const at = (row, name) => (idx[name] >= 0 ? cellText(row[idx[name]]) : '');
 
-  const cellText = (cell) => cell
-    .replace(/<br\s*\/?>/g, ' ')
-    .replace(/<[^>]+>/g, '')
-    .trim();
-
-  const COLS = 7; // 内容方向一/二、定义、植入策略、策略等级、适合达人、正向案例
-  const spanLeft = new Array(COLS).fill(0);
-  const lastVal = new Array(COLS).fill('');
-  const out = [];
-
-  for (const row of rows) {
-    const cells = row.match(/<td[^>]*>[\s\S]*?<\/td>/g) || [];
-    if (cells.length === 0) continue;
-    const values = new Array(COLS).fill('');
-    let ci = 0;
-    for (let col = 0; col < COLS && ci < cells.length; col++) {
-      if (spanLeft[col] > 0) {
-        spanLeft[col] -= 1;
-        values[col] = lastVal[col];
-        continue;
-      }
-      const cell = cells[ci++];
-      const rowspanMatch = cell.match(/rowspan="(\d+)"/);
-      if (rowspanMatch) spanLeft[col] = parseInt(rowspanMatch[1], 10) - 1;
-      values[col] = cellText(cell);
-      lastVal[col] = values[col];
-    }
-    out.push(values);
-  }
-
-  // 列索引：0内容方向一 1内容方向二 2定义 3植入策略 4策略等级 5适合达人 6正向案例
-  return out
-    .filter(v => v[0] && v[1] && v[0] !== '内容方向一')
-    .filter(v => !STRATEGY_EXCLUDE_L1.includes(v[0]))
-    .filter(v => v[4] === 'S' || v[4] === 'A')
-    .map(v => ({ l1: v[0], l2: v[1], definition: v[2].substring(0, 120), level: v[4] }));
+  const rows = rawRows.map((row, i) => ({
+    recordId: recordIds[i] || null,
+    l1: normalizeDirectionValue(at(row, '内容方向一')),
+    l2: normalizeDirectionValue(at(row, '内容方向二')),
+    level: at(row, '策略等级'),
+    definition: at(row, '内容一方向定义'),
+    植入策略: at(row, '植入策略'),
+    素材链接ids: at(row, '素材链接ids'),
+    适合达人: at(row, '适合达人')
+  }));
+  if (!fresh) _strategyRowsSnapshot = rows;
+  return rows;
 }
 
-function fetchStrategyDoc() {
-  // 1. 新鲜缓存直接用（24h 内）
-  if (fs.existsSync(STRATEGY_CACHE_FILE)) {
-    try {
-      const cache = JSON.parse(fs.readFileSync(STRATEGY_CACHE_FILE, 'utf-8'));
-      if (cache.fetchedAt
-        && (Date.now() - new Date(cache.fetchedAt).getTime()) < STRATEGY_CACHE_TTL
-        && (cache.strategies || []).length > 0) {
-        log(`   ♻️ 使用策略文档缓存（${cache.strategies.length} 个 S/A 级策略方向，24h 内）`);
-        return cache.strategies;
-      }
-    } catch { /* 缓存损坏，继续拉取 */ }
-  }
+// 等级分布摘要（日志用）：S×9 A×3 X×1
+function summarizeStrategyLevels(list) {
+  const counts = {};
+  for (const s of list) counts[s.level || '?'] = (counts[s.level || '?'] || 0) + 1;
+  return Object.entries(counts).map(([lv, n]) => `${lv}×${n}`).join(' ');
+}
 
-  // 2. 拉取文档
+// 策略清单（注入关键词 prompt 的 __STRATEGY_LIST__）
+function fetchStrategyList() {
+  let rows;
   try {
-    const output = runLarkCli([
-      'docs', '+fetch',
-      '--doc', STRATEGY_DOC_URL,
-      '--doc-format', 'markdown',
-      '--as', 'user',
-      '--format', 'json'
-    ]);
-    const data = JSON.parse(output);
-    const content = data?.data?.document?.content || '';
-    const strategies = parseStrategyTable(content);
-    if (strategies.length > 0) {
-      fs.writeFileSync(STRATEGY_CACHE_FILE, JSON.stringify({
-        fetchedAt: new Date().toISOString(),
-        source: STRATEGY_DOC_URL,
-        strategies
-      }, null, 2));
-      log(`   📋 策略文档拉取成功：${strategies.length} 个 S/A 级策略方向（已缓存 24h）`);
-      return strategies;
-    }
-    throw new Error('解析到 0 个策略');
+    rows = fetchStrategyRows();
   } catch (error) {
-    // 3. 过期缓存兜底
-    if (fs.existsSync(STRATEGY_CACHE_FILE)) {
-      try {
-        const cache = JSON.parse(fs.readFileSync(STRATEGY_CACHE_FILE, 'utf-8'));
-        if ((cache.strategies || []).length > 0) {
-          log(`   ⚠️ 策略文档拉取失败（${error.message.substring(0, 100)}），使用过期缓存`);
-          return cache.strategies;
-        }
-      } catch { /* fallthrough */ }
-    }
-    // 4. 内置清单兜底
-    log(`   ⚠️ 策略文档拉取失败，使用内置兜底清单（${FALLBACK_STRATEGIES.length} 个）`);
+    log(`   ⚠️ 策略表读取失败（${error.message.substring(0, 120)}），使用静态快照兜底（${FALLBACK_STRATEGIES.length} 个）`);
     return FALLBACK_STRATEGIES;
   }
+  const list = rows
+    .filter(r => r.l1 && r.l2 && !STRATEGY_EXCLUDE_L1.includes(r.l1))
+    .map(r => ({
+      l1: r.l1,
+      l2: r.l2,
+      level: r.level,
+      definition: (r.definition || '').substring(0, 120)
+    }));
+  if (list.length === 0) {
+    log(`   ⚠️ 策略表无可用行，使用静态快照兜底（${FALLBACK_STRATEGIES.length} 个）`);
+    return FALLBACK_STRATEGIES;
+  }
+  log(`   📋 策略清单来源：策略表（${list.length} 个方向，等级 ${summarizeStrategyLevels(list)}）`);
+  return list;
 }
 
 // ============ 开放探索来源（来源3）：处境坐标系 + 邻接域反推 + 热点翻译（跳数门控） ============
@@ -949,8 +949,8 @@ async function generateKeywords(existingIds) {
   const totalQuota = directQuota + deriveQuota + exploreQuota;
   log(`🔹 Step 1: 生成搜索关键词（${boost ? `加强探索模式：直搜${directQuota} + 探索${exploreQuota}，策略衍生暂停` : `直搜${directQuota} + 衍生${deriveQuota} + 探索${exploreQuota}`}）${boost ? `——已连续 ${growth.droughtStreak} 轮零新策略，自动提升探索配额` : ''}`);
 
-  // 来源1/2：拉取内容策略清单（24h 缓存 + 兜底）
-  const strategies = fetchStrategyDoc();
+  // 来源1/2：策略清单（实时读策略表，失败退静态快照）
+  const strategies = fetchStrategyList();
   const strategyListText = strategies
     .map(s => `- ${s.l1}-${s.l2}（${s.level}级）：${s.definition}`)
     .join('\n');
@@ -1713,37 +1713,19 @@ function normalizeAnalysisDirections(analysis) {
   return analysis;
 }
 
-// 读取策略表现有记录，返回 Map「方向一|方向二」-> { recordId, 植入策略, 素材链接ids }
-function fetchStrategyRecords() {
-  const output = runLarkCli([
-    'base', '+record-list',
-    '--base-token', STRATEGY_BASE_TOKEN,
-    '--table-id', STRATEGY_TABLE_ID,
-    '--limit', '200',
-    '--as', 'user',
-    '--format', 'json'
-  ]);
-  const data = JSON.parse(output)?.data || {};
-  const fieldNames = data.fields || [];
-  const rows = data.data || [];
-  const recordIds = data.record_id_list || [];
-  const idx = {};
-  ['内容方向一', '内容方向二', '植入策略', '素材链接ids', '适合达人'].forEach(name => {
-    idx[name] = fieldNames.indexOf(name);
-  });
-
+// 策略表按「方向一|方向二」建索引（方向枚举 / 写表合并共用）。
+// 数据来自 fetchStrategyRows（唯一读表入口）；写表路径须传 { fresh: true } 实时读。
+function fetchStrategyRecords({ fresh = false } = {}) {
   const map = new Map();
-  rows.forEach((row, i) => {
-    const dir1 = normalizeDirectionValue(idx['内容方向一'] >= 0 ? cellText(row[idx['内容方向一']]) : '');
-    const dir2 = normalizeDirectionValue(idx['内容方向二'] >= 0 ? cellText(row[idx['内容方向二']]) : '');
-    if (!dir1 || !dir2) return;
-    map.set(`${dir1}|${dir2}`, {
-      recordId: recordIds[i] || null,
-      植入策略: cellText(idx['植入策略'] >= 0 ? row[idx['植入策略']] : null),
-      素材链接ids: cellText(idx['素材链接ids'] >= 0 ? row[idx['素材链接ids']] : null),
-      适合达人: cellText(idx['适合达人'] >= 0 ? row[idx['适合达人']] : null)
+  for (const r of fetchStrategyRows({ fresh })) {
+    if (!r.l1 || !r.l2) continue;
+    map.set(`${r.l1}|${r.l2}`, {
+      recordId: r.recordId,
+      植入策略: r.植入策略,
+      素材链接ids: r.素材链接ids,
+      适合达人: r.适合达人
     });
-  });
+  }
   return map;
 }
 
@@ -1940,7 +1922,8 @@ async function syncStrategyTable(results) {
 
   let existing;
   try {
-    existing = fetchStrategyRecords();
+    // 写表路径：强制实时读，避免用 Step 1 的旧快照做「素材链接ids/植入策略」合并写入
+    existing = fetchStrategyRecords({ fresh: true });
   } catch (error) {
     log(`   ❌ 读取策略表失败，跳过同步: ${error.message.substring(0, 200)}`);
     return { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: allStrategyItems.length, skipped: allStrategyItems.length };
