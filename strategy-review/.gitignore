@@ -1,0 +1,14 @@
+# 环境变量（含密钥）
+.env
+config/*/.env
+
+# 运行临时产物（lark-cli NDJSON 明细 + manifest 清单）
+*.ndjson
+*.manifest.json
+*.tmp
+
+# 系统文件
+.DS_Store
+
+# Node
+node_modules/

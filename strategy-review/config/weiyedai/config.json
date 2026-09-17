@@ -1,0 +1,119 @@
+{
+  "_TODO": "微业贷品牌配置骨架——所有 TODO 字段需补齐后才能运行（配置加载器会拦截 TODO 占位并报错退出）。结构对齐 config/duxiaoman/config.json。",
+  "brand": "weiyedai",
+  "brandName": "微业贷",
+  "audience": "中小微企业主与个体经营者",
+  "reviewTitle": "微业贷策略素材自动分析",
+  "syncTitle": "微业贷策略素材同步到策略库",
+  "tables": {
+    "source": {
+      "label": "TODO_投放数据源表名（对应度小满的头条数据表）",
+      "baseUrl": "TODO_数据源表URL",
+      "baseToken": "TODO_数据源表base_token",
+      "tableId": "TODO_数据源表table_id",
+      "fieldNames": {
+        "_TODO": "字段名需与数据源表实际列名逐字一致",
+        "topic": "TODO_脚本主题字段名",
+        "script": "TODO_脚本文案字段名",
+        "starRatio": "TODO_星推比字段名",
+        "conversionQualified": "TODO_转化是否达标字段名",
+        "creator": "TODO_达人名称字段名"
+      },
+      "envOverride": {
+        "baseToken": "WEIYEDAI_SOURCE_BASE_TOKEN",
+        "tableId": "WEIYEDAI_SOURCE_TABLE_ID"
+      }
+    },
+    "review": {
+      "label": "TODO_审核表名",
+      "baseUrl": "TODO_审核表URL",
+      "baseToken": "TODO_审核表base_token",
+      "tableId": "TODO_审核表table_id",
+      "fieldNames": {
+        "_TODO": "建议直接复用度小满审核表字段结构（脚本主题/源脚本ID/脚本文案/AI建议-钩子/承接/转折/角色定位/评分等级/入库目标/审核状态）",
+        "topic": "TODO_脚本主题",
+        "scriptId": "TODO_源脚本ID",
+        "script": "TODO_脚本文案",
+        "hook": "TODO_AI建议-钩子",
+        "inherit": "TODO_AI建议-承接",
+        "transition": "TODO_AI建议-转折",
+        "role": "TODO_AI建议-角色定位",
+        "grade": "TODO_评分等级",
+        "target": "TODO_入库目标",
+        "status": "TODO_审核状态"
+      },
+      "envOverride": {
+        "baseToken": "WEIYEDAI_REVIEW_BASE_TOKEN",
+        "tableId": "WEIYEDAI_REVIEW_TABLE_ID"
+      },
+      "status": {
+        "pending": "待审核",
+        "approved": "已通过",
+        "rejected": "已拒绝",
+        "synced": "已入库"
+      }
+    }
+  },
+  "filters": {
+    "_TODO": "入池阈值与脚本长度，沿用度小满口径（星推比>2.5 或 转化达标）；若微业贷投放口径不同请调整。conversionQualifiedValues 需与「转化是否达标」字段的 select 选项逐字一致。",
+    "starRatioThreshold": 2.5,
+    "conversionQualifiedValues": [
+      "是"
+    ],
+    "minScriptLength": 30,
+    "scriptMaxLength": 10000
+  },
+  "grading": {
+    "_TODO": "分级映射；null 表示该组合不入池",
+    "both": "S",
+    "conversionOnly": "A",
+    "starRatioOnly": "A"
+  },
+  "topicSplit": {
+    "_TODO": "是否分热点/非热点两条策略库。微业贷若只维护一份策略库文档，把 enabled 改为 false，并在 strategyLib.docs 里只留 default。",
+    "enabled": true,
+    "default": "非热点",
+    "rules": [
+      {
+        "keyword": "热点",
+        "target": "热点"
+      }
+    ]
+  },
+  "strategyLib": {
+    "label": "策略库",
+    "baseUrl": "https://kwza968lz1u.feishu.cn/docx/",
+    "docs": {
+      "非热点": "TODO_非热点策略库docx_token",
+      "热点": "TODO_热点策略库docx_token"
+    },
+    "sectionTemplate": "sync_section.md",
+    "recordFields": [
+      {
+        "label": "钩子",
+        "field": "hook"
+      },
+      {
+        "label": "承接",
+        "field": "inherit"
+      },
+      {
+        "label": "转折",
+        "field": "transition"
+      },
+      {
+        "label": "角色定位",
+        "field": "role"
+      }
+    ]
+  },
+  "ai": {
+    "promptTemplate": "review.md",
+    "temperature": 0.3,
+    "maxRetries": 3,
+    "requestTimeoutSec": 420,
+    "retryDelayMs": 2000,
+    "betweenRecordsDelayMs": 500,
+    "batchSize": 20
+  }
+}

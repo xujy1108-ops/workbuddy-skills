@@ -1,0 +1,112 @@
+{
+  "brand": "duxiaoman",
+  "brandName": "度小满",
+  "audience": "30-50岁",
+  "reviewTitle": "度小满策略素材自动分析",
+  "syncTitle": "度小满策略素材同步到策略库",
+  "tables": {
+    "source": {
+      "label": "头条数据表",
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/IusNb2cgTafYo4sTVntcHNJHn9f",
+      "baseToken": "IusNb2cgTafYo4sTVntcHNJHn9f",
+      "tableId": "tblBEveR1P0gKRyy",
+      "fieldNames": {
+        "topic": "脚本主题",
+        "script": "脚本文案",
+        "starRatio": "星推比",
+        "conversionQualified": "转化是否达标",
+        "creator": "达人名称"
+      },
+      "envOverride": {
+        "baseToken": "TOUTIAO_BASE_TOKEN",
+        "tableId": "TOUTIAO_TABLE_ID"
+      }
+    },
+    "review": {
+      "label": "策略素材审核表",
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/IusNb2cgTafYo4sTVntcHNJHn9f",
+      "baseToken": "IusNb2cgTafYo4sTVntcHNJHn9f",
+      "tableId": "tblX7a3YpwLExN7Z",
+      "fieldNames": {
+        "topic": "脚本主题",
+        "scriptId": "源脚本ID",
+        "script": "脚本文案",
+        "hook": "AI建议-钩子",
+        "inherit": "AI建议-承接",
+        "transition": "AI建议-转折",
+        "role": "AI建议-角色定位",
+        "grade": "评分等级",
+        "target": "入库目标",
+        "status": "审核状态"
+      },
+      "envOverride": {
+        "tableId": "REVIEW_TABLE_ID"
+      },
+      "status": {
+        "pending": "待审核",
+        "approved": "已通过",
+        "rejected": "已拒绝",
+        "synced": "已入库"
+      }
+    }
+  },
+  "filters": {
+    "starRatioThreshold": 2.5,
+    "conversionQualifiedValues": [
+      "是"
+    ],
+    "minScriptLength": 30,
+    "scriptMaxLength": 10000
+  },
+  "grading": {
+    "both": "S",
+    "conversionOnly": "A",
+    "starRatioOnly": "A"
+  },
+  "topicSplit": {
+    "enabled": true,
+    "default": "非热点",
+    "rules": [
+      {
+        "keyword": "热点",
+        "target": "热点"
+      }
+    ]
+  },
+  "strategyLib": {
+    "label": "策略库",
+    "baseUrl": "https://kwza968lz1u.feishu.cn/docx/",
+    "docs": {
+      "非热点": "BBx1dVk5aoNIn6xgON2cppNKnkb",
+      "热点": "SHdXdI0KQoJbfwxNq4mcePL5nxb"
+    },
+    "sectionTemplate": "sync_section.md",
+    "recordFields": [
+      {
+        "label": "钩子",
+        "field": "hook"
+      },
+      {
+        "label": "承接",
+        "field": "inherit"
+      },
+      {
+        "label": "转折",
+        "field": "transition"
+      },
+      {
+        "label": "角色定位",
+        "field": "role"
+      }
+    ]
+  },
+  "ai": {
+    "promptTemplate": "review.md",
+    "temperature": 0.3,
+    "maxRetries": 3,
+    "requestTimeoutSec": 420,
+    "retryDelayMs": 2000,
+    "betweenRecordsDelayMs": 500,
+    "batchSize": 20
+  }
+}
