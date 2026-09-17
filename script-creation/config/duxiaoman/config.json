@@ -1,0 +1,94 @@
+{
+  "brand": "duxiaoman",
+  "brandName": "度小满",
+
+  "_note": "品牌私有内容全部在此。代码零品牌硬编码：scripts/config/settings.py 按 --brand 加载本文件，缺失/缺字段即启动报错。baseUrl 仅供人工核对，实际调用只用 baseToken + tableId。",
+
+  "tables": {
+    "strategy": {
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/EPYhbxo9TaUclysWuM0cgjkdnFf",
+      "baseToken": "EPYhbxo9TaUclysWuM0cgjkdnFf",
+      "tableId": "tblSZ8LbahG9GnCH",
+      "purpose": "directions 步骤驱动源：达人画像匹配策略行"
+    },
+    "hotspot": {
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/STMrbQgqma35dksI3WsclJlNnlc",
+      "baseToken": "STMrbQgqma35dksI3WsclJlNnlc",
+      "tableId": "tblDpxkM7psozqeO",
+      "purpose": "蹭热点线创意方向来源（按素材评分取优）"
+    },
+    "materials": {
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/RFAqblL7FahLxps2SsNcoyxjnWh",
+      "baseToken": "RFAqblL7FahLxps2SsNcoyxjnWh",
+      "tableId": "tblYEQ0raRDrB4tb",
+      "purpose": "策略行素材链接ids 反查源（素材id 字段）；scripts 步骤写稿参照"
+    },
+    "historyToutiao": {
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/IusNb2cgTafYo4sTVntcHNJHn9f",
+      "baseToken": "IusNb2cgTafYo4sTVntcHNJHn9f",
+      "tableId": "tblBEveR1P0gKRyy",
+      "purpose": "仅 match 旧步骤使用；已退出主流程"
+    }
+  },
+
+  "docs": {
+    "_note": "运行时实时拉取，不缓存。拉取失败即报错不降级（写稿依据缺失不应静默降级）。",
+    "sopHotspot": {
+      "name": "度小满-脚本SOP-热点-V2",
+      "url": "https://kwza968lz1u.feishu.cn/docx/OBkUdT47XoctsxxHBExce92Xn1c",
+      "purpose": "蹭热点方向写稿依据（结构 + 各模块打法选择逻辑）"
+    },
+    "sopNonhotspot": {
+      "name": "度小满-脚本SOP-非热点-V2",
+      "url": "https://kwza968lz1u.feishu.cn/docx/D3DQdyllxoEIgyxhHi4cyYzfnng",
+      "purpose": "其他方向写稿依据（结构 + 各模块打法选择逻辑）"
+    },
+    "libraryHotspot": {
+      "name": "度小满-策略库-热点",
+      "url": "https://kwza968lz1u.feishu.cn/docx/SHdXdI0KQoJbfwxNq4mcePL5nxb",
+      "purpose": "蹭热点方向语料库：库内档位台词公式/案例原句、热点承接方法库、热点痛点·缺口场景、热点角色定位（5 档）、热点转折/收尾/切入方式/热点类型速查"
+    },
+    "libraryNonhotspot": {
+      "name": "度小满-策略库-非热点",
+      "url": "https://kwza968lz1u.feishu.cn/docx/BBx1dVk5aoNIn6xgON2cppNKnkb",
+      "purpose": "其他方向语料库：钩子方法库（A–J 10 档）、痛点软肋方法库、转折句式方法库、角色定位方法库（7 档）、收尾方法库、切入方式库"
+    },
+    "scoringStandard": {
+      "name": "度小满-口播脚本评分标准-V2",
+      "url": "https://kwza968lz1u.feishu.cn/docx/WxwmdfYIeowjPLxvznWcfS7Nnle",
+      "purpose": "定义源 + 第0条红线依据 + 复盘归因标准（生成期不打分；“使用规则”节规定 0/1/2 只对人工修改后版本打）"
+    },
+    "contentStandard": {
+      "name": "度小满-内容标准",
+      "url": "https://kwza968lz1u.feishu.cn/docx/ZdJMd6L1uo7lkwxSgKkcvXawnLc",
+      "purpose": "2026-09-09 起停用（大纲步骤已移除）",
+      "deprecated": true
+    },
+    "influencerTypeStandard": {
+      "name": "度小满-达人类型基础标准（终版）",
+      "url": "https://kwza968lz1u.feishu.cn/docx/QDPOdmP6XoNiqpxmbl6cwNianCg",
+      "localCopy": "config/<brand>/references/influencer-type-standard.md",
+      "purpose": "达人类型判定的唯一合法枚举来源（品牌私有标准，按品牌不同而不同）"
+    }
+  },
+
+  "rolePositions": {
+    "_note": "角色定位档位枚举——来自品牌策略库。prompt 模板用 __ROLE_POSITIONS_NONHOTSPOT__ / __ROLE_POSITIONS_HOTSPOT__ 注入。",
+    "nonhotspot": ["痛点解药", "过来人工具", "应急安全垫", "被验证的靠谱", "拒绝话术武器", "优等生", "体面方案"],
+    "hotspot": ["合规标杆", "国家队合作伙伴", "缺口补充工具", "政策响应者", "普通人低息入口"]
+  },
+
+  "influencerTypeStandardMap": {
+    "_note": "达人类型标准的**结构化**版本，供代码做枚举合法性校验（TYPE_STANDARD）。必须与 promptVars.influencerTypeEnum 的文本枚举同源，改一处要同步另一处。",
+    "财经": ["泛财经", "高价值", "小微企业主"],
+    "生活": ["民生", "人文杂谈"],
+    "三农": ["三农美食", "三农建造"],
+    "剧情": ["常规剧情", "剧情搞笑"]
+  },
+
+  "promptVars": {
+    "_note": "prompt 模板的其余动态文本。品牌名用 __BRAND_NAME__ 注入，本字段供需要整段替换的场景使用。",
+    "influencerTypeEnum": "### 财经\n- 泛财经：商业故事、个人财富、消费决策、搞钱思路、时政要闻、国内外热点等所有与\"金钱\"\"财富\"\"商业活动\"相关的点评，输出观点；**军事点评也算入泛财经**；方向可垂直但不涉及投资；方向也可以很广，任何时事要闻、小道新闻都要表达看法\n- 高价值：主要讲投资（贵金属、二级市场投资即股票债券基金、房产、进出口等金融投资）；垂直赛道；政策分析、投资心得、市场洞察、投资产品推荐\n- 小微企业主：自己必须是老板/合伙人，有自己的公司和业务；分析自己公司产业、吐槽或点评创业；创业 vlog\n\n### 生活\n- 民生：选题全部来自\"普通人正在经历、但自己说不清楚\"的事，不追专业议程（不讲货币政策本身），只抓大众体感（钱变难赚了、婚不敢结了、学历不值钱了）；落点永远是\"你个人怎么办\"，宏观事件只当引子，三句话内必然折到个人决策；话题自带阶层站位（站普通打工人）；人设=平视过来人，有可验证的平民经历叙事，无权威身份包装\n- 人文杂谈：选题源是\"人活不明白\"的困惑（被拿捏、被套话、内耗、看不透人情世故），钱只是偶发话题无连续主线；落点是处世方法论或认知消遣（非金钱决策）；站位无阶层对抗性（说书人或阅历权威）；关键检验：观众对该账号无\"金钱托付感\"\n\n### 三农\n- 三农美食：围绕指定食材+剧情演绎，核心是把食材有爽感地做饭；人物出镜说话；场景在农村（含草原、窑洞等少数民族场景）或城乡结合部，场景多元化\n- 三农建造：建造房子、家具、生活用具（泳池、猪圈等）手工内容；人物出镜口播；不单提某品牌；场景农村/野外/城市均可\n\n### 剧情\n- 常规剧情：1 分钟以上；多人（非一人分饰多角）演出；多场景；有人物关系、叙事结构、核心冲突；起因发展高潮结束完整；环环相扣\n- 剧情搞笑：逻辑不严谨，可不到 1 分钟，无脑、耍丑、肢体动作搞笑；叙事可不用环环相扣，有万万没想到的转折",
+    "influencerTypeReferenceAnchors": "财经-泛财经（商业小纸条、直言财经、达哥有点味）、财经-高价值（小张小张吃饭用缸、许戈、大哲）、财经-小微企业主（乡村大宁、包工头才哥）、生活-民生（萌叔的小酒馆、朴素之道、刘雯）、生活-人文杂谈（涵浪、万能春秋、赵大湿）、三农-三农美食（董姐夫美食、周甄甄）、三农-三农建造（建造哥户外生活、文子大大、手工耿）、剧情-常规剧情（帅大斌的一天、三根葱）、剧情-剧情搞笑（太和小夫妻、猪肉佬）"
+  }
+}

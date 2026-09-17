@@ -106,7 +106,7 @@ def fetch_materials_by_type(
 
     规则：
     - "适配达人" contains "达人类型：一级-二级"（与标准文档统一的精确标注）
-    - 标准来源：references/influencer-type-standard.md
+    - 标准来源：品牌配置 config/<brand>/references/influencer-type-standard.md
 
     Args:
         material_match_text: 形如 "达人类型：财经-泛财经" 的匹配文本

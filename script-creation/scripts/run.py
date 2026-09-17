@@ -4,6 +4,11 @@
   python run.py --step match       --style style.json [--user-input "..."]
   python run.py --step directions  --style style.json
   python run.py --step scripts     --style style.json --directions step3.json --selected 1,3,5
+
+品牌配置化（2026-09-17）：品牌私有内容（飞书表 token / 文档 URL / prompt 模板 /
+角色定位档位 / 达人类型枚举）外置在 skill 根目录 config/<brand>/。
+  --brand duxiaoman   指定品牌（默认 duxiaoman，可用 env WORKFLOW_BRAND 覆盖）
+  新增品牌 = 复制 config/duxiaoman 改配置，不改代码。
 """
 
 from __future__ import annotations
@@ -96,8 +101,24 @@ def main() -> None:
     parser.add_argument("--user-input", help="match 步骤: 用户手动输入的创意方向")
     parser.add_argument("--directions", help="scripts 步骤: step3_directions.json 路径")
     parser.add_argument("--selected", help="选中的方向 ID（逗号分隔，如 1,3,5）")
+    parser.add_argument(
+        "--brand",
+        help="品牌（对应 config/<brand>/），默认 duxiaoman；亦可用 env WORKFLOW_BRAND",
+    )
 
     args = parser.parse_args()
+
+    # 品牌必须在 import agents 之前确定（agents / tools 在 cmd_* 内延迟 import）
+    if args.brand:
+        os.environ["WORKFLOW_BRAND"] = args.brand
+
+    # 提前校验品牌配置：缺失/缺字段时给出可用品牌列表，而不是让堆栈冒到 agents 深处
+    try:
+        from config.settings import BRAND
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+    logger.info("生效品牌：%s（配置目录 config/%s/）", BRAND, BRAND)
 
     dispatch = {
         "match": cmd_match,

@@ -1,6 +1,6 @@
 ---
 name: script-creation
-description: "短视频脚本创作 skill — 接收达人风格 JSON，创意策略表驱动生成创意方向（蹭热点/其他方向分线），选方向后按脚本 SOP 文档（热点/非热点）直出逐字稿并过生成期自检（红线一票否决 + 检验机制 pass/fail，不打分），产出可投放的短视频脚本。"
+description: "短视频脚本创作 skill（多品牌配置化）— 接收达人风格 JSON，创意策略表驱动生成创意方向（蹭热点/其他方向分线），选方向后按脚本 SOP 文档（热点/非热点）直出逐字稿并过生成期自检（红线一票否决 + 检验机制 pass/fail，不打分），产出可投放的短视频脚本。品牌私有内容（表 token / 文档 URL / prompt 模板 / 角色定位档位 / 达人类型枚举）全部外置在 config/<brand>/，用 --brand 切换品牌，代码零改动。"
 version: 2.0.0
 author: user
 ---
@@ -13,6 +13,33 @@ author: user
 
 **前置依赖**：需要先使用 `influencer-style-analysis` skill 获得达人风格 JSON（含 `career_identity` 职业身份核实字段）。
 
+## 品牌配置化（2026-09-17）
+
+品牌私有内容全部外置在 skill 根目录 `config/<brand>/`，**代码内零品牌硬编码**：
+
+```
+config/<brand>/
+├── config.json      # 品牌名 / 飞书表 token+tableId / 文档 URL / 角色定位档位 /
+│                    # 达人类型枚举（结构化 + 文本）/ prompt 占位符变量
+├── prompts/         # 5 个 prompt 模板（品牌段落 + 占位符）
+│   ├── script_writer.md        # 写稿主 prompt（含角色定位档位枚举）
+│   ├── influencer_type.md      # 达人类型判定
+│   ├── direction_match.md      # 策略匹配
+│   ├── direction_generate.md   # 方向生成
+│   └── material_match.md       # 素材匹配（match 旧步骤）
+└── references/      # 品牌私有参考文档（达人类型标准 / 飞书表结构 / 策略库副本）
+```
+
+**品牌选择**：`--brand <name>`（等价于 env `WORKFLOW_BRAND`），默认 `duxiaoman`。
+
+**失败即报错**（不静默回退到其它品牌）——以下情况 import 时直接抛 `RuntimeError`：
+配置目录/文件缺失、JSON 非法、必填字段缺失、**值仍为 `TODO_` 占位**（骨架未补齐）、
+prompt 模板缺失、prompt 模板为纯注释（未补齐）、或 prompt 内存在未注入的占位符。
+> 未补齐检测的意义：骨架品牌在补齐前就明确报错，而不是一路跑到读表/调 LLM 才炸出难懂的飞书报错。
+
+**新增品牌**：复制 `config/duxiaoman/` → 改 `config.json`（品牌名/表 token/文档 URL/档位/类型枚举）
+→ 改 5 个 prompt 模板的品牌段落 → **无需改任何代码**。
+
 ## 触发条件
 
 当用户提到"脚本创作""写脚本""创作脚本""script-creation"等关键词时触发。
@@ -23,7 +50,7 @@ author: user
 
 用户需要提供：
 1. **达人风格 JSON**（来自 influencer-style-analysis skill 的输出，含 career_identity）
-2. **用户手动创意方向**（可选，仅 match 旧步骤使用）
+4. **用户手动创意方向**（可选，仅 match 旧步骤使用）
 
 将达人风格 JSON 保存为临时文件，例如 `{工作目录}/style.json`。
 
@@ -39,8 +66,8 @@ cd {SKILL_ROOT}/scripts && {PYTHON} run.py \
 ```
 
 **创意策略表驱动逻辑（2026-09-09 改造）**：
-1. 拉取创意策略表（base `EPYhbxo9TaUclysWuM0cgjkdnFf` / table `tblSZ8LbahG9GnCH`）→ LLM 拿达人画像与每行的「适合达人」+「内容方向」共同判定命中哪些策略行（不简单按 influencer_type 分线；「适合达人」= 策略反推的匹配条件；蹭热点行「适合达人」= 所有类型即无过滤；**职业身份条件是一票否决硬门槛**：策略行指定职业身份（企业主/前企业主/金融从业者等）时，达人画像的 career_identity 必须 status=有明确证据且身份相符才可命中，缺失/无法判断/不符 → 该策略行不推荐且记入 excluded_strategies，不得以角色代入绕过）
-2. 命中策略行中「内容方向一」= 蹭热点 → **蹭热点线**：从热点素材库（base `STMrbQgqma35dksI3WsclJlNnlc` / table `tblDpxkM7psozqeO`）按「素材评分」降序（优秀>良好>一般>劣质）取优组织创意方向
+1. 拉取创意策略表（base/table 见 `config/<brand>/config.json` → `tables.strategy`）→ LLM 拿达人画像与每行的「适合达人」+「内容方向」共同判定命中哪些策略行（不简单按 influencer_type 分线；「适合达人」= 策略反推的匹配条件；蹭热点行「适合达人」= 所有类型即无过滤；**职业身份条件是一票否决硬门槛**：策略行指定职业身份（企业主/前企业主/金融从业者等）时，达人画像的 career_identity 必须 status=有明确证据且身份相符才可命中，缺失/无法判断/不符 → 该策略行不推荐且记入 excluded_strategies，不得以角色代入绕过）
+2. 命中策略行中「内容方向一」= 蹭热点 → **蹭热点线**：从热点素材库（见 `tables.hotspot`）按「素材评分」降序（优秀>良好>一般>劣质）取优组织创意方向
 3. 命中策略行为其他方向（揭秘自己/借钱高性价比/利息计算/有钱人借钱/网贷测评/回应解释/鸡汤/避坑/拒绝借钱）→ **其他方向线**：
    - 植入策略：直接取策略行「植入策略」字段
    - 叙事策略：正向案例 + 按「素材链接ids」（dy_xxx，对应网络素材库「素材id」字段）反查网络素材库素材，**一起分析**后描述整体叙事逻辑（人物、场景、如何植入）；ids 为空则只用正向案例
@@ -49,7 +76,7 @@ cd {SKILL_ROOT}/scripts && {PYTHON} run.py \
    场景写明"在哪里发生、什么场合、几个人"（如"酒席饭桌，多人聚餐当众讨债"；纯对镜讲述写"对镜口播（无场景情节）"），
    依据反查素材的「场景」字段与内容分析判断，蹭热点线从热点概述判断；多条策略命中按策略等级 S>A>B>X 优先；
    **蹭热点方向最多 2 个**（2026-09-15 定：热点优先但限流，其余 3+ 名额由其他方向线按等级补足）
-5. **停用项**：《内容标准》文档注入与程序化校验（standard_check_dropped）、历史库匹配
+7. **停用项**：《内容标准》文档注入与程序化校验（standard_check_dropped）、历史库匹配
 
 读取输出 `step3_directions.json`，其中：
 - `directions`：5 个创意方向（id/title/track/content_direction/**scene**/implant_strategy/suitable_influencer/narrative_strategy/source_material_ids/style_fit）
@@ -76,31 +103,31 @@ cd {SKILL_ROOT}/scripts && {PYTHON} run.py \
 ```
 
 **SOP + 策略库驱动逻辑（2026-09-09 建，2026-09-15 补策略库）**：
-1. 运行时实时拉取**五份文档**（配置于 `config/settings.py`，拉取失败即报错不降级；
+1. 运行时实时拉取**五份文档**（URL 配置于 `config/<brand>/config.json` → `docs`，拉取失败即报错不降级；
    每次运行现拉、代码不缓存 → 文档在飞书改完，下次运行自动生效，无需改代码）：
-   - 《度小满-脚本SOP-热点-V2》（`SOP_HOTSPOT_DOC_URL`）：蹭热点方向的结构与打法依据
-   - 《度小满-策略库-热点》（`LIBRARY_HOTSPOT_DOC_URL`）：蹭热点方向的语料与角色定位
-   - 《度小满-脚本SOP-非热点-V2》（`SOP_NONHOTSPOT_DOC_URL`）：其他方向的结构与打法依据
-   - 《度小满-策略库-非热点》（`LIBRARY_NONHOTSPOT_DOC_URL`）：其他方向的语料与角色定位
-   - 《度小满-口播脚本评分标准-V2》（`SCORING_STANDARD_DOC_URL`）：**定义源 + 第0条红线依据**
+   - 脚本SOP-热点（`docs.sopHotspot`）：蹭热点方向的结构与打法依据
+   - 策略库-热点（`docs.libraryHotspot`）：蹭热点方向的语料与角色定位
+   - 脚本SOP-非热点（`docs.sopNonhotspot`）：其他方向的结构与打法依据
+   - 策略库-非热点（`docs.libraryNonhotspot`）：其他方向的语料与角色定位
+   - 口播脚本评分标准（`docs.scoringStandard`）：**定义源 + 第0条红线依据**
      （生成期不打分——该文档「使用规则（先读这一节）」节明确：写稿只走 SOP 检验机制的 pass/fail）
 2. 按 track 分线：蹭热点方向注入（热点 SOP + 策略库-热点），其他方向注入（非热点 SOP + 策略库-非热点）；
    两组均注入评分标准；分线各自一次 LLM 调用，结果按方向顺序合并
-3. **库内素材取用（SOP 顶部「素材取用流程」四步，2026-09-15 起真正落地）**：
+5. **库内素材取用（SOP 顶部「素材取用流程」四步，2026-09-15 起真正落地）**：
    库级定位 → 条目级选择 → 产出留痕 → 缺口兜底。
    产出留痕落在脚本 JSON 新字段 `library_picks`（各模块「库内编号＋名称＋命中理由」）与 `material_gap`；
    编号体系纪律：库内编号与 SOP 模块子编号是两套体系（库内：热点钩子 A–C／非热点钩子 A–J；
    SOP：热点线为纯序号 1/2/3、非热点线为 A1–D2），**禁止按字母或序号对齐**，
    一律按库内各档「对应 SOP」字段反查；`【模块·打法】`标签沿用**对应 track 的 SOP 编号**，库内编号只进 `library_picks`
-4. **角色定位必选（SOP 推导流程 Step 3，2026-09-15 补齐）**：
-   非热点线从《策略库-非热点》角色定位方法库 7 档选 1 档（痛点解药/过来人工具/应急安全垫/被验证的靠谱/拒绝话术武器/优等生/体面方案）；
-   热点线从 SOP-热点 模块④「热点专属角色定位」5 档选 1 档（合规标杆/国家队合作伙伴/缺口补充工具/政策响应者/普通人低息入口）；
+6. **角色定位必选（SOP 推导流程 Step 3，2026-09-15 补齐）**：
+   非热点线从《策略库-非热点》角色定位方法库档位中选 1 档（档位表见 `config/<brand>/config.json` → `rolePositions.nonhotspot`）；
+   热点线从 SOP-热点 模块④「热点专属角色定位」档位中选 1 档（档位表见 `rolePositions.hotspot`）；
    选中档位写进 `library_picks`（module=模块④角色定位），植入段口吻与【植入·…】标签须体现该角色定位
 5. 产品上下文：方向自带的植入策略/叙事策略/场景 + 按 `source_material_ids` 现拉网络素材库素材
    （**场景 + 内容分析 + 广告可借鉴点**，2026-09-14 起不再注入素材脚本文案原文——实测原文逐字复用率≈0，
    骨架由「内容分析」承载、场景由「场景」字段承载）；历史数据库、step2 依赖已全部移除
 6. 写稿执行 SOP 推导流程（Step 0 达人风格定基调 → 钩子定类 → 转折收口 → 角色定位 → 植入 4 步 → 收尾叠加 → 自检）；产出完整口播逐字稿（含【模块·打法】标签，60-90s / 220-390 字）
-7. **生成期自检（不打分，2026-09-15 口径）**：
+9. **生成期自检（不打分，2026-09-15 口径）**：
    先过第 0 条合规红线（一票否决，记入 `compliance_check`）；通过后按对应 SOP「四、检验机制」逐项过 **pass / fail**，写入 `self_check`
    （键固定：`hook`／`name_removal`／`influencer`／`speed`／`placement_chain`／`density`／`entry_direction`／`hotspot_fit`／`speakability`／`redline`；
    值只允许 `pass`｜`fail`｜`n/a`，`hotspot_fit` 仅蹭热点线适用，其他方向线填 `n/a`；未过项记入 `fail_items`）；
@@ -153,6 +180,7 @@ cd {SKILL_ROOT}/scripts && {PYTHON} run.py \
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
+| WORKFLOW_BRAND | 生效品牌（= `--brand` 参数；`--brand` 优先级更高） | duxiaoman |
 | DEEPSEEK_API_KEY | inferera API key | 必填 |
 | DEEPSEEK_BASE_URL | API 端点 | https://api.inferera.com/v1 |
 | DEEPSEEK_MODEL | 模型名 | deepseek-v4-pro |
@@ -161,50 +189,66 @@ cd {SKILL_ROOT}/scripts && {PYTHON} run.py \
 
 ## 飞书数据源与文档
 
-| 数据源 | Base Token | Table ID | 用途 |
-|--------|-----------|----------|------|
-| 创意策略表 | EPYhbxo9TaUclysWuM0cgjkdnFf | tblSZ8LbahG9GnCH | directions 步骤驱动源：达人画像匹配策略行 |
-| 热点素材库 | STMrbQgqma35dksI3WsclJlNnlc | tblDpxkM7psozqeO | 蹭热点线创意方向来源（按素材评分取优） |
-| 网络素材库 | RFAqblL7FahLxps2SsNcoyxjnWh | tblYEQ0raRDrB4tb | 策略行素材链接ids 反查源（素材id 字段）；scripts 步骤写稿参照；match 旧步骤按「适配达人 contains 达人类型：一级-二级」匹配 |
-| 历史数据库-头条 | IusNb2cgTafYo4sTVntcHNJHn9f | tblBEveR1P0gKRyy | 仅 match 旧步骤使用；已退出主流程 |
+**全部来自品牌配置** `config/<brand>/config.json`，此处不再罗列 token/URL（避免双轨漂移）。
 
-| 文档 | URL | 用途 |
-|------|-----|------|
-| 脚本SOP-热点-V2 | https://kwza968lz1u.feishu.cn/docx/OBkUdT47XoctsxxHBExce92Xn1c | 蹭热点方向写稿依据（结构 + 各模块打法选择逻辑） |
-| 脚本SOP-非热点-V2 | https://kwza968lz1u.feishu.cn/docx/D3DQdyllxoEIgyxhHi4cyYzfnng | 其他方向写稿依据（结构 + 各模块打法选择逻辑） |
-| **策略库-热点** | https://kwza968lz1u.feishu.cn/docx/SHdXdI0KQoJbfwxNq4mcePL5nxb | 蹭热点方向**语料库**：库内档位的台词公式/案例原句、热点承接方法库、热点痛点·缺口场景、热点角色定位（5 档）、热点转折/收尾/切入方式/热点类型速查 |
-| **策略库-非热点** | https://kwza968lz1u.feishu.cn/docx/BBx1dVk5aoNIn6xgON2cppNKnkb | 其他方向**语料库**：钩子方法库（A–J 10 档）、痛点软肋方法库、转折句式方法库、角色定位方法库（7 档）、收尾方法库、切入方式库 |
-| 口播脚本评分标准-V2 | https://kwza968lz1u.feishu.cn/docx/WxwmdfYIeowjPLxvznWcfS7Nnle | **定义源 + 第0条红线依据 + 复盘归因标准**（生成期不打分；「使用规则」节规定 0/1/2 只对人工修改后版本打） |
-| 内容标准（已停用） | https://kwza968lz1u.feishu.cn/docx/ZdJMd6L1uo7lkwxSgKkcvXawnLc | 2026-09-09 起停用 |
+| 数据源 | 配置路径 | 用途 |
+|--------|---------|------|
+| 创意策略表 | `tables.strategy` | directions 步骤驱动源：达人画像匹配策略行 |
+| 热点素材库 | `tables.hotspot` | 蹭热点线创意方向来源（按素材评分取优） |
+| 网络素材库 | `tables.materials` | 策略行素材链接ids 反查源（素材id 字段）；scripts 步骤写稿参照；match 旧步骤按「适配达人 contains 达人类型：一级-二级」匹配 |
+| 历史数据库-头条 | `tables.historyToutiao` | 仅 match 旧步骤使用；已退出主流程 |
 
-> 2026-09-15 补齐策略库注入：此前只注入 SOP，而 SOP 正文的「素材取用流程」要求 LLM 去策略库取档位语料（正文含 20 处指向策略库的链接）——单次补全的 LLM 打不开链接，该流程成为死指令。
+| 文档 | 配置路径 | 用途 |
+|------|---------|------|
+| 脚本SOP-热点 | `docs.sopHotspot` | 蹭热点方向写稿依据（结构 + 各模块打法选择逻辑） |
+| 脚本SOP-非热点 | `docs.sopNonhotspot` | 其他方向写稿依据（结构 + 各模块打法选择逻辑） |
+| 策略库-热点 | `docs.libraryHotspot` | 蹭热点方向**语料库**：库内档位的台词公式/案例原句、热点承接方法库、热点痛点·缺口场景、热点角色定位、热点转折/收尾/切入方式/热点类型速查 |
+| 策略库-非热点 | `docs.libraryNonhotspot` | 其他方向**语料库**：钩子方法库、痛点软肋方法库、转折句式方法库、角色定位方法库、收尾方法库、切入方式库 |
+| 口播脚本评分标准 | `docs.scoringStandard` | **定义源 + 第0条红线依据 + 复盘归因标准**（生成期不打分；「使用规则」节规定 0/1/2 只对人工修改后版本打） |
+| 达人类型基础标准 | `docs.influencerTypeStandard` | 达人类型判定的唯一合法枚举来源（品牌私有标准）；固化版本见 `references/` 下同名文件 |
+| 内容标准（已停用） | `docs.contentStandard` | 2026-09-09 起停用（`deprecated: true`） |
+
+> 2026-09-15 补齐策略库注入：此前只注入 SOP，而 SOP 正文的「素材取用流程」要求 LLM 去策略库取档位语料——单次补全的 LLM 打不开链接，该流程成为死指令。
+> 2026-09-17 配置化：以上 token/URL 全部改由 `config/<brand>/config.json` 提供，改用 `--brand` 切品牌。
 
 ## 代码结构
 
 ```
-scripts/
-├── run.py                         # 主入口（--step: match|directions|scripts）
-├── config/settings.py             # 环境变量 + 飞书配置 + SOP/策略库/评分文档 URL
-├── providers/llm.py               # deepseek-v4-pro 调用
-├── tools/feishu.py                # 飞书数据拉取（lark-cli subprocess）
-├── agents/
-│   ├── base.py                    # AgentResult, AgentSpec
-│   ├── match_condition_extractor.py # match 旧步骤：达人类型判定
-│   ├── material_matcher.py        # match 旧步骤（主流程不经过）
-│   ├── direction_generator.py     # 步骤 directions：创意策略表驱动
-│   └── script_writer.py           # 步骤 scripts：SOP + 策略库驱动写稿 + 生成期自检（pass/fail，不打分）+ 库内取用留痕自检
-└── .env
+script-creation/
+├── SKILL.md
+├── config/<brand>/                 # ★ 品牌配置（唯一品牌私有内容存放处）
+│   ├── config.json                 # 品牌名/表 token/docs URL/角色定位档位/达人类型枚举/占位符变量
+│   ├── prompts/*.md                # 5 个 prompt 模板（品牌段落 + 占位符）
+│   └── references/                 # 品牌私有参考文档（达人类型标准/飞书表结构/策略库副本）
+├── references/                     # 通用参考文档（跨品牌共用）
+│   ├── output-schemas.md
+│   └── workflow.md
+└── scripts/
+    ├── run.py                         # 主入口（--step: match|directions|scripts；--brand 指定品牌）
+    ├── config/settings.py             # 品牌配置加载器（唯一读取入口，import 时校验并注入占位符）
+    ├── providers/llm.py               # deepseek-v4-pro 调用
+    ├── tools/feishu.py                # 飞书数据拉取（lark-cli subprocess）
+    ├── agents/
+    │   ├── base.py                    # AgentResult, AgentSpec
+    │   ├── match_condition_extractor.py # match 旧步骤：达人类型判定
+    │   ├── material_matcher.py        # match 旧步骤（主流程不经过）
+    │   ├── direction_generator.py     # 步骤 directions：创意策略表驱动
+    │   └── script_writer.py           # 步骤 scripts：SOP + 策略库驱动写稿 + 生成期自检（pass/fail，不打分）+ 库内取用留痕自检
+    └── .env
 ```
 
 > outline_writer.py / standard_guard.py 已于 2026-09-09 移除（大纲步骤取消）。
+> 2026-09-17 配置化：agents/tools 一律从 `config.settings` 引用常量，Python 代码内零品牌硬编码。
 
 ## 注意事项
 
-1. **Python 路径**：使用隔离环境 `/Users/dzsb-002295/.workbuddy/binaries/python/envs/default/bin/python`
-2. **lark-cli 依赖**：飞书数据拉取依赖 lark-cli 已认证
-3. **步骤间文件传递**：每步输出 JSON 文件，下一步读取上一步的文件
-4. **回退机制**：2 个交互点都有"不认可就回退"的机制
-5. **SOP + 策略库为写稿硬依据**：五份文档拉取失败不降级直接报错；**每次运行实时拉取（不缓存）→ 文档在飞书改完，下次创作自动生效，不需要改代码**
-6. **库内取用必须留痕**：`library_picks` 覆盖模块①-⑤ 且角色定位有且仅有 1 档；运行末尾会打自检日志（缺失只警告不阻断），复盘时可据 `library_picks` 回溯素材来源
-7. **两套编号不通用**：库内编号（策略库-热点钩子 A–C／策略库-非热点钩子 A–J）与 SOP 模块子编号（热点线为纯序号 1/2/3；非热点线为 A1–D2 且与评分维度一的 A-D 类绑定）**禁止按字母或序号对齐**，必须按库内各档「对应 SOP」字段反查
-8. **生成期不打分（2026-09-15 定）**：写稿阶段只做红线一票否决 + 检验机制 pass/fail，输出 `self_check` 与核验行 `verification`；0/1/2 的「预期分」只对**人工修改后的版本**打、由人工填 `human_revision`，随脚本交付文档留存供投放数据复盘归因。AI 初稿按 SOP 生成必然"满分"，自评没有区分度（球员兼裁判）
+1. **品牌私有内容只放 config/**：新增/修改品牌相关内容（表 token、文档 URL、prompt 品牌段落、角色定位档位、达人类型枚举）**一律改 `config/<brand>/`，不改代码**；代码里出现品牌名品牌 token 即为 bug
+2. **prompt 占位符不可删**：换品牌时模板里的 `__BRAND_NAME__` 等占位符必须保留，`load_prompt` 会校验未注入占位符并报错
+3. **Python 路径**：使用隔离环境 `/Users/dzsb-002295/.workbuddy/binaries/python/envs/default/bin/python`
+4. **lark-cli 依赖**：飞书数据拉取依赖 lark-cli 已认证
+5. **步骤间文件传递**：每步输出 JSON 文件，下一步读取上一步的文件
+6. **回退机制**：2 个交互点都有"不认可就回退"的机制
+7. **SOP + 策略库为写稿硬依据**：五份文档拉取失败不降级直接报错；**每次运行实时拉取（不缓存）→ 文档在飞书改完，下次创作自动生效，不需要改代码**
+8. **库内取用必须留痕**：`library_picks` 覆盖模块①-⑤ 且角色定位有且仅有 1 档；运行末尾会打自检日志（缺失只警告不阻断），复盘时可据 `library_picks` 回溯素材来源
+9. **两套编号不通用**：库内编号（策略库-热点钩子 A–C／策略库-非热点钩子 A–J）与 SOP 模块子编号（热点线为纯序号 1/2/3；非热点线为 A1–D2 且与评分维度一的 A-D 类绑定）**禁止按字母或序号对齐**，必须按库内各档「对应 SOP」字段反查
+10. **生成期不打分（2026-09-15 定）**：写稿阶段只做红线一票否决 + 检验机制 pass/fail，输出 `self_check` 与核验行 `verification`；0/1/2 的「预期分」只对**人工修改后的版本**打、由人工填 `human_revision`，随脚本交付文档留存供投放数据复盘归因。AI 初稿按 SOP 生成必然"满分"，自评没有区分度（球员兼裁判）

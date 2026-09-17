@@ -2,7 +2,8 @@
 
 ## 来源
 
-飞书文档：https://kwza968lz1u.feishu.cn/wiki/OMPiwq1hdiZpzNkWq7McQPMMnOd
+本文档描述**品牌无关**的流程骨架。品牌私有的表 token 与文档 URL 见 `config/<brand>/config.json`
+（2026-09-17 配置化：此处不再内联任何品牌资源地址，避免与配置双轨漂移）。
 
 ## 飞轮全貌
 

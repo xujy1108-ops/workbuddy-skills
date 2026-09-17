@@ -1,0 +1,91 @@
+{
+  "_TODO": "微业贷品牌配置骨架——所有 TODO 字段补齐后才能运行 weiyedai 品牌；结构对齐 config/duxiaoman/config.json",
+
+  "brand": "weiyedai",
+  "brandName": "微业贷",
+
+  "tables": {
+    "strategy": {
+      "baseUrl": "TODO_策略表URL(https://<租户>.feishu.cn/base/<base_token>)",
+      "baseToken": "TODO_策略表base_token",
+      "tableId": "TODO_策略表table_id",
+      "purpose": "directions 步骤驱动源：达人画像匹配策略行"
+    },
+    "hotspot": {
+      "baseUrl": "TODO_热点素材表URL",
+      "baseToken": "TODO_热点素材表base_token",
+      "tableId": "TODO_热点素材表table_id",
+      "purpose": "蹭热点线创意方向来源（按素材评分取优）"
+    },
+    "materials": {
+      "baseUrl": "TODO_网络素材表URL",
+      "baseToken": "TODO_网络素材表base_token",
+      "tableId": "TODO_网络素材表table_id",
+      "purpose": "策略行素材链接ids 反查源；scripts 步骤写稿参照"
+    },
+    "historyToutiao": {
+      "baseUrl": "TODO_历史库URL（如不使用可留空字符串）",
+      "baseToken": "TODO_历史库base_token",
+      "tableId": "TODO_历史库table_id",
+      "purpose": "仅 match 旧步骤使用；已退出主流程"
+    }
+  },
+
+  "docs": {
+    "_note": "运行时实时拉取，不缓存。拉取失败即报错不降级。",
+    "sopHotspot": {
+      "name": "TODO_微业贷-脚本SOP-热点",
+      "url": "TODO_热点SOP文档URL",
+      "purpose": "蹭热点方向写稿依据"
+    },
+    "sopNonhotspot": {
+      "name": "TODO_微业贷-脚本SOP-非热点",
+      "url": "TODO_非热点SOP文档URL",
+      "purpose": "其他方向写稿依据"
+    },
+    "libraryHotspot": {
+      "name": "TODO_微业贷-策略库-热点",
+      "url": "TODO_热点策略库文档URL",
+      "purpose": "蹭热点方向语料库"
+    },
+    "libraryNonhotspot": {
+      "name": "TODO_微业贷-策略库-非热点",
+      "url": "TODO_非热点策略库文档URL",
+      "purpose": "其他方向语料库"
+    },
+    "scoringStandard": {
+      "name": "TODO_微业贷-口播脚本评分标准",
+      "url": "TODO_评分标准文档URL",
+      "purpose": "定义源 + 红线依据（生成期不打分）"
+    },
+    "contentStandard": {
+      "name": "TODO_内容标准（如已停用可标 deprecated=true）",
+      "url": "",
+      "purpose": "旧步骤依赖，如不使用可留空",
+      "deprecated": true
+    },
+    "influencerTypeStandard": {
+      "name": "TODO_微业贷-达人类型基础标准",
+      "url": "TODO_达人类型标准文档URL",
+      "localCopy": "config/<brand>/references/influencer-type-standard.md",
+      "purpose": "达人类型判定的唯一合法枚举来源"
+    }
+  },
+
+  "rolePositions": {
+    "_note": "角色定位档位枚举——必须从微业贷策略库的「角色定位方法库」实际档位导出，换品牌时必须重导。",
+    "nonhotspot": [],
+    "hotspot": []
+  },
+
+  "influencerTypeStandardMap": {
+    "_TODO": "微业贷达人类型标准的**结构化**版本（一级类型 → 二级类型列表），供代码做枚举合法性校验。必须与 promptVars.influencerTypeEnum 的文本枚举同源，不可照抄 duxiaoman。",
+    "TODO_一级类型": []
+  },
+
+  "promptVars": {
+    "_note": "达人类型枚举与参考锚点必须从微业贷达人类型标准导出，不可照抄 duxiaoman。",
+    "influencerTypeEnum": "TODO_达人类型枚举文本（一级/二级类型 + 范围限定）",
+    "influencerTypeReferenceAnchors": "TODO_参考锚点（各类型的示例达人账号）"
+  }
+}
