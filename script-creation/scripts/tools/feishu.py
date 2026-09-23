@@ -136,7 +136,8 @@ def fetch_materials_by_type(
 def fetch_strategy_table(limit: int = 200) -> list[dict]:
     """创意策略表全量拉取（directions 步骤的驱动源）。
 
-    表字段：内容方向一/二（select）、策略等级、内容一方向定义、
+    表字段：内容方向一/二（select）、策略等级、内容一方向定义（一级方向定义）、
+    内容二方向定义（二级方向定义，2026-09-21 起新增列）、
     植入策略、适合达人、正向案例、素材链接ids。
     """
     d = _lark_cli(

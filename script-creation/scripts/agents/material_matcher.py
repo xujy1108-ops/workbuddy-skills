@@ -5,11 +5,12 @@
    判定达人的一级/二级类型（LLM，军事归财经-泛财经）
 2. 按类型程序化查询飞书：
    - 网络素材库：按"适配达人" contains "达人类型：一级-二级"（精确匹配）
-   - 历史库-头条：按"达人类型" intersects 大类映射 + "星推比" 降序（服务端 sort-json）
 3. 实时拉取《内容标准》飞书文档（转化链条/切入方向/铺垫转折）注入 prompt
 4. LLM 基于真实命中的记录 + 内容标准硬约束生成原始创意，绑定来源 _record_id
 5. 程序化校验：链条传动 >1 次、疑似宏大叙事切入的创意直接淘汰
 
+历史变更：2026-09-17 移除历史库（头条）查询——历史库已退出全流程，
+不再参与匹配，输出中不再有 raw_history / matched_history / source_history_ids。
 注意：视频号历史表字段不全（达人风格为空、无星推比），按决策排除，不参与匹配。
 """
 
@@ -27,7 +28,6 @@ from config.settings import BRAND_NAME, CONTENT_STANDARD_DOC_URL, load_prompt
 from providers.llm import run_llm
 from tools.feishu import (
     fetch_doc_content,
-    fetch_history_toutiao_by_types,
     fetch_materials_by_type,
 )
 
@@ -62,10 +62,6 @@ def run_material_matcher(
         material_match_text=conditions.get("material_match_text", ""),
         limit=30,
     )
-    history = fetch_history_toutiao_by_types(
-        daren_types=conditions.get("history_daren_types", []),
-        limit=30,
-    )
 
     # 3. 实时拉取《内容标准》文档（创意产出前必读，失败则中止）
     logger.info("步骤 2: 拉取内容标准文档...")
@@ -75,7 +71,7 @@ def run_material_matcher(
     # 4. LLM 基于真实命中记录 + 内容标准生成创意
     logger.info("步骤 2: 调用 LLM 匹配风格 + 生成创意...")
     user_text = _build_user_text(
-        style_json, materials, history, user_input, conditions, content_standard
+        style_json, materials, user_input, conditions, content_standard
     )
 
     result = run_llm(
@@ -91,7 +87,6 @@ def run_material_matcher(
     output["match_conditions"] = conditions
     # 附加真实命中数据，供后续写稿步骤使用（含完整脚本文案 + _record_id 可追溯）
     output["raw_materials"] = materials
-    output["raw_history"] = history
     return output
 
 
@@ -135,7 +130,6 @@ def _filter_violating_creatives(output: dict[str, Any]) -> dict[str, Any]:
 def _build_user_text(
     style_json: dict,
     materials: list[dict],
-    history: list[dict],
     user_input: str | None,
     type_judgment: dict | None = None,
     content_standard: str | None = None,
@@ -148,7 +142,7 @@ def _build_user_text(
             f"一级类型：{type_judgment.get('primary_type', '')}\n"
             f"二级类型：{type_judgment.get('secondary_type', '')}\n"
             f"判定依据：{type_judgment.get('reason', '')}\n\n"
-            "素材库与历史库的命中记录均按此类型筛选，创意必须与该类型的范围限定契合。\n"
+            "素材库的命中记录均按此类型筛选，创意必须与该类型的范围限定契合。\n"
         )
 
     parts.append("## 达人风格 JSON\n")
@@ -160,13 +154,6 @@ def _build_user_text(
             parts.append(json.dumps(m, ensure_ascii=False) + "\n")
     else:
         parts.append("（无匹配素材）\n")
-
-    parts.append("\n## 历史投放数据库命中记录（程序化匹配，已按星推比降序）\n")
-    if history:
-        for h in history:
-            parts.append(json.dumps(h, ensure_ascii=False) + "\n")
-    else:
-        parts.append("（无匹配历史记录）\n")
 
     if user_input:
         parts.append(f"\n## 用户手动输入的创意方向\n{user_input}\n")

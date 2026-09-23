@@ -1,7 +1,6 @@
 {
   "brand": "duxiaoman",
   "brandName": "度小满",
-
   "_note": "品牌私有内容全部在此。代码零品牌硬编码：scripts/config/settings.py 按 --brand 加载本文件，缺失/缺字段即启动报错。baseUrl 仅供人工核对，实际调用只用 baseToken + tableId。",
 
   "tables": {
@@ -34,12 +33,12 @@
   "docs": {
     "_note": "运行时实时拉取，不缓存。拉取失败即报错不降级（写稿依据缺失不应静默降级）。",
     "sopHotspot": {
-      "name": "度小满-脚本SOP-热点-V2",
+      "name": "度小满-脚本SOP-热点",
       "url": "https://kwza968lz1u.feishu.cn/docx/OBkUdT47XoctsxxHBExce92Xn1c",
       "purpose": "蹭热点方向写稿依据（结构 + 各模块打法选择逻辑）"
     },
     "sopNonhotspot": {
-      "name": "度小满-脚本SOP-非热点-V2",
+      "name": "度小满-脚本SOP-非热点",
       "url": "https://kwza968lz1u.feishu.cn/docx/D3DQdyllxoEIgyxhHi4cyYzfnng",
       "purpose": "其他方向写稿依据（结构 + 各模块打法选择逻辑）"
     },
@@ -54,15 +53,14 @@
       "purpose": "其他方向语料库：钩子方法库（A–J 10 档）、痛点软肋方法库、转折句式方法库、角色定位方法库（7 档）、收尾方法库、切入方式库"
     },
     "scoringStandard": {
-      "name": "度小满-口播脚本评分标准-V2",
+      "name": "度小满-口播脚本评分标准",
       "url": "https://kwza968lz1u.feishu.cn/docx/WxwmdfYIeowjPLxvznWcfS7Nnle",
-      "purpose": "定义源 + 第0条红线依据 + 复盘归因标准（生成期不打分；“使用规则”节规定 0/1/2 只对人工修改后版本打）"
+      "purpose": "定义源 + 复盘归因标准（生成期不打分；“使用规则”节规定 0/1/2 只对人工修改后版本打；红线条款正文不在本文，见 docs.redline）"
     },
-    "contentStandard": {
-      "name": "度小满-内容标准",
-      "url": "https://kwza968lz1u.feishu.cn/docx/ZdJMd6L1uo7lkwxSgKkcvXawnLc",
-      "purpose": "2026-09-09 起停用（大纲步骤已移除）",
-      "deprecated": true
+    "redline": {
+      "name": "度小满-禁止红线",
+      "url": "https://kwza968lz1u.feishu.cn/docx/OYCIdmjLDoABrrxQ8fGcLxKXnkg",
+      "purpose": "合规红线唯一权威源（一票否决 8 条 A1-A4/B1-B3/E1、计分项 4 条、投放审核口径、白名单登记）。评分标准与两份 SOP 的「第0条合规红线」指向本文——2026-09-18 接入注入链路前从未进入模型上下文。"
     },
     "influencerTypeStandard": {
       "name": "度小满-达人类型基础标准（终版）",
@@ -72,6 +70,20 @@
     }
   },
 
+  "scriptSpec": {
+    "_note": "写稿硬约束口径（时长/字数/字速）——必须与品牌《脚本SOP》「生成期硬约束」节一致，SOP 改口径时同步改这里。2026-09-18 从 prompt 模板移入品牌配置（度小满数值与原硬编码一致，保持不变）。来源：度小满-脚本SOP-非热点「总字数（维度⑥）」节。",
+    "durationRange": "60-90",
+    "wordCountMin": 220,
+    "wordCountMax": 390,
+    "charsPerMinute": "220-260",
+    "moneyWindow": {
+      "_note": "钱要素位置窗（SOP「生成期硬约束 ④」）：钩子类 → {min,max}，单位为「钱要素首字位置 ÷ 全篇口播正文字数」的百分比（%），null=不限。2026-09-20 由秒数改为百分比并移入品牌配置（用户定）——秒数依赖字速假设，且同一套秒数在不同长度脚本上折成的百分比能差 3-4 倍，不自洽。热点线 SOP 只定义 A/B 两档。",
+      "A": { "label": "利益直给型", "min": null, "max": 3 },
+      "B": { "label": "好奇心驱动型", "min": null, "max": 8 },
+      "C": { "label": "情绪冲突型", "min": 8, "max": 16 },
+      "D": { "label": "自证回应型", "min": null, "max": null }
+    }
+  },
   "rolePositions": {
     "_note": "角色定位档位枚举——来自品牌策略库。prompt 模板用 __ROLE_POSITIONS_NONHOTSPOT__ / __ROLE_POSITIONS_HOTSPOT__ 注入。",
     "nonhotspot": ["痛点解药", "过来人工具", "应急安全垫", "被验证的靠谱", "拒绝话术武器", "优等生", "体面方案"],

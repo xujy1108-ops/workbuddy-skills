@@ -3,7 +3,7 @@
 > **当前主流程只有两步**：`directions`（→ `step3_directions.json`）→ `scripts`（→ `step6_scripts.json`）。
 > 下面的 步骤 2 / 步骤 5 是旧流程遗留（大纲步骤已于 2026-09-09 移除），标注为**已停用**，仅用于回溯历史产物。
 
-## 步骤 2: step2_materials.json（已停用，主流程不经过）
+## 步骤 2: step2_materials.json（已停用，主流程不经过；2026-09-17 起历史库退出匹配，无 matched_history）
 
 ```json
 {
@@ -14,14 +14,6 @@
       "content_direction": "内容方向",
       "borrowable_points": "可借鉴点",
       "script_excerpt": "脚本摘要"
-    }
-  ],
-  "matched_history": [
-    {
-      "source": "历史数据库",
-      "script_theme": "脚本主题",
-      "performance": "播放量/点赞量/转化情况",
-      "success_factors": "成功要素提取"
     }
   ],
   "original_creatives": [
@@ -56,13 +48,20 @@
     }
   ],
   "strategy_match": {
-    "hit_rows": [],
+    "matched_strategies": [],
     "excluded_strategies": []
-  }
+  },
+  "skipped_hotspot_strategies": [
+    {
+      "record_id": "recXXX",
+      "skip_reason": "热点素材库为空，跳过蹭热点策略行（禁止凭空编造热点方向）"
+    }
+  ]
 }
 ```
 
-> 输出恰好 5 个方向，其中**蹭热点方向最多 2 个**；`strategy_match` 记录命中的策略行与被职业身份门槛排除的行及原因。
+> 输出恰好 5 个方向，其中**蹭热点方向最多 2 个**；`strategy_match` 记录命中的策略行与被排除的行及原因（**排除依据只有一条：达人一级/二级类型不符**——「适合达人」是或关系，类型命中后不得用年龄/风格/资产/职业二次否决，职业身份已不是门槛）。
+> **热点素材库为空时**（如抓取未跑）：自动跳过全部蹭热点策略行并写入 `skipped_hotspot_strategies`，本次方向全部来自其他方向线，禁止凭空编造热点事件；若命中的策略行全部依赖热点库 → `directions` 为空数组并给出 `message` 提示。
 
 ## 步骤 5: step5_outlines.json（已停用，大纲步骤已移除）
 
@@ -120,7 +119,6 @@
       "material_gap": "素材缺口·打法X（库内无对应档位时填，否则空字符串）",
       "self_check": {
         "hook": "pass",
-        "name_removal": "pass",
         "influencer": "pass",
         "speed": "pass",
         "placement_chain": "pass",
@@ -128,15 +126,32 @@
         "entry_direction": "pass",
         "hotspot_fit": "pass（仅蹭热点线；其他方向线填 n/a）",
         "speakability": "pass",
+        "originality": "pass",
         "redline": "pass",
         "fail_items": []
       },
       "verification": {
         "money_element_sentence": 1,
-        "money_element_second": "约第3秒",
+        "money_element_percent": "全篇前2.4%",
         "word_count": 300,
         "transition_sentences": 2,
         "function_tags": "钩子:权威事件开场 / 承接:政策翻译 / 转折:成本传导 / 植入:合规标杆·四步 / 收尾:合规劝退+人设"
+      },
+      "program_check": {
+        "word_count_with_punct": 429,
+        "word_count_no_punct": 402,
+        "word_count_range": "220-780",
+        "word_count_in_range": true,
+        "model_reported_word_count": 388,
+        "model_word_count_matches": false,
+        "money_element_keyword": "利率",
+        "money_element_sentence": 2,
+        "money_element_percent": 3.2,
+        "money_element_second": 14,
+        "money_window": "全篇前8%（B类）",
+        "money_window_ok": true,
+        "brand_mentions": 3,
+        "issues": []
       },
       "human_revision": null,
       "style_fit_analysis": "脚本如何匹配达人风格的说明（<=80字）"
@@ -152,8 +167,9 @@
 | `compliance_check` | 第 0 条合规红线，**一票否决**：`passed=false` 时列出 `violations`，该稿标记需重写（其余字段照常输出） |
 | `library_picks` | SOP「素材取用流程·产出留痕」的落点：各模块选中的**库内编号＋名称＋命中理由**。须覆盖模块①-⑤；`module="模块④角色定位"` 有且仅有 1 档（非热点线 7 档选 1、热点线 5 档选 1）。理由必须引用创意特征与条目名称的对齐点，禁止"比较合适"式空泛表述 |
 | `material_gap` | SOP「缺口兜底」的落点：库内无对应档位时填「素材缺口·打法X」，有对应档位则留空。**严禁自创公式** |
-| `self_check` | 两份 SOP「四、检验机制」逐项 pass/fail。值只允许 `pass`｜`fail`｜`n/a`（`hotspot_fit` 仅蹭热点线适用）；未过项写进 `fail_items`。**不填分数** |
-| `verification` | 核验行（SOP「生成期硬约束」自证）：钱要素首现位置、总字数、过渡句数、逐句功能标签串。须与脚本实际一致，禁止估算 |
+| `self_check` | 两份 SOP「四、检验机制」逐项 pass/fail。值只允许 `pass`｜`fail`｜`n/a`（`hotspot_fit` 仅蹭热点线适用）；未过项写进 `fail_items`。**不填分数**；`name_removal`（删名测试）已于 2026-09-18 移除。**`originality`**（原创检验，2026-09-19 新增）：与策略行「正向案例原文」逐句比对，判定线＝**连续重合 ≥12 字即算照抄**，只换语气词/改一两个字不算重写，开场句被整段搬用直接 fail。**当前仅为写稿规则（模型自检），尚无程序检测** |
+| `verification` | 核验行（SOP「生成期硬约束」自证）：钱要素首现位置（第几句／全篇前百分之几）、总字数、过渡句数、逐句功能标签串。**由模型自报、不可信**——真值以 `program_check` 为准（实测自报 386-389 字、实际 502-647 字） |
+| `program_check` | **程序复算**（`agents/script_writer.py::_program_check`，2026-09-18 新增）：字数（含/不含标点两口径，对照品牌 config `scriptSpec`）、钱要素首现位置（关键词字符偏移 ÷ 全篇口播正文字数的**百分比**，对照 `scriptSpec.moneyWindow` 的钩子类位置窗；折算秒数只作参考展示）、品牌名出现次数；`issues` 列出全部异常。**翻键规则（2026-09-20 起按异常类型，不再按 issue 文案里的中文关键词匹配）**：字数超区间 → `density`；钱要素缺位／超窗 → `speed`；品牌名 0 次 → `placement_chain`；**模型自报字数与复算不符只记入 `fail_items`、不翻任何键**（模型数不准字数，实测 5/5 误判，翻 density 属错判）。<br>**2026-09-20 口径变更**：判定依据由「秒数」改为「占全篇百分比」——秒数是脚本未配音时按字速折出的推算值，且同一套秒数在长/短稿上折成的百分比能差 3-4 倍（220 字稿 C 类 10-20 秒＝全篇前 18%-36%，780 字稿＝5%-10%）。现档：A ≤3%／B ≤8%／C 8%-16%／D 不限（在 500 字中位稿上与旧秒窗逐档对齐） |
 | `human_revision` | **AI 固定输出 `null`**。人工修改后填写：`expected_score`（8 维度预期分，0-2/维，满分 16）+ `revisions[]`（position 改动位置／nature 改动性质／magnitude 改动幅度）。只记总分无法归因，三要素必填 |
 
 > 编号纪律：`hook_class` / `【模块·打法】`标签沿用**对应 track 的 SOP 模块子编号**（热点线纯序号 1/2/3；非热点线 A1–D2）；库内编号只出现在 `library_picks`。

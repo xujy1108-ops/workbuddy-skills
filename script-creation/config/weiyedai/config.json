@@ -1,91 +1,125 @@
 {
-  "_TODO": "微业贷品牌配置骨架——所有 TODO 字段补齐后才能运行 weiyedai 品牌；结构对齐 config/duxiaoman/config.json",
-
   "brand": "weiyedai",
   "brandName": "微业贷",
-
   "tables": {
     "strategy": {
-      "baseUrl": "TODO_策略表URL(https://<租户>.feishu.cn/base/<base_token>)",
-      "baseToken": "TODO_策略表base_token",
-      "tableId": "TODO_策略表table_id",
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/IxZAbSbnia0i7MsbmVScRcMgnMu?from=from_copylink",
+      "baseToken": "IxZAbSbnia0i7MsbmVScRcMgnMu",
+      "tableId": "tblLiVZkNd8Qz7BG",
       "purpose": "directions 步骤驱动源：达人画像匹配策略行"
     },
     "hotspot": {
-      "baseUrl": "TODO_热点素材表URL",
-      "baseToken": "TODO_热点素材表base_token",
-      "tableId": "TODO_热点素材表table_id",
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/J94ZbL2ZqaQ3SGsPVZecjkganic?from=from_copylink",
+      "baseToken": "J94ZbL2ZqaQ3SGsPVZecjkganic",
+      "tableId": "tblnaKTz7PJsomaF",
       "purpose": "蹭热点线创意方向来源（按素材评分取优）"
     },
     "materials": {
-      "baseUrl": "TODO_网络素材表URL",
-      "baseToken": "TODO_网络素材表base_token",
-      "tableId": "TODO_网络素材表table_id",
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/L58UbSuRJaipUNsu8xWc5PJ9n0b?from=from_copylink",
+      "baseToken": "L58UbSuRJaipUNsu8xWc5PJ9n0b",
+      "tableId": "tbl9HRBms9kcZB0G",
       "purpose": "策略行素材链接ids 反查源；scripts 步骤写稿参照"
     },
     "historyToutiao": {
-      "baseUrl": "TODO_历史库URL（如不使用可留空字符串）",
-      "baseToken": "TODO_历史库base_token",
-      "tableId": "TODO_历史库table_id",
+      "baseUrl": "https://kwza968lz1u.feishu.cn/base/SQrubJVajaGiLls85kTcy3ytn0e?from=from_copylink",
+      "baseToken": "SQrubJVajaGiLls85kTcy3ytn0e",
+      "tableId": "tblH6xcnRVVqnlVb",
       "purpose": "仅 match 旧步骤使用；已退出主流程"
     }
   },
-
   "docs": {
     "_note": "运行时实时拉取，不缓存。拉取失败即报错不降级。",
     "sopHotspot": {
-      "name": "TODO_微业贷-脚本SOP-热点",
-      "url": "TODO_热点SOP文档URL",
-      "purpose": "蹭热点方向写稿依据"
+      "name": "微业贷-脚本SOP-热点 V2",
+      "url": "https://kwza968lz1u.feishu.cn/docx/KsbrdVk5iobKldxvCHGcLVS9nLe?from=from_copylink",
+      "purpose": "蹭热点方向写稿依据（结构与各模块打法选择逻辑）"
     },
     "sopNonhotspot": {
-      "name": "TODO_微业贷-脚本SOP-非热点",
-      "url": "TODO_非热点SOP文档URL",
-      "purpose": "其他方向写稿依据"
+      "name": "微业贷-脚本SOP-非热点 V2",
+      "url": "https://kwza968lz1u.feishu.cn/docx/Rq1WdPzsHonYZyx4gL9cLA2an5d?from=from_copylink",
+      "purpose": "其他方向写稿依据（结构与各模块打法选择逻辑）"
     },
     "libraryHotspot": {
-      "name": "TODO_微业贷-策略库-热点",
-      "url": "TODO_热点策略库文档URL",
-      "purpose": "蹭热点方向语料库"
+      "name": "微业贷-策略库-热点 V2",
+      "url": "https://kwza968lz1u.feishu.cn/docx/FaZhdZ0yooGc31xUaPucoQ8Yn7c?from=from_copylink",
+      "purpose": "蹭热点方向语料库：热点钩子方法库（A–C）／热点承接方法库（A–C）／热点痛点·缺口场景／热点转折、角色定位、收尾、切入方式／热点类型速查／微业贷产品口径速查（话术白名单）"
     },
     "libraryNonhotspot": {
-      "name": "TODO_微业贷-策略库-非热点",
-      "url": "TODO_非热点策略库文档URL",
-      "purpose": "其他方向语料库"
+      "name": "微业贷-策略库-非热点 V2",
+      "url": "https://kwza968lz1u.feishu.cn/docx/QBJKdkUQqoctmPxPzDLcKDALnef?from=from_copylink",
+      "purpose": "其他方向语料库：钩子方法库（A–J 共 10 档）／痛点软肋／转折句式／角色定位／收尾／切入方式／微业贷产品口径速查（话术白名单）"
     },
     "scoringStandard": {
-      "name": "TODO_微业贷-口播脚本评分标准",
-      "url": "TODO_评分标准文档URL",
-      "purpose": "定义源 + 红线依据（生成期不打分）"
+      "name": "微业贷-口播脚本评分标准",
+      "url": "https://kwza968lz1u.feishu.cn/docx/WbNsdIMa4oi4h5xkOPjcpHjWnGf?from=from_copylink",
+      "purpose": "定义源（生成期不打分；红线条款正文不在本文，见 docs.redline）"
     },
-    "contentStandard": {
-      "name": "TODO_内容标准（如已停用可标 deprecated=true）",
-      "url": "",
-      "purpose": "旧步骤依赖，如不使用可留空",
-      "deprecated": true
+    "redline": {
+      "name": "微业贷-禁止红线",
+      "url": "https://kwza968lz1u.feishu.cn/docx/OlHLdNUFuoXgoIxylitcKXo6nDc",
+      "purpose": "合规红线唯一权威源：一~七节（一票否决 10 条细则 A1-A5/B1-B4/E1、计分项 4 条、豁免与判定口径含背书登记、第五节口径表＝产品表述唯一合法来源、第六节投放审核口径）。两份 SOP、两份策略库、评分标准共 5 份文档的「第0条合规红线」全部指向本文——2026-09-18 接入注入链路前，写稿侧只拿得到 SOP 里的一行摘要，红线细则与口径表从未进入模型上下文。"
     },
     "influencerTypeStandard": {
-      "name": "TODO_微业贷-达人类型基础标准",
-      "url": "TODO_达人类型标准文档URL",
+      "name": "微业贷-达人类型基础标准",
+      "url": "https://kwza968lz1u.feishu.cn/docx/GzOidpMLdo9hYzxPQNKc1a2Hn5d?from=from_copylink",
       "localCopy": "config/<brand>/references/influencer-type-standard.md",
       "purpose": "达人类型判定的唯一合法枚举来源"
     }
   },
-
+  "scriptSpec": {
+      "_note": "写稿硬约束口径（时长/字数/字速）——必须与品牌《脚本SOP》「生成期硬约束」节一致，SOP 改口径时同步改这里。2026-09-19 下限放宽（用户定）：总时长下限 90→60 秒、字数下限 330→220 字（=60 秒 × 220 字/分，字速不变）；上限维持 180 秒 / 780 字。已同步改《微业贷-脚本SOP-非热点》《微业贷-脚本SOP-热点》各 3 处与《微业贷-口播脚本评分标准》2 处。历史：2026-09-18 上限放宽 120→180 秒、520→780 字；同日从 prompt 模板移入品牌配置，此前 prompt 硬编码度小满口径（60-90s/220-390字）导致写稿目标本身即错。来源：微业贷-脚本SOP-非热点 V2「总字数（维度⑥）」节。",
+      "durationRange": "60-180",
+      "wordCountMin": 220,
+      "wordCountMax": 780,
+      "charsPerMinute": "220-260",
+      "moneyWindow": {
+        "_note": "钱要素位置窗（SOP「生成期硬约束 ④」）：钩子类 → {min,max}，单位为「钱要素首字位置 ÷ 全篇口播正文字数」的百分比（%），null=不限。2026-09-20 由秒数改为百分比并移入品牌配置（用户定）——秒数依赖字速假设，且同一套秒数在不同长度脚本上折成的百分比能差 3-4 倍（220 字稿 C 类 10-20 秒＝18%-36%，780 字稿＝5%-10%），不自洽。热点线 SOP 只定义 A/B 两档。",
+        "A": { "label": "利益直给型", "min": null, "max": 3 },
+        "B": { "label": "好奇心驱动型", "min": null, "max": 8 },
+        "C": { "label": "情绪冲突型", "min": 8, "max": 16 },
+        "D": { "label": "自证回应型", "min": null, "max": null }
+      }
+    },
   "rolePositions": {
-    "_note": "角色定位档位枚举——必须从微业贷策略库的「角色定位方法库」实际档位导出，换品牌时必须重导。",
-    "nonhotspot": [],
-    "hotspot": []
+    "_note": "角色定位档位枚举——与微业贷策略库 V2（config.docs.libraryHotspot/libraryNonhotspot，2026-09-18 修订）逐档对齐。prompt 模板用 __ROLE_POSITIONS_NONHOTSPOT__ / __ROLE_POSITIONS_HOTSPOT__ 注入。2026-09-18 修订：hotspot 删除「国家队合作伙伴」（微众银行无赛事赞助权益，红线B3）与「普通人低息入口」，对齐 SOP-热点 V2 的 5 档；nonhotspot 追加「官方直连」（对应策略库新增档）。2026-09-17 的度小满品牌名问题已在 V2 文档中修复。",
+    "nonhotspot": [
+      "痛点解药",
+      "过来人工具",
+      "应急安全垫",
+      "被验证的靠谱",
+      "拒绝话术武器",
+      "优等生",
+      "体面方案",
+      "官方直连"
+    ],
+    "hotspot": [
+      "合规标杆",
+      "持牌银行背书",
+      "缺口补充工具",
+      "政策响应者",
+      "小微企业主资金入口"
+    ]
   },
-
   "influencerTypeStandardMap": {
-    "_TODO": "微业贷达人类型标准的**结构化**版本（一级类型 → 二级类型列表），供代码做枚举合法性校验。必须与 promptVars.influencerTypeEnum 的文本枚举同源，不可照抄 duxiaoman。",
-    "TODO_一级类型": []
+    "_note": "微业贷达人类型标准的**结构化**版本，供代码做枚举合法性校验（TYPE_STANDARD）。必须与 promptVars.influencerTypeEnum 的文本枚举同源，改一处要同步另一处。导出自 docs.influencerTypeStandard 文档（2026-09-17，revision 13）：4 大类 6 二级，与度小满不同（无高价值/剧情搞笑/三农，新增科普）。",
+    "财经": [
+      "泛财经",
+      "小微企业主"
+    ],
+    "生活": [
+      "民生",
+      "人文杂谈"
+    ],
+    "科普": [
+      "知识科普"
+    ],
+    "剧情": [
+      "常规剧情"
+    ]
   },
-
   "promptVars": {
-    "_note": "达人类型枚举与参考锚点必须从微业贷达人类型标准导出，不可照抄 duxiaoman。",
-    "influencerTypeEnum": "TODO_达人类型枚举文本（一级/二级类型 + 范围限定）",
-    "influencerTypeReferenceAnchors": "TODO_参考锚点（各类型的示例达人账号）"
+    "_note": "达人类型枚举与参考锚点从微业贷达人类型基础标准（config.docs.influencerTypeStandard）导出，不可照抄 duxiaoman。",
+    "influencerTypeEnum": "### 财经\n- 泛财经：商业故事、个人财富、消费决策、搞钱思路、时政要闻、国内外热点等所有与\"金钱\"\"财富\"\"商业活动\"相关的点评，输出观点；**军事点评也算入泛财经**；方向可垂直，但不涉及股票、金银等投资；方向也可以很广，任何时事要闻、小道新闻都要表达看法\n- 小微企业主：自己必须是老板/合伙人，有自己的公司和业务；日常分析自己公司产业看法、吐槽或点评创业中遇到的事情；每天创业 vlog 等\n\n### 生活\n- 民生：选题全部来自\"普通人正在经历、但自己说不清楚\"的事，不追专业议程（不讲货币政策本身），只抓大众体感（钱变难赚了、婚不敢结了、学历不值钱了）；落点永远是\"你个人怎么办\"，不是\"宏观怎么看\"，宏观事件只当引子，三句话内必然折到个人决策（怎么花钱、怎么签字、怎么选）；话题自带阶层站位（站普通打工人一边，\"为老百姓说话\"的姿态贯穿）；经济落点占比≥60%（近20条作品折到\"我的钱/我的决策\"五簇之一：钱袋安全/消费收入/人生阶段经济账/宏观民生翻译/借钱）；价值落点=个人金钱决策，看完能回答\"我的钱怎么办\"；人设=平视过来人，有可验证的平民经历叙事，无权威身份包装\n- 人文杂谈：选题源是\"人活不明白\"的困惑（被拿捏、被套话、被挤兑、内耗、看不透人情世故、想不通为什么），钱只是偶发话题无连续主线；落点是个人人际/认知决策（\"下次遇到这种人就这么办\"的处世方法论，或\"哦原来如此\"的认知消遣），非金钱动作；站位无阶层对抗性（阅历权威俯视半级，或说书人市井平视旁观）；关键检验：观众对该账号无\"金钱托付感\"\n\n### 科普\n- 知识科普：选题源是知识议程——学科世界里反直觉、未解或冷门的问题（河流为什么是弯的、地球内部结构怎么知道的），标题天然是\"为什么X\"\"X是怎么回事\"的知识问句；既不来自观众生活困惑，也不追社会热点；落点是纯认知增量（\"哦原来如此\"），无金钱决策、无人际方法论、无情绪站队；站位=知识权威（善意的俯视），讲解员/老师姿态，靠\"讲得清楚\"建立信任，不靠个人经历，无阶层、地域、阵营叙事；知识问句选题占比≥60%（近30条标题为\"为什么X\"式且知识本身是主角——用知识给生活决策做注脚的往泛财经/民生走）；人设=知识权威/讲解员，无可验证的\"过来人\"生活叙事\n\n### 剧情\n- 常规剧情：1 分钟以上；多人（非一人分饰多角）、多人物参与演出；多场景讲述剧情；有人物关系、叙事结构（剧情梗概）、核心冲突；有完整的人物背景、故事起因、发展、高潮、结束/转折；叙事推进环环相扣，没有很突兀的故事转折，可以是直叙、倒叙、插叙等",
+    "influencerTypeReferenceAnchors": "财经-泛财经（商业小纸条real、直言财经、达哥有点味）、财经-小微企业主（乡村大宁、豫游纪高公璞、包工头才哥）、生活-民生（萌叔的小酒馆、朴素之道、刘雯）、生活-人文杂谈（涵浪、万能春秋、赵大湿）、科普-知识科普（李论科学、直男财经、无穷小亮的科普日常）、剧情-常规剧情（帅大斌的一天、三根葱、刘老二）"
   }
 }
