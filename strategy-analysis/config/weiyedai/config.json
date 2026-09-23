@@ -1,0 +1,24 @@
+{
+  "brand": "weiyedai",
+  "brandName": "微业贷",
+  "_note": "微业贷策略表（2026-09-17 建）：字段与度小满表同名同结构（内容方向一/二、内容一方向定义、植入策略、策略等级、适合达人、正向案例、素材链接ids）。",
+  "strategyTable": {
+    "baseToken": "IxZAbSbnia0i7MsbmVScRcMgnMu",
+    "tableId": "tblLiVZkNd8Qz7BG",
+    "baseUrl": "https://kwza968lz1u.feishu.cn/base/IxZAbSbnia0i7MsbmVScRcMgnMu?table=tblLiVZkNd8Qz7BG",
+    "label": "微业贷-内容策略表",
+    "excludeL1": []
+  },
+  "levelForNewStrategy": "X",
+  "rowLimit": 200,
+  "ai": {
+    "defaultModel": "doubao-seed-2-1-pro",
+    "timeoutSec": 60,
+    "temperature": 0.1,
+    "maxTokens": 512
+  },
+  "fallback": {
+    "strategies": [],
+    "directionEnums": ""
+  }
+}
