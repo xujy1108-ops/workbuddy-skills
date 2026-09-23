@@ -29,6 +29,22 @@
       "tone_and_emotion": "string — 语气与情绪基调，<=20字",
       "visual_symbols": "string — 标志性视觉/听觉元素，<=50字",
       "style_tags": ["string — 开放式风格标签，2-4个"]
+    },
+    "authority_profile": {
+      "available": "bool — 大V判定是否成功产出（false 时仅有粉丝/认证数据）",
+      "is_big_v": "bool — 是否大V：阅历型权威四特征全命中 AND 粉丝>100万（双条件硬门槛）",
+      "tier": "string — 头部大V(>500万)|标准大V(100-500万)|中腰部阅历型|内容能力型",
+      "authority_source": "string — 阅历身份型|内容能力型",
+      "follower_count": "int|null — 真实粉丝数（handler_user_profile 端点，失败为 null）",
+      "verification": "string — 认证信息（个人认证优先，无则空串）",
+      "traits": {
+        "age_35_50": "dict — {hit: bool, evidence: str<=40字}；程序解析 age_range 优先",
+        "narratable_experience": "dict — 可叙述阅历资历（军旅/创业/企业主/媒体/学界，失败经历也算）",
+        "oral_opinion_form": "dict — 口播观点形态（非剧情/图文/vlog）",
+        "mentor_relationship": "dict — 观众仰视导师关系"
+      },
+      "confidence": "string — high|medium|low（粉丝未知=low）",
+      "note": "string — 判定结论说明，<=60字"
     }
   },
   "audience_insight": {
@@ -178,6 +194,8 @@
 | basic_positioning.influencer_demographic.verbal_pace | 45 字 |
 | basic_positioning.influencer_demographic.tone_and_emotion | 20 字 |
 | basic_positioning.influencer_demographic.visual_symbols | 50 字 |
+| basic_positioning.authority_profile.note | 60 字 |
+| basic_positioning.authority_profile.traits.*.evidence | 40 字 |
 | audience_insight.demographic | 20 字 |
 | audience_insight.psychological_needs | 50 字 |
 
@@ -187,3 +205,5 @@
 |------|----------|
 | basic_positioning.content_tracks | 3 |
 | basic_positioning.influencer_demographic.style_tags | 4 |
+
+> 注：`authority_profile` 的 note（60字）与 traits 各 evidence（40字）在 `_build_authority_profile()` 组装时用同一 `_smart_truncate()` 程序截断，不走 `_compact_result()` 的字段清单（traits 键名是动态的）。

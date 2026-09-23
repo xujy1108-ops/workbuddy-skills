@@ -1,6 +1,6 @@
 ---
 name: influencer-style-analysis
-description: "达人风格识别技能。通过抖音主页链接或 sec_user_id，经 TikHub API 拉取达人数据（简介、视频列表），筛选视频并使用千问多模态大模型直接看视频分析达人风格，输出包含基础定位（含达人自身画像）、受众洞察的结构化 JSON。当用户提到达人分析、达人风格、风格识别、创作者风格、达人画像、influencer profiler 等关键词时触发此技能。"
+description: "达人风格识别技能。通过抖音主页链接或 sec_user_id，经 TikHub API 拉取达人数据（简介、视频列表），按点赞Top5+时长筛选选出视频，用千问多模态大模型直接看视频分析达人风格，输出包含基础定位（含达人自身画像）、叙事骨架、受众洞察、爆款商单分析的结构化 JSON。当用户提到达人分析、达人风格、风格识别、创作者风格、达人画像、influencer profiler 等关键词时触发此技能。"
 agent_created: true
 ---
 
@@ -19,36 +19,57 @@ agent_created: true
 Step 0 询问人工补充（达人职业 / 资产层次 / 其他补充，可全部留空）
     │
     ▼
-TikHub API 拉取达人作品列表
+TikHub API 拉取达人作品列表（固定最近 20 条；play_count 恒为 0，热度排序用点赞数）
     ├── bio（达人简介）
     ├── author_nickname（达人昵称）
+    ├── user_profile（粉丝量级 + 认证，走 handler_user_profile 端点）
     └── aweme_list（作品列表）
     │
     ▼
-视频筛选
-    ├── 筛选 video.play_addr.data_size 存在的作品
-    ├── 按 data_size 升序排序
-    ├── 取前 2 个（不足则有几个选几个）
-    └── 从 url_list 中选 api.amemv.com 域名链接（兜底取最后一个）
+视频选样（2026-09-21 规则）
+    ├── 全部作品按点赞数降序 → Top5
+    ├── Top5 中筛时长 < 10 分钟 → 按排名取前 2 个做多模态分析
+    └── Top5 全部 ≥ 10 分钟 → UnfitInfluencerError（达人不适合本次投放：视频太长）
     │
     ▼
-千问多模态 LLM 分析（逐个视频，方案A）
+千问多模态 LLM 分析（逐个视频，失败跳过）
     ├── 看视频：口吻、语气、语速节奏、情绪、画面风格、视觉元素、达人外貌/年龄/穿搭
+    ├── 叙事骨架：前3秒钩子类型、开场/中段/收尾三段结构、母题、情绪、商业信号
     └── 读文本：bio → 人设定位、职业身份、资产层次
     │
     ▼
 LLM 二次合并（多视频时）
-    └── 综合多次分析结果 → 归纳最终风格画像
+    ├── 综合多次分析结果 → 归纳最终风格画像
+    └── 叙事骨架归并（skeleton_mode 枚举 + 母题谱系 + 多视频共现钩子模式；禁标题推断）
+    │
+    ▼
+爆款商单附加分析（星图链路，失败不影响主流程）
+    ├── sec_user_id → 星图 kol_id（get_xingtu_kolid_by_sec_user_id）
+    ├── kol_id → 最近 15 条星图商单（kol_video_performance_v1, onlyAssign=true）
+    ├── 取播放量最高的 1 条 → aweme_id 换播放地址（fetch_one_video_v3）
+    └── 多模态分析商单视频 → top_ad_video 字段；无商单则跳过
     │
     ▼
 人工补充强制覆盖（occupation / asset_level / other；留空则保持模型推断）
     │
     ▼
-JSON 输出（2 大维度）
-    ├── basic_positioning（基础定位 + 达人自身画像）
+大V（阅历型权威）判定（2026-09-21 新增，附加产出，失败降级）
+    ├── 数据源：user_profile.follower_count（>100万硬门槛）+ 认证信息
+    ├── LLM 判四特征：中年(35-50)/可叙述阅历资历/口播观点形态/观众仰视导师关系
+    ├── 程序化计算 tier（头部大V>500万｜标准大V 100-500万｜中腰部阅历型｜内容能力型）
+    └── 输出 basic_positioning.authority_profile（is_big_v/tier/traits/evidence/confidence）
+    │
+    ▼
+JSON 输出（4 大模块）
+    ├── basic_positioning（基础定位 + 达人自身画像 + authority_profile 大V判定）
     │   ├── nickname, influencer_type, core_persona, content_tracks[]
-    │   └── influencer_demographic（年龄/性别/职业/career_identity职业身份核实/外貌/讲话/资产/语速/情绪/视觉/标签）
-    └── audience_insight（受众洞察）
+    │   ├── influencer_demographic（年龄/性别/职业/career_identity职业身份核实/外貌/讲话/资产/语速/情绪/视觉/标签）
+    │   └── authority_profile（is_big_v/tier/authority_source/follower_count/traits四特征/confidence）
+    ├── narrative_skeleton（叙事骨架）
+    │   └── skeleton_mode枚举/开场/转折/收尾/motif_spectrum母题谱系/hit_hook_patterns共现钩子模式/emotion
+    ├── audience_insight（受众洞察）
+    └── top_ad_video（爆款商单分析，可空）
+        └── 商单数据（播放/点赞/日期）+ 视频分析（钩子/骨架/植入方式/原生化程度）
 ```
 
 ## 触发条件
@@ -121,16 +142,47 @@ JSON 输出（2 大维度）
 
 **前置条件**：需配置 `TIKHUB_API_TOKEN` 环境变量。
 
-### Step 3: 视频筛选
+### Step 3: 视频选样（2026-09-21 规则）
 
-在 `parse_influencer_bundle()` 中执行筛选逻辑：
+在 `parse_influencer_bundle()` 中执行：
 
-1. 遍历 `aweme_list`，筛选 `video.play_addr.data_size` 字段存在且 > 0 的作品
-2. 按 `data_size` **升序**排序（小文件优先，减少大模型处理时间）
-3. 取前 2 个；不足 2 个则有几个选几个
-4. 对每个作品，从 `video.play_addr.url_list` 中选取域名为 `api.amemv.com` 的链接
-5. 找不到 `api.amemv.com` 时，取 `url_list` 最后一个链接兜底
-6. **筛选结果为 0 个时，中断流程**，提示用户"没有可以分析的视频"
+1. 拉取达人最近 20 条作品（端点实测仅支持 count=20，传其他值 400）
+2. 全部作品按 `statistics.digg_count`（点赞）降序排序，取 Top5
+   - 注意：该端点 `statistics.play_count` 恒为 0（抖音不公开播放数），无法按播放量排序
+3. Top5 中筛选时长 < 10 分钟的视频，按排名取前 2 个做多模态分析
+4. **Top5 全部 ≥ 10 分钟时抛 `UnfitInfluencerError`**，报"该达人不适合本次投放：视频太长"，流程中止
+5. 时长缺失（duration=0）的视频视为不合格，不参与选中
+6. 对每个选中作品，从 `video.play_addr.url_list` 中选取域名为 `api.amemv.com` 的链接（找不到则取最后一个兜底）
+
+### Step 3.5: 爆款商单附加分析（星图链路）
+
+主流程输出后，通过 TikHub 星图接口附加 `top_ad_video` 字段（**任何环节失败只降级不报错，不影响主流程**）：
+
+1. `get_xingtu_kolid_by_sec_user_id`：sec_user_id → 星图 kol_id（未注册星图返回 None，跳过）
+2. `kol_video_performance_v1`（onlyAssign=true）：kol_id → `latest_star_item_info` = 最近 15 条星图商单（含真实播放量/点赞/时长/日期）
+3. 取播放量最高的 1 条 → `fetch_one_video_v3`（aweme_id 换播放地址）
+4. 千问多模态分析商单视频：钩子类型、三段骨架、植入方式、内容母题、品牌口播信号、广告原生化程度
+5. 无商单 / 未取到播放地址 / 分析失败 → `top_ad_video.available=false` + 原因说明
+
+**成本**：星图链路每次分析约 +0.021$（kol_id 查询 + 商单列表 0.02$）+ 1 次视频分析；大V判定 +1 次用户信息接口 + 1 次文本 LLM 调用（约几千 token，成本可忽略）。
+
+### Step 3.6: 大V（阅历型权威）判定
+
+主分析产出后，附加 `basic_positioning.authority_profile`（**失败降级不报错，不影响主流程**）：
+
+1. **数据源**：`fetch_user_profile_info()`（`/api/v1/douyin/web/handler_user_profile`）拉取 `follower_count`（真实粉丝数）+ 认证（`custom_verify` 个人认证 / `enterprise_verify_reason` 企业认证）。注意：作品列表端点的 author 对象**不含** follower_count，必须走此端点；接口失败 → 粉丝未知 → confidence=low，不确认大V
+2. **LLM 判四特征**（一次文本调用，输入为主分析 JSON 紧凑子集 + bio + 粉丝/认证）：
+   - `age_35_50`：中年（35-50 岁）——程序解析 `age_range` 优先（区间与 [35,50] 重叠 ≥3 年），LLM 兜底
+   - `narratable_experience`：可叙述阅历资历（军旅/创业/企业主/媒体/学界/从业年限，失败经历也算；自我否认不构成否定）
+   - `oral_opinion_form`：口播观点形态（非剧情/非图文/非vlog）
+   - `mentor_relationship`：观众仰视导师关系（区别于闺蜜安利/平视）
+   - 人工补充职业 → `narratable_experience` 强制命中（人工优先）
+3. **程序化计算**（纯规则，可单测，`tests/test_authority.py`）：
+   - 四特征全命中 → `authority_source = 阅历身份型`（大V 形态成立）
+   - **`is_big_v` = 阅历身份型 AND 粉丝 > 100 万**（用户 2026-09-21 定硬门槛，大宽哥 103 万校准；崔校长 81 万 → 形态成立但量级不足）
+   - `tier` 枚举：`头部大V`（>500万）｜`标准大V`（100-500万）｜`中腰部阅历型`（形态成立量级不足）｜`内容能力型`（无阅历证据，如达哥）
+4. **confidence**：粉丝未知=low；阅历型成立且 career_identity 有明确证据=high；其余=medium
+5. **消费含义**：is_big_v=true 可承接权威叙事型策略（专家背书/政策解读/权威拆解）；内容能力型走认知差/拆解型策略，权威类策略对其打折
 
 ### Step 4: 千问多模态 LLM 分析
 
@@ -140,18 +192,23 @@ JSON 输出（2 大维度）
 - **API 地址**：`https://api.inferera.com/v1/chat/completions`
 - **输入**：系统 prompt（风格分析指令）+ 用户文本（bio + nickname）+ video_url
 - **参数**：max_tokens=8192, temperature=0.3, timeout=300s
-- **分析维度**（2 大模块）：
+- **分析维度**（3 大模块）：
   - **基础定位**：人设一句话、核心赛道、达人类型（格式"一级-二级"，依据《达人类型基础标准（终版）》，无匹配输出"无匹配-需补充"）；下属 `influencer_demographic` 子对象提取达人自身画像（年龄/性别/职业/外貌/讲话风格/资产层次/语速/情绪/视觉符号/风格标签）。
   - **career_identity（职业身份核实，下游 script-creation 策略匹配的硬门槛）**：status（有明确证据=bio自述或口述明确提及职业/经营/从业经历；有间接线索=仅画面场景推断；无法判断=均无信息）+ description（职业经历描述，无证据写'未发现'）+ evidence（判定依据）。禁止编造，宁可'无法判断'不可拔高
+  - **narrative_skeleton（叙事骨架，2026-09-21 新增）**：hook_type（前3秒钩子类型，必须基于视频实际开头）、开场/中段转折/收尾三段结构、motifs（内容母题1-3个）、emotion（情绪基调）、commercial_signals（品牌口播/推销信号，区分硬广与自然提及）
   - **受众洞察**：人口统计特征、心理诉求
 
-**逐个视频调用（方案A）**：遍历选出的视频 URL，逐个调用大模型分析。全部成功后通过 LLM 二次合并为最终结果。单个失败则跳过继续，全部失败则报错中止。
+**逐视频调用（方案A）**：遍历选出的视频 URL，逐个调用大模型分析。全部成功后通过 LLM 二次合并为最终结果。单个失败则跳过继续，全部失败则报错中止。
+
+**合并规则（narrative_skeleton）**：合并时 skeleton_mode 从枚举（反常识结论前置/悬念递进/故事化叙事/数据实证/场景剧情/盘点清单）选最主要 1 个；hit_hook_patterns 只收多视频共现的钩子模式（≥2 个视频出现同一模式），**禁止从标题/简介文本推断**（2026-09-21 教训：标题推断出的"时效性强"共性证据等级低，曾误导下游热点嫁接规则）。
 
 ### Step 5: 输出 JSON
 
 LLM 输出 JSON，经 `_ensure_complete_json()` 校验完整性 + `_compact_result()` 硬截断超长字段后返回。
 
 输出结构详见 `references/json-schema.md`。
+
+**下游技能消费本技能输出时，必读 `references/output-schema.md`（输出数据使用指南）**：完整字段清单、枚举值、异常降级分支（如"视频太长不适合投放"）、数据口径须知（非商单视频无真实播放量、hit_hook_patterns 仅收视频级共现证据等）。该指南为一次性固定文档，schema 变更时才更新。
 
 ## 代码结构
 
@@ -240,11 +297,11 @@ python _run_with_manual.py --url "https://www.douyin.com/user/MS4w..."
 | `--occupation` | 人工补充：达人职业 |
 | `--asset-level` | 人工补充：资产层次 |
 | `--other` | 人工补充：其他补充 |
-| `--candidates` | 拉取候选视频数，默认 5（多拉是为规避千问内容审核拦截） |
+| `--candidates` | （已废弃）选样规则固定为 点赞Top5→时长筛选→前2个，此参数仅兼容保留 |
 | `--target` | 成功分析目标数，默认 2 |
 | `--out` | 输出路径，默认 `analysis_result_manual_<日期>.json` |
 
-脚本内部流程：多拉候选视频 → 逐个分析、失败跳过、凑够 target 个即停 → LLM 二次合并 → 人工补充程序化强制覆盖 → 落盘 JSON。
+脚本内部流程：按选样规则取视频 → 逐个分析、失败跳过、凑够 target 个即停 → LLM 二次合并 → 星图商单附加分析（top_ad_video）→ 人工补充程序化强制覆盖 → 落盘 JSON。
 
 ## 分析设计原则
 
@@ -267,11 +324,13 @@ python _run_with_manual.py --url "https://www.douyin.com/user/MS4w..."
 ## 注意事项
 
 - **带人工补充信息一律走 `scripts/_run_with_manual.py`**：它是唯一支持 `--occupation/--asset-level/--other` 的入口，跑完自动执行人工补充强制覆盖；直接调 `run_influencer_profiler()` 需要自己按 Step 1 的 JSON 结构传 `manual_supplement`
-- **千问内容审核拦截（data_inspection_failed）**：qwen3-vl-plus 对个别视频会报 `400 InternalError.Algo.DataInspectionFailed`，默认"最小2个视频"可能全被拦截。处理方式：用 `--candidates 5` 多取候选，逐个分析、失败跳过、成功 2 个即停（`_run_with_manual.py` 与 `scripts/_run_analysis_retry.py` 均已内置该逻辑）
+- **达人不适合投放的判定**：点赞 Top5 视频时长全部 ≥10 分钟时抛 `UnfitInfluencerError`（如口播长视频达人），这是用户 2026-09-21 定的硬规则，提示"达人不适合本次投放：视频太长"
+- **大V判定是形态判断不含善恶**：劣迹/品牌风险（如刘雯式封禁败诉史）不进 authority_profile，走 manual_supplement 人工补充；粉丝量级是硬门槛（>100万），量级不足但四特征命中 → 中腰部阅历型（权威类策略打折而非禁用）
+- **大V判定附加产出，失败降级**：用户信息接口失败（粉丝未知）或 LLM 特征判定失败 → `authority_profile.available=false` + note，主流程正常输出其余字段
+- **千问内容审核拦截（data_inspection_failed）**：qwen3-vl-plus 对个别视频会报 `400 InternalError.Algo.DataInspectionFailed`。处理方式：逐个分析、失败跳过、成功 2 个即停（`_run_with_manual.py` 已内置该逻辑）
 - **勿复用 scripts 目录下的 analysis_result*.json 旧缓存**：这些是历史分析残留，可能是其他达人的结果，每次分析以本次运行输出为准
-- TikHub API 有调用频率限制，注意控速
-- 视频筛选按 `data_size` 升序排列，优先分析小文件以减少处理时间
-- 视频链接优先选 `api.amemv.com` 域名，该域名通常稳定可访问
+- TikHub API 有调用频率限制，注意控速；星图接口（kol_video_performance_v1）收费 0.02$/次
+- 星图商单分析是附加产出，`top_ad_video.available=false` 时附原因（未注册星图/无商单/接口异常），不影响主流程
 - 所有视频分析均失败时直接报错中止，不做文本兜底
 - 各字符串和数组字段有硬限制，超长按**标点感知**方式截断（回退到最近标点，不会拦腰切句；无标点可用时补 `…`），详见 `references/json-schema.md`
 - 需要配置的 API Key：`TIKHUB_API_TOKEN`、`ANTHROPIC_API_KEY`（或 `VIDEO_API_KEY`）

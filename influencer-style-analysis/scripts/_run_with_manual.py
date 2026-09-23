@@ -1,7 +1,10 @@
 """带人工补充信息的达人分析 runner。
 
 特性：
-- 多拉候选视频（规避千问内容审核拦截），逐个分析、失败跳过、凑够 target 个即停
+- 选样规则（2026-09-21 定）：作品按点赞排序取 Top5 → 筛时长 <10 分钟 → 按排名取前 2 个做多模态分析；
+  Top5 全部 ≥10 分钟则报 UnfitInfluencerError（达人不适合本次投放：视频太长）
+- 附加产出 top_ad_video：经星图接口取最近 15 条商单中播放量最高的一条做多模态分析（无商单跳过）
+- 逐视频分析、失败跳过、凑够 target 个即停
 - 人工补充（达人职业 / 资产层次 / 其他补充）程序化强制覆盖最终产出
 
 用法：
@@ -27,6 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agents.influencer_profiler import (  # noqa: E402
     _analyze_one_video,
     _apply_manual_supplement,
+    _attach_authority_profile,
+    _attach_top_ad_video,
     _build_text_payload,
     _merge_multiple_analyses,
 )
@@ -50,7 +55,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="人工补充：其他补充（拍摄方式/出镜人数/机位/身份背景等非前两项的内容）",
     )
 
-    p.add_argument("--candidates", type=int, default=5, help="拉取候选视频数，默认 5")
+    p.add_argument("--candidates", type=int, default=2, help="（已废弃）选样规则固定为 点赞Top5→时长筛选→前2个，此参数仅兼容保留")
     p.add_argument("--target", type=int, default=2, help="成功分析目标数，默认 2")
     p.add_argument("--out", default="", help="输出 JSON 路径，默认 analysis_result_manual_<日期>.json")
     return p.parse_args(argv)
@@ -79,6 +84,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"昵称: {bundle.get('author_nickname')}")
     print(f"简介: {(bundle.get('bio') or '')[:120]}")
     print(f"候选视频: {bundle.get('video_count')} 个")
+    user_profile = bundle.get("user_profile") or {}
+    if user_profile.get("follower_count") is not None:
+        print(f"粉丝量级: {user_profile['follower_count']:,}")
+    else:
+        print(f"粉丝量级: 未知（{user_profile.get('note', '')[:50]}）")
 
     video_urls = bundle.get("video_urls") or []
     if not video_urls:
@@ -90,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         "sec_user_id": args.sec_user_id or "",
         "bio": bundle.get("bio") or "",
         "video_urls": video_urls,
+        "user_profile": user_profile,
         "manual_supplement": manual,
         "_tikhub_meta": {
             "sec_user_id": bundle.get("sec_user_id"),
@@ -131,6 +142,21 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     final = _apply_manual_supplement(final, manual)
+
+    # 4. 大V（阅历型权威）判定：粉丝硬门槛 >100万 + 四特征，附加 authority_profile
+    print("大V判定（阅历型权威四特征 + 粉丝量级）...")
+    final = _attach_authority_profile(final, data)
+    ap = ((json.loads(final.text).get("basic_positioning") or {}).get("authority_profile")) or {}
+    print(
+        f"  大V判定: available={ap.get('available')} | tier={ap.get('tier')} | "
+        f"is_big_v={ap.get('is_big_v')} | 粉丝={ap.get('follower_count')}"
+    )
+
+    # 5. 爆款商单附加分析（星图链路，失败自动降级不影响主产出）
+    print("爆款商单分析（星图链路）...")
+    final = _attach_top_ad_video(final, data)
+    ad = json.loads(final.text).get("top_ad_video") or {}
+    print(f"  商单分析: available={ad.get('available')} | {ad.get('note', '')[:60]}")
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(json.loads(final.text), f, ensure_ascii=False, indent=2)

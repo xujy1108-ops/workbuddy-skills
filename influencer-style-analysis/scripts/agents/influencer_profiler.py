@@ -4,15 +4,35 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 from agents.base import AgentResult, AgentSpec
 from providers.multimodal import run_text_analysis, run_video_analysis
-from tools.tikhub import fetch_influencer_from_douyin
+from tools.tikhub import (
+    fetch_best_star_item,
+    fetch_influencer_from_douyin,
+    fetch_video_play_url,
+)
 
 logger = logging.getLogger(__name__)
+
+# ── 大V（阅历型权威）判定参数（2026-09-21 与用户共创定稿）──────────
+# 定义：大V = 阅历型权威，四必要特征全命中 + 粉丝量级 > 100 万（用户定硬门槛）
+# 四特征：中年(35-50) / 可叙述阅历资历 / 口播观点形态 / 观众仰视导师关系
+_AUTHORITY_AGE_LO = 35
+_AUTHORITY_AGE_HI = 50
+_AUTHORITY_AGE_MIN_OVERLAP = 3  # 年龄区间与[35,50]至少重叠3年才算命中
+_BIG_V_FOLLOWER_GATE = 1_000_000  # 大V 粉丝硬门槛（严格大于，用户 2026-09-21 定）
+_HEAD_V_FOLLOWER = 5_000_000  # 头部大V 量级线
+_AUTHORITY_TRAITS = (
+    "age_35_50",
+    "narratable_experience",
+    "oral_opinion_form",
+    "mentor_relationship",
+)
 
 # ── 系统 Prompt ──────────────────────────────────────────────
 
@@ -34,7 +54,8 @@ _SYSTEM_PROMPT = """# Role
    - `occupation`（达人职业）：原样采纳为职业身份，不得改写、不得用画面推断结果覆盖
    - `asset_level`（资产层次）：原样采纳，不得改写
    - `other`（其他补充）：其中与达人呈现相关的内容（如拍摄方式、出镜人数、机位、是否双人共说台词等）**必须体现在 `visual_symbols`、`appearance`、`speech_style` 等相应字段中**
-8. **严格遵循格式**：输出必须且只能是一个合法的 JSON 对象，严格遵循下方的 `_OUTPUT_SCHEMA`，不要输出任何额外的解释性文字。
+8. **叙事骨架必须基于视频实际内容**：narrative_skeleton 中的 hook_type 必须来自视频真实前 3 秒，不得套模板；commercial_signals 要区分"硬广口播"与"内容自然提及"
+9. **严格遵循格式**：输出必须且只能是一个合法的 JSON 对象，严格遵循下方的 `_OUTPUT_SCHEMA`，不要输出任何额外的解释性文字。
 
 # 达人类型标准列表（判定 influencer_type 必须从此表选取，不得自创；无匹配则输出"无匹配-需补充"）
 
@@ -86,6 +107,18 @@ _SYSTEM_PROMPT = """# Role
       ]
     }
   },
+  "narrative_skeleton": {
+    "hook_type": "开场前3秒钩子类型，短语（如：反常识结论前置/提问式悬念/冲突事件直入/数据冲击），必须基于视频实际开头，<=15字",
+    "opening": "开场策略一句话，<=25字",
+    "turn": "中段推进/转折方式一句话，<=25字",
+    "ending": "收尾方式一句话（含是否给结论/建议），<=25字",
+    "motifs": [
+      "这条视频打的主题母题1（如：认知差/防坑/时局解读）",
+      "主题母题2"
+    ],
+    "emotion": "整体情绪基调，3-8字",
+    "commercial_signals": "视频中品牌口播/产品推销/利益点引导，有则摘录关键词并注明是硬广还是自然提及，无则写'无'，<=50字"
+  },
   "audience_insight": {
     "demographic": "人口统计学特征，如'25-45岁一二线男性'，<=20字",
     "psychological_needs": "受众心理诉求与痛点，如'渴望专业解读以获取社交谈资，缓解信息焦虑'，<=50字"
@@ -95,6 +128,7 @@ _SYSTEM_PROMPT = """# Role
 # 数组数量上限
 - content_tracks: 2-3 个
 - influencer_demographic.style_tags: 2-4 个
+- narrative_skeleton.motifs: 1-3 个
 
 # 输出格式约束
 使用简体中文。只输出一个合法的 JSON 对象，**禁止**用 ```json 或 ``` 包裹，禁止输出任何解释性文字。"""
@@ -117,7 +151,8 @@ _MERGE_SYSTEM_PROMPT = """# Role
 3. **达人类型判定**：influencer_type 必须严格依据下方「达人类型标准列表」选取，格式"一级-二级"；多视频类型不一致时以多数共识为准；无匹配输出"无匹配-需补充"。
 4. **career_identity 证据等级从严合并**：多视频结果中，status 取最保守值（有明确证据 > 有间接线索 > 无法判断，向下兼容）；仅当 bio 或任一视频口述明确提及职业/经营/从业经历才可标"有明确证据"，evidence 引用具体出处。
 5. **人工补充信息优先级最高**：若输入中出现 `manual_supplement`（用户人工补充），其 occupation（达人职业）/ asset_level（资产层次）必须原样采纳，优先于所有视频分析结论；other（其他补充）中与达人呈现相关的内容（拍摄方式、出镜人数、机位等）必须体现在 `visual_symbols` / `appearance` / `speech_style` 中。
-6. **严格遵循格式**：输出必须且只能是一个合法的 JSON 对象，严格遵循下方的 `_OUTPUT_SCHEMA`。
+6. **叙事骨架合并规则**：narrative_skeleton 综合各视频的 narrative_skeleton 分析结果归并；hit_hook_patterns **只能**来自多个视频分析结果中共现的钩子模式（至少 2 个视频出现同一模式才输出，单视频模式不得写入），**禁止**从昵称、简介或任何标题文本推断钩子共性；分析视频只有 1 个时 hit_hook_patterns 输出空数组。
+7. **严格遵循格式**：输出必须且只能是一个合法的 JSON 对象，严格遵循下方的 `_OUTPUT_SCHEMA`。
 
 # 达人类型标准列表（判定 influencer_type 必须从此表选取，不得自创；无匹配则输出"无匹配-需补充"）
 
@@ -161,6 +196,15 @@ _MERGE_SYSTEM_PROMPT = """# Role
       "style_tags": ["开放式提取的风格标签", "2-4个"]
     }
   },
+  "narrative_skeleton": {
+    "skeleton_mode": "惯用叙事骨架，从枚举选最主要的1个：反常识结论前置|悬念递进|故事化叙事|数据实证|场景剧情|盘点清单，<=12字",
+    "opening": "综合各视频的惯用开场策略，<=30字",
+    "turn": "惯用中段推进方式，<=30字",
+    "ending": "惯用收尾方式，<=30字",
+    "motif_spectrum": ["常打母题按出现频次排序", "3-5个"],
+    "hit_hook_patterns": ["多视频共现的钩子模式0-2个（不足2个视频共现则输出空数组）"],
+    "emotion": "整体情绪基调，<=8字"
+  },
   "audience_insight": {
     "demographic": "人口统计学特征，如'25-45岁一二线男性'，<=20字",
     "psychological_needs": "受众心理诉求与痛点，<=50字"
@@ -170,9 +214,38 @@ _MERGE_SYSTEM_PROMPT = """# Role
 # 数组数量上限
 - content_tracks: 2-3 个
 - influencer_demographic.style_tags: 2-4 个
+- narrative_skeleton.motif_spectrum: 3-5 个
+- narrative_skeleton.hit_hook_patterns: 0-2 个
 
 # 输出格式约束
 使用简体中文。只输出一个合法的 JSON 对象，**禁止**用 ```json 或 ``` 包裹，禁止输出任何解释性文字。"""
+
+# ── 商单视频分析 Prompt ───────────────────────────────────────
+
+_AD_VIDEO_SYSTEM_PROMPT = """# Role
+你是短视频商单拆解专家。你会看到一条达人发布的星图商单广告视频，请只依据视频内容本身输出以下结构化 JSON，禁止编造视频里没有的信息：
+
+```json
+{
+  "form": "口播 | 情景剧情 | 图文混剪 | 其他",
+  "hook_type": "开场前3秒钩子类型，短语（如：反常识结论前置/提问式悬念/利益点直给/数据冲击），必须基于视频实际开头，<=15字",
+  "skeleton": {
+    "opening": "开场策略一句话，<=25字",
+    "turn": "中段推进方式及产品/品牌出现的位置与方式，<=30字",
+    "ending": "收尾方式一句话（含行动引导如何给出），<=25字"
+  },
+  "implant_mode": "产品/品牌的植入方式一句话（如：导师式收尾给方案/中段场景化演示/开场利益点直给），<=30字",
+  "motifs": ["这条商单借用的内容母题1（如：认知差/防坑/节日送礼）", "母题2"],
+  "emotion": "整体情绪基调，3-8字",
+  "commercial_signals": "品牌名/产品口播原话关键词，摘录1-2处，<=60字",
+  "native_fit": "广告原生化程度一句话：广告与该达人日常内容形态的融合度（如'完全套用日常口播结构，仅收尾换产品'），<=35字"
+}
+```
+
+要求：
+1. hook_type 必须基于视频实际前 3 秒，不要套模板
+2. skeleton.ending 必须说明行动引导（点击/搜索/信任背书）是怎么自然给出的
+3. 全部中文输出；只输出一个合法 JSON，不要输出任何解释性文字"""
 
 # ── 字段长度限制（用于 _compact_result 硬截断）─────────────────
 
@@ -192,11 +265,22 @@ _STRING_FIELD_LIMITS: dict[str, int] = {
     "basic_positioning.influencer_demographic.visual_symbols": 50,
     "audience_insight.demographic": 20,
     "audience_insight.psychological_needs": 50,
+    # 叙事骨架（逐视频 + 合并共用部分字段名）
+    "narrative_skeleton.hook_type": 20,
+    "narrative_skeleton.skeleton_mode": 12,
+    "narrative_skeleton.opening": 30,
+    "narrative_skeleton.turn": 30,
+    "narrative_skeleton.ending": 30,
+    "narrative_skeleton.emotion": 10,
+    "narrative_skeleton.commercial_signals": 60,
 }
 
 _ARRAY_FIELD_LIMITS: dict[str, int] = {
     "basic_positioning.content_tracks": 3,
     "basic_positioning.influencer_demographic.style_tags": 4,
+    "narrative_skeleton.motifs": 3,
+    "narrative_skeleton.motif_spectrum": 5,
+    "narrative_skeleton.hit_hook_patterns": 2,
 }
 
 
@@ -302,6 +386,7 @@ def _merge_with_tikhub(data: dict[str, Any]) -> dict[str, Any]:
         **data,
         "bio": data.get("bio") or fetched.get("bio") or "",
         "video_urls": fetched.get("video_urls") or [],
+        "user_profile": fetched.get("user_profile") or {},
         "_tikhub_meta": {
             "sec_user_id": fetched.get("sec_user_id"),
             "author_nickname": fetched.get("author_nickname"),
@@ -594,6 +679,380 @@ def _analyze_one_video(
         return (index, None, exc)
 
 
+# ── 爆款商单分析（星图链路）──────────────────────────────────
+
+
+def _analyze_top_ad_video(sec_user_id: str) -> dict[str, Any]:
+    """星图商单 → 最近15条中播放量最高的一条 → 多模态视频分析。
+
+    任何环节失败都降级为 available=False + 原因说明，不抛异常、不影响主流程。
+    """
+    entry: dict[str, Any] = {"available": False}
+
+    best, note = fetch_best_star_item(sec_user_id)
+    entry["note"] = note
+    if not best:
+        return entry
+
+    entry.update(
+        {
+            "available": True,
+            "item_id": best["item_id"],
+            "title": best["title"],
+            "item_date": best["item_date"],
+            "duration_s": best["duration_s"],
+            "stats": {
+                "play": best["play"],
+                "like": best["like"],
+                "comment": best["comment"],
+                "share": best["share"],
+            },
+            "url": best["url"],
+        }
+    )
+
+    play_url = fetch_video_play_url(best["item_id"])
+    if not play_url:
+        entry["note"] = entry["note"] + "；未取到播放地址，仅输出数据无视频分析"
+        return entry
+
+    try:
+        logger.info("爆款商单视频分析中: %s（%s 播放）", best["item_id"], best["play"])
+        result = run_video_analysis(
+            agent_name=SPEC.name,
+            system=_AD_VIDEO_SYSTEM_PROMPT,
+            user_text=f"星图商单视频，发布日期 {best['item_date']}，标题：{best['title']}。请按系统指令输出 JSON。",
+            video_url=play_url,
+            max_tokens=2048,
+        )
+        entry["analysis"] = json.loads(_strip_markdown_fence(result.text))
+        entry["note"] = entry["note"] + "；视频分析完成"
+    except Exception as exc:  # noqa: BLE001
+        entry["analysis_error"] = str(exc)[:150]
+        entry["note"] = entry["note"] + "；视频分析失败"
+
+    return entry
+
+
+def _attach_top_ad_video(result: AgentResult, data: dict[str, Any]) -> AgentResult:
+    """在最终 JSON 上附加 top_ad_video 字段（星图链路）。"""
+    sec_uid = (
+        (data.get("_tikhub_meta") or {}).get("sec_user_id")
+        or data.get("sec_user_id")
+        or ""
+    ).strip()
+
+    try:
+        obj = json.loads(result.text)
+    except json.JSONDecodeError:
+        return result
+    if not isinstance(obj, dict):
+        return result
+
+    if not sec_uid:
+        obj["top_ad_video"] = {"available": False, "note": "无 sec_user_id，跳过商单分析"}
+    else:
+        obj["top_ad_video"] = _analyze_top_ad_video(sec_uid)
+
+    return AgentResult(
+        agent=result.agent,
+        text=json.dumps(obj, ensure_ascii=False),
+        model=result.model,
+        usage=result.usage,
+        raw=result.raw,
+    )
+
+
+# ── 大V（阅历型权威）特征判定 ─────────────────────────────────
+
+
+_AUTHORITY_JUDGE_SYSTEM_PROMPT = """# Role
+你是短视频达人权威形态判定专家。基于达人的画像数据，判断该达人是否呈现"阅历型权威"（大V）形态。
+
+# 大V 定义（阅历型权威，四必要特征）
+大V 不是粉丝多的达人，而是**观众仰视关系的达人**——观众以"听导师/前辈指点"的心态观看。
+判断以下四个特征，每个特征独立判定：
+
+1. **age_35_50（中年）**：达人处于中年段（35-50 岁）。依据年龄推断区间；区间跨界（如 30-40）时看主体是否落在中年段。
+2. **narratable_experience（可叙述阅历资历）**：有可讲述的职业/人生履历——军旅、创业、企业主、媒体从业、学界、从业年限等，**失败经历也算**（如"创业20年失败者"）。证据来源：bio 自述、平台认证、视频口述、人工补充。注意：达人自我否认（如"我不是专家啥也不是"）**不构成否定**——看实际履历信号。
+3. **oral_opinion_form（口播观点形态）**：内容以达人出镜口播输出观点为主（观点/解读/方法论），区别于剧情演绎、纯图文混剪、vlog 流水记录。
+4. **mentor_relationship（观众仰视导师关系）**：观众视角是"向上听教"——渴求权威解读、把达人当导师/前辈。区别于平视（闺蜜安利、同龄人分享、娱乐消遣）。
+
+# 判定纪律
+- 只依据提供的数据判断，**禁止编造**；每条 evidence 引用具体字段内容或原文
+- 信号不足时 hit=false，evidence 写"无信号"或注明依据缺失；宁可 false 不可拔高
+- career_identity.status=无法判断 且 bio 无履历线索 → narratable_experience 应为 false
+
+# 输出格式
+只输出一个合法 JSON 对象，**禁止**用 ```json 或 ``` 包裹，禁止任何解释性文字：
+{
+  "age_35_50": {"hit": true, "evidence": "依据，<=40字"},
+  "narratable_experience": {"hit": false, "evidence": "依据，<=40字"},
+  "oral_opinion_form": {"hit": true, "evidence": "依据，<=40字"},
+  "mentor_relationship": {"hit": true, "evidence": "依据，<=40字"}
+}"""
+
+
+_AGE_RANGE_RE = re.compile(r"(\d{2})\s*[-—~至到]\s*(\d{2})")
+_AGE_SINGLE_RE = re.compile(r"(\d{2})")
+
+
+def _parse_age_range(age_range: str) -> Optional[tuple[int, int]]:
+    """解析年龄区间字符串（如'40-45岁'→(40,45)；'38岁上下'→(38,38)）。"""
+    text = (age_range or "").strip()
+    if not text:
+        return None
+    match = _AGE_RANGE_RE.search(text)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    single = _AGE_SINGLE_RE.search(text)
+    if single:
+        v = int(single.group(1))
+        return (v, v)
+    return None
+
+
+def _age_in_window(parsed: tuple[int, int]) -> bool:
+    """年龄区间与 [35, 50] 至少重叠 _AUTHORITY_AGE_MIN_OVERLAP 年才算命中。"""
+    lo, hi = parsed
+    overlap = min(hi, _AUTHORITY_AGE_HI) - max(lo, _AUTHORITY_AGE_LO)
+    return overlap >= _AUTHORITY_AGE_MIN_OVERLAP
+
+
+def _judge_authority_traits(obj: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """LLM 判定四特征。输入为主分析 JSON 的紧凑子集，输出 {trait: {hit, evidence}}。
+
+    失败返回 None（调用方降级），不抛异常影响主流程。
+    """
+    bp = obj.get("basic_positioning") or {}
+    demo = (bp.get("influencer_demographic") or {})
+    skeleton = obj.get("narrative_skeleton") or {}
+    audience = obj.get("audience_insight") or {}
+
+    user_profile = (obj.get("_user_profile") or {})
+    follower_count = user_profile.get("follower_count")
+
+    payload = {
+        "nickname": bp.get("nickname") or "",
+        "bio": obj.get("_bio") or "",
+        "follower_count": follower_count,
+        "verification": user_profile.get("verification") or "",
+        "inferred_age_range": demo.get("age_range") or "",
+        "occupation": demo.get("occupation") or "",
+        "career_identity": demo.get("career_identity") or {},
+        "speech_style": demo.get("speech_style") or "",
+        "skeleton_mode": skeleton.get("skeleton_mode") or "",
+        "opening": skeleton.get("opening") or "",
+        "ending": skeleton.get("ending") or "",
+        "audience_demographic": audience.get("demographic") or "",
+        "audience_psychological_needs": audience.get("psychological_needs") or "",
+        "style_tags": demo.get("style_tags") or [],
+        "note": "请依据以上数据判定四特征，输出规定 JSON。",
+    }
+
+    try:
+        result = run_text_analysis(
+            agent_name=SPEC.name,
+            system=_AUTHORITY_JUDGE_SYSTEM_PROMPT,
+            user_text=json.dumps(payload, ensure_ascii=False, indent=2),
+            max_tokens=1024,
+        )
+        judged = json.loads(_strip_markdown_fence(result.text))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("大V特征判定失败: %s", exc)
+        return None
+
+    if not isinstance(judged, dict):
+        return None
+
+    # 归一化为 {trait: {"hit": bool, "evidence": str}}
+    normalized: dict[str, Any] = {}
+    for trait in _AUTHORITY_TRAITS:
+        raw = judged.get(trait)
+        if isinstance(raw, dict):
+            normalized[trait] = {
+                "hit": bool(raw.get("hit")),
+                "evidence": _smart_truncate(str(raw.get("evidence") or ""), 40),
+            }
+        elif isinstance(raw, bool):
+            normalized[trait] = {"hit": raw, "evidence": ""}
+        # 缺失的特征不写入，调用方按未命中处理
+    return normalized
+
+
+def _compute_authority_tier(
+    traits: dict[str, dict[str, Any]],
+    follower_count: Optional[int],
+) -> tuple[str, str, bool, str]:
+    """程序化计算 (tier, authority_source, is_big_v, note)。纯规则，可单测。
+
+    - 四特征全命中 → 阅历身份型（大V 形态成立）
+    - 大V = 阅历身份型 AND 粉丝 > 100 万（用户 2026-09-21 定硬门槛，大宽哥103万校准）
+    - tier 枚举：头部大V(>500万) | 标准大V(100-500万) | 中腰部阅历型(形态成立但量级不足) | 内容能力型
+    """
+    experiential = all(
+        traits.get(t, {}).get("hit") is True for t in _AUTHORITY_TRAITS
+    )
+    authority_source = "阅历身份型" if experiential else "内容能力型"
+
+    if not experiential:
+        return (
+            "内容能力型",
+            authority_source,
+            False,
+            "无阅历资历证据，权威来自内容能力（如认知差拆解），非大V形态",
+        )
+
+    if follower_count is None:
+        return (
+            "中腰部阅历型",
+            authority_source,
+            False,
+            "阅历型权威形态成立，但粉丝量级未知，大V判定不可确认",
+        )
+
+    if follower_count > _HEAD_V_FOLLOWER:
+        return (
+            "头部大V",
+            authority_source,
+            True,
+            f"阅历型权威四特征命中，粉丝 {follower_count} 超头部量级线",
+        )
+
+    if follower_count > _BIG_V_FOLLOWER_GATE:
+        return (
+            "标准大V",
+            authority_source,
+            True,
+            f"阅历型权威四特征命中，粉丝 {follower_count} 达大V量级门槛",
+        )
+
+    return (
+        "中腰部阅历型",
+        authority_source,
+        False,
+        f"阅历型权威形态成立，但粉丝 {follower_count} 未达100万大V门槛",
+    )
+
+
+def _build_authority_profile(
+    result_text: str, data: dict[str, Any]
+) -> dict[str, Any]:
+    """组装 authority_profile：程序取粉丝/认证 + LLM 判四特征 + 程序算 tier。
+
+    任一环节失败均降级（available=false + note），不影响主流程。
+    """
+    user_profile = data.get("user_profile") or {}
+    follower_count = user_profile.get("follower_count")
+    verification = (user_profile.get("verification") or "").strip()
+
+    try:
+        obj = json.loads(result_text)
+    except json.JSONDecodeError:
+        obj = {}
+    if not isinstance(obj, dict):
+        obj = {}
+
+    # LLM 判四特征（input 挂在临时键上，判完即弃）
+    obj["_user_profile"] = user_profile
+    obj["_bio"] = data.get("bio") or ""
+    traits = _judge_authority_traits(obj)
+    obj.pop("_user_profile", None)
+    obj.pop("_bio", None)
+
+    profile: dict[str, Any] = {
+        "follower_count": follower_count,
+        "verification": verification,
+    }
+
+    if traits is None:
+        profile.update(
+            {
+                "available": False,
+                "note": "大V特征判定失败，仅有粉丝/认证数据，四特征与tier不可用",
+            }
+        )
+        return profile
+
+    # 人工补充职业 → narratable_experience 强制命中（人工优先级最高）
+    manual = data.get("manual_supplement") or {}
+    manual_occupation = (manual.get("occupation") or "").strip() if isinstance(manual, dict) else ""
+    if manual_occupation:
+        traits["narratable_experience"] = {
+            "hit": True,
+            "evidence": f"人工补充职业：{manual_occupation[:30]}",
+        }
+
+    # age_35_50：程序解析年龄区间优先（确定性），解析不了用 LLM 判定兜底
+    demo = (obj.get("basic_positioning") or {}).get("influencer_demographic") or {}
+    age_range = (demo.get("age_range") or "").strip()
+    parsed_age = _parse_age_range(age_range)
+    if parsed_age is not None:
+        traits["age_35_50"] = {
+            "hit": _age_in_window(parsed_age),
+            "evidence": f"年龄推断 {age_range}（程序解析）",
+        }
+
+    tier, authority_source, is_big_v, note = _compute_authority_tier(
+        traits, follower_count
+    )
+
+    # confidence：粉丝未知=low；阅历型成立且职业身份有明确证据=high；其余=medium
+    career_status = (demo.get("career_identity") or {}).get("status") or ""
+    if follower_count is None:
+        confidence = "low"
+    elif authority_source == "阅历身份型":
+        confidence = "high" if career_status == "有明确证据" else "medium"
+    else:
+        confidence = "medium"
+
+    profile.update(
+        {
+            "available": True,
+            "is_big_v": is_big_v,
+            "tier": tier,
+            "authority_source": authority_source,
+            "traits": traits,
+            "confidence": confidence,
+            "note": _smart_truncate(note, 60),
+        }
+    )
+    return profile
+
+
+def _attach_authority_profile(
+    result: AgentResult, data: dict[str, Any]
+) -> AgentResult:
+    """在最终 JSON 上附加 basic_positioning.authority_profile 字段。"""
+    try:
+        obj = json.loads(result.text)
+    except json.JSONDecodeError:
+        return result
+    if not isinstance(obj, dict):
+        return result
+
+    try:
+        profile = _build_authority_profile(result.text, data)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("authority_profile 组装失败: %s", exc)
+        profile = {
+            "available": False,
+            "note": f"authority_profile 组装异常（{str(exc)[:60]}）",
+        }
+
+    bp = obj.setdefault("basic_positioning", {})
+    if isinstance(bp, dict):
+        bp["authority_profile"] = profile
+
+    return AgentResult(
+        agent=result.agent,
+        text=json.dumps(obj, ensure_ascii=False),
+        model=result.model,
+        usage=result.usage,
+        raw=result.raw,
+    )
+
+
 # ── 主入口 ────────────────────────────────────────────────────
 
 
@@ -649,9 +1108,11 @@ def run_influencer_profiler(user_input: str) -> AgentResult:
             "总耗时 %.1fs（TikHub %.1fs / 视频分析 %.1fs / 单视频无合并）",
             time.perf_counter() - t_total, t_tikhub, t_video,
         )
-        return _apply_manual_supplement(
+        final = _apply_manual_supplement(
             success_results[0], data.get("manual_supplement")
         )
+        final = _attach_authority_profile(final, data)
+        return _attach_top_ad_video(final, data)
 
     nickname = ""
     if data.get("_tikhub_meta"):
@@ -673,4 +1134,6 @@ def run_influencer_profiler(user_input: str) -> AgentResult:
         t_video,
         time.perf_counter() - t_merge,
     )
-    return _apply_manual_supplement(merged, data.get("manual_supplement"))
+    final = _apply_manual_supplement(merged, data.get("manual_supplement"))
+    final = _attach_authority_profile(final, data)
+    return _attach_top_ad_video(final, data)
