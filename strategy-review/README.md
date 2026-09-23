@@ -24,7 +24,7 @@ node strategy_review.js --brand weiyedai   # 指定品牌
 ```
 
 - `--brand` > `env WORKFLOW_BRAND` > 默认 `duxiaoman`；入池/分级/分线规则来自 `config/<brand>/config.json`
-- .env 按优先级合并加载：`config/<brand>/.env` → `scripts/.env` → skill 根 → 仓库根 → `duxiaoman-hotspot/.env`
+- .env 按优先级合并加载：`config/<brand>/.env` → `scripts/.env` → skill 根 → 仓库根 → `hotspot/.env`
 - 入池标准（度小满）：星推比>2.5 或 转化是否达标=是；评分等级：双达标→S，仅一项达标→A
 - 按源脚本ID去重，重复跑不会重复写入
 - 调试：`TEST_MODE=1` 只分析第1条；`DRY_RUN=1` 全流程干跑但不写表

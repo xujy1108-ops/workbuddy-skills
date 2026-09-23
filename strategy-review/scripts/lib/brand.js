@@ -29,7 +29,7 @@ function loadEnv(brand) {
     path.join(SKILL_ROOT, 'scripts', '.env'),
     path.join(SKILL_ROOT, '.env'),
     path.join(SKILL_ROOT, '..', '.env'),
-    path.join(SKILL_ROOT, '..', 'duxiaoman-hotspot', '.env') // 历史共用 env 兜底
+    path.join(SKILL_ROOT, '..', 'hotspot', '.env') // 历史共用 env 兜底
   ].filter(Boolean);
 
   for (const envPath of candidates) {

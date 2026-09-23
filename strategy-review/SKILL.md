@@ -57,7 +57,7 @@ node strategy_review.js --brand weiyedai # 指定品牌（config/<brand>/）
 ```
 
 - `--brand` 参数 > `env WORKFLOW_BRAND` > 默认 `duxiaoman`
-- `.env` 按优先级合并加载：`config/<brand>/.env` → `scripts/.env` → skill 根 `.env` → 仓库根 `.env` → `duxiaoman-hotspot/.env`（历史共用兜底）
+- `.env` 按优先级合并加载：`config/<brand>/.env` → `scripts/.env` → skill 根 `.env` → 仓库根 `.env` → `hotspot/.env`（历史共用兜底）
 - 入池/分级/分线规则全部来自 `config/<brand>/config.json`，改配置不改代码
 - 去重：按"源脚本ID"跳过审核表中已存在的脚本，重复跑不会重复写入
 - AI 分析单条实测约 2-5 分钟（2026-09-17 实测单条 267 秒，doubao-seed-2-1-pro 生成 4 段 JSON 较慢），`ai.requestTimeoutSec` 默认 420 秒、失败重试 3 次
