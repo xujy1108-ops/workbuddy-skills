@@ -447,44 +447,61 @@ function updateStrategyGrowth(strategyResult, itemCount) {
 //   （B 级只出现在被排除的「回应解释」类，实际不会进清单）。
 // 好处：表里加/改方向、升降级都自动跟上，代码与配置都不用动；也没有 24h 缓存造成的滞后。
 // 策略表读取失败 → 退到 config/<brand>/config.json 的 strategy.fallbackStrategies 静态快照。
+//
+// 2026-09-17 拆分：策略表的**所有读写**收敛到独立 skill `strategy-analysis`（CLI），
+//   本工作流只通过其 list / sync 子命令与策略表交互，本文件不再直连策略表 API
+//   （preflightFeishu 的可达性探针除外）。表结构/合并规则/选项扩充在该 skill 统一维护。
 const STRATEGY_EXCLUDE_L1 = BRAND_CONFIG.tables.strategy.excludeL1 || ['回应解释'];
-const STRATEGY_FIELDS = ['内容方向一', '内容方向二', '策略等级', '内容一方向定义', '植入策略', '素材链接ids', '适合达人'];
 
 // 静态快照兜底（策略表读取失败时使用；口径与策略表一致：全部行 - excludeL1）
 const FALLBACK_STRATEGIES = (BRAND_CONFIG.strategy.fallbackStrategies || [])
   .filter(s => !STRATEGY_EXCLUDE_L1.includes(s.l1));
 
-// 读策略表原始行——全流程唯一的策略表读取入口（策略清单 / 方向枚举 / 写表合并三处共用）。
+// strategy-analysis CLI 定位：env 覆盖 > 仓库姐妹目录 > 技能装载目录（软链）
+const STRATEGY_SYNC_CLI = (() => {
+  if (process.env.STRATEGY_SYNC_CLI) return process.env.STRATEGY_SYNC_CLI;
+  const candidates = [
+    path.join(__dirname, '..', '..', 'strategy-analysis', 'scripts', 'sync.js'),  // scripts→skill根→workbuddy-skills 姐妹目录
+    path.join(os.homedir(), '.workbuddy', 'skills', 'strategy-analysis', 'scripts', 'sync.js')
+  ];
+  for (const p of candidates) { if (fs.existsSync(p)) return p; }
+  return candidates[0];
+})();
+
+/** 调用 strategy-analysis CLI；stdout=结果 JSON，stderr 日志直接透传到本进程 stderr */
+function callStrategySyncCli(args) {
+  // sync 含逐方向 AI 查重（每组最长 60s），给足 10 分钟；list 纯读表 2 分钟足够
+  const timeoutMs = args[0] === 'sync' ? 600000 : 120000;
+  return execFileSync('node', [STRATEGY_SYNC_CLI, ...args, '--brand', BRAND], {
+    encoding: 'utf-8',
+    timeout: timeoutMs,
+    maxBuffer: 50 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'inherit']
+  });
+}
+
+// 读策略表原始行——经 strategy-analysis list 子命令（全流程唯一的策略表读取入口：
+// 策略清单 / 方向枚举 / 写表合并三处共用）。
 // 进程内缓存：同一次运行内，策略清单与方向枚举共用同一份快照，避免两次读表结果不一致；
-// 写表路径（Step 6 策略沉淀）必须传 { fresh: true } 实时读，绝不能用旧快照做合并写入。
+// 写表路径（Step 6 策略沉淀）传 { fresh: true } → sync 子命令内部实时读，绝不用旧快照合并。
 let _strategyRowsSnapshot = null;
 function fetchStrategyRows({ fresh = false } = {}) {
   if (!fresh && _strategyRowsSnapshot) return _strategyRowsSnapshot;
-  const output = runLarkCli([
-    'base', '+record-list',
-    '--base-token', STRATEGY_BASE_TOKEN,
-    '--table-id', STRATEGY_TABLE_ID,
-    '--limit', '200',
-    '--as', 'user',
-    '--format', 'json'
-  ]);
-  const data = JSON.parse(output)?.data || {};
-  const fieldNames = data.fields || [];
-  const rawRows = data.data || [];
-  const recordIds = data.record_id_list || [];
-  const idx = {};
-  STRATEGY_FIELDS.forEach(name => { idx[name] = fieldNames.indexOf(name); });
-  const at = (row, name) => (idx[name] >= 0 ? cellText(row[idx[name]]) : '');
-
-  const rows = rawRows.map((row, i) => ({
-    recordId: recordIds[i] || null,
-    l1: normalizeDirectionValue(at(row, '内容方向一')),
-    l2: normalizeDirectionValue(at(row, '内容方向二')),
-    level: at(row, '策略等级'),
-    definition: at(row, '内容一方向定义'),
-    植入策略: at(row, '植入策略'),
-    素材链接ids: at(row, '素材链接ids'),
-    适合达人: at(row, '适合达人')
+  const out = JSON.parse(callStrategySyncCli(['list']));
+  if (!out.ok) throw new Error(`strategy-analysis list 失败`);
+  if (out.fallbackUsed) {
+    log(`   ⚠️ 策略表读取失败，strategy-analysis 已退静态快照兜底（${out.total} 行）`);
+  }
+  const rows = out.rows.map(r => ({
+    recordId: r.recordId || null,
+    l1: r.l1 || '',
+    l2: r.l2 || '',
+    level: r.level || '',
+    definition: r.definition || '',
+    l2Definition: r.l2Definition || '',
+    植入策略: r.placement || '',
+    素材链接ids: r.materialIds || '',
+    适合达人: r.suited || ''
   }));
   if (!fresh) _strategyRowsSnapshot = rows;
   return rows;
@@ -498,13 +515,119 @@ function summarizeStrategyLevels(list) {
 }
 
 // 策略清单（注入关键词 prompt 的 __STRATEGY_LIST__）
+//
+// 2026-09-21 新增方向覆盖度标注（用户发现「鸡汤」3 个方向从未被搜索过）：
+// 此前注入 prompt 的策略清单只含「方向名 + 等级 + 定义」，不含「这个方向查过几次、
+// 攒了多少素材」，且第 1018 行的近期方向避让只约束策略衍生/开放探索、策略直搜不受约束
+// → 直搜可反复挑熟悉的方向（实测「揭秘自己-生意赚多少钱」被选 2 次，而鸡汤 3 个方向
+//   在 26 条历史关键词里零查询）。现在改为：程序标注覆盖度 + 未覆盖方向排最前 +
+// prompt 侧写死「优先选已搜过 0 次的方向」，覆盖率由程序保证而非依赖模型自觉。
+function countMaterialIds(raw) {
+  return String(raw || '')
+    .split(/[、,，;；\s]+/)
+    .filter(x => /^(dy_|xhs_|wx_)\S+/.test(x.trim()))
+    .length;
+}
+
+// 方向名归一化（2026-09-21）：把关键词的 direction 统一成策略表的「一级-二级」写法。
+// 背景：AI 生成的 direction 是自由文本（如「策略衍生-网贷测评反向打脸」），与策略表的
+// 「网贷测评-反向测评」字面匹配不上 → 覆盖度统计漏判，明明搜过的方向被记成"从未搜过"，
+// 下轮又被重复选中。根治办法是写入前就归一化，而不是靠匹配时放宽。
+// 匹配顺序：① 精确「一级-二级」 ② 核心串含完整二级名 ③ 二级名的字全被核心串覆盖（容忍 AI 改写词序）
+// ④ 一级方向名被完整覆盖且该一级下只有一个二级方向。都匹配不上则保留原文——宁可显示自由文本，也不硬塞错方向。
+const DIRECTION_SOURCE_PREFIX = /^(策略直搜|策略衍生|策略探索|直搜|衍生|探索|策略)[-—–－:：]?/;
+
+function canonicalDirection(raw, source, strategies) {
+  const rawText = String(raw || '').trim();
+  if (!rawText) return '';
+  // 探索类方向由探索路径自行命名，不属于策略表方向体系，不参与归一化
+  if (!/^strategy_/.test(String(source || ''))) return rawText;
+  const compact = t => String(t || '').replace(/\s+/g, '');
+  const core = compact(rawText).replace(DIRECTION_SOURCE_PREFIX, '');
+  const pool = (strategies || [])
+    .map(s => ({ key: `${s.l1}-${s.l2}`, l1: s.l1 || '', l2: s.l2 || '' }))
+    .filter(s => s.l1 && s.l2);
+  if (pool.length === 0) return rawText;
+  // ① 精确命中
+  for (const s of pool) {
+    const k = compact(s.key);
+    if (k === compact(rawText) || k === core) return s.key;
+  }
+  // ② 核心串包含完整二级名
+  const contained = pool.filter(s => core.includes(s.l2));
+  if (contained.length > 0) return contained.sort((a, b) => b.l2.length - a.l2.length)[0].key;
+  // ③ 二级名的字全部出现在核心串中（AI 改写词序时兜底，如「网贷测评反向打脸」↔「反向测评」）
+  const covered = pool.filter(s => s.l2.length >= 3 && [...new Set(s.l2)].every(ch => core.includes(ch)));
+  if (covered.length > 0) return covered.sort((a, b) => b.l2.length - a.l2.length)[0].key;
+  // 原文已自带明确二级（「一级-二级」格式，此处用全角/半角短横描述）时不再降级：
+  // 二级已由模型指定，降级成「一级-*」会把该一级下无关的二级也误记为"已搜过"
+  // （实例：「揭秘自己-反差职业收入」策略表里并不存在，若降级会让"生意赚多少钱""炒股是否财富自由"被错误计入）
+  if (/^[^-—–－]+[-—–－][^-—–－]+$/.test(core)) return rawText;
+  // ④ 一级方向名被完整覆盖，且无歧义（只命到一个一级、该一级下只有一个二级方向）。
+  // 要求 l1Hit 唯一：如「借钱高性价比-利息计算」同时覆盖两个一级方向名，属歧义，保留原文不硬猜。
+  const l1Hit = [...new Set(pool.map(s => s.l1))]
+    .filter(l1 => l1.length >= 2 && [...new Set(l1)].every(ch => core.includes(ch)))
+    .filter(l1 => pool.filter(s => s.l1 === l1).length === 1);
+  if (l1Hit.length === 1) {
+    return pool.find(s => s.l1 === l1Hit[0]).key;
+  }
+  // ⑤ 一级方向名被部分覆盖（命中 ≥2 字且占比 ≥40%），但二级方向无法确定（该一级下有多个二级）
+  // → 记为「一级-*」，覆盖统计按"该一级下所有二级都搜过"计。
+  // 场景：AI 把「场景还原拒绝借钱」自由改写成「场景化拒绝话术」，字面完全对不上（只共享"拒绝"二字），
+  // 若无此层，「拒绝借钱」会被反复记成"从未搜过"而重复搜索。
+  // 阈值取 40% 而非更高：核心串往往是语义改写，能共享的汉字本就有限；靠「至少命中 2 字」+「候选唯一」双重约束防误判。
+  const partial = [...new Set(pool.map(s => s.l1))]
+    .map(l1 => {
+      const chars = [...new Set(l1)];
+      return { l1, hit: chars.filter(ch => core.includes(ch)).length, total: chars.length };
+    })
+    .filter(x => x.hit >= 2 && x.hit / x.total >= 0.4);
+  if (partial.length === 1) return `${partial[0].l1}-*`;
+  return rawText;
+}
+
+// 用历史关键词统计（.keyword_stats.json）里各关键词的 direction 反查本方向被搜过几次。
+// 判定口径：direction 先经 canonicalDirection 归一化（兼容历史自由文本），再与「一级-二级」比对；
+// 归一化结果为「一级-*」（二级未定）时，该一级下所有二级方向都记为已搜过。
+function annotateDirectionCoverage(list) {
+  const stats = loadKeywordStats();
+  const usedDirs = Object.values(stats.keywords || {})
+    .map(v => ({ raw: (v && v.direction) || '', source: (v && v.source) || '' }))
+    .filter(x => x.raw)
+    .map(x => canonicalDirection(x.raw, x.source, list));
+  return list.map(s => ({
+    ...s,
+    queried: usedDirs.filter(d =>
+      d === `${s.l1}-${s.l2}` ||
+      d === `${s.l1}-*` ||
+      (s.l2 && d.includes(s.l2))
+    ).length
+  }));
+}
+
+const STRATEGY_LEVEL_RANK = { S: 0, A: 1, X: 2 };
+
+// 排序：从未搜过的最前 → 已有素材最少的最前（空方向最缺内容）→ 等级 S>A>X
+function sortStrategiesByCoverage(list) {
+  return [...list].sort((a, b) => {
+    if ((a.queried === 0) !== (b.queried === 0)) return a.queried === 0 ? -1 : 1;
+    const am = a.materialCount === null ? Infinity : a.materialCount;
+    const bm = b.materialCount === null ? Infinity : b.materialCount;
+    if (am !== bm) return am - bm;
+    const la = STRATEGY_LEVEL_RANK[a.level] ?? 9;
+    const lb = STRATEGY_LEVEL_RANK[b.level] ?? 9;
+    return la - lb;
+  });
+}
+
 function fetchStrategyList() {
   let rows;
   try {
     rows = fetchStrategyRows();
   } catch (error) {
     log(`   ⚠️ 策略表读取失败（${error.message.substring(0, 120)}），使用静态快照兜底（${FALLBACK_STRATEGIES.length} 个）`);
-    return FALLBACK_STRATEGIES;
+    // 快照无素材数据 → materialCount 记 null（注入 prompt 时显示「素材数未知」，不谎报 0）
+    return annotateDirectionCoverage(FALLBACK_STRATEGIES.map(s => ({ ...s, materialCount: null })));
   }
   const list = rows
     .filter(r => r.l1 && r.l2 && !STRATEGY_EXCLUDE_L1.includes(r.l1))
@@ -512,14 +635,16 @@ function fetchStrategyList() {
       l1: r.l1,
       l2: r.l2,
       level: r.level,
-      definition: (r.definition || '').substring(0, 120)
+      definition: (r.definition || '').substring(0, L1_DEF_LIMIT),
+      l2Definition: (r.l2Definition || '').substring(0, L2_DEF_LIMIT),
+      materialCount: countMaterialIds(r['素材链接ids'])
     }));
   if (list.length === 0) {
     log(`   ⚠️ 策略表无可用行，使用静态快照兜底（${FALLBACK_STRATEGIES.length} 个）`);
-    return FALLBACK_STRATEGIES;
+    return annotateDirectionCoverage(FALLBACK_STRATEGIES.map(s => ({ ...s, materialCount: null })));
   }
   log(`   📋 策略清单来源：策略表（${list.length} 个方向，等级 ${summarizeStrategyLevels(list)}）`);
-  return list;
+  return annotateDirectionCoverage(list);
 }
 
 // ============ 开放探索来源（来源3）：处境坐标系 + 邻接域反推 + 热点翻译（跳数门控） ============
@@ -541,11 +666,17 @@ const HOTSPOT_MAX_COUNT = 3;      // 每轮最多注入 3 条热点候选（配�
 const HOTSPOT_MAX_HOPS = 1;       // 跳数门控：只取 0-1 跳热点（≥2 跳离借钱需求太远，实测全被 AI 判不相关）
 
 // 探索登记表（已扫格子/已用邻接话题，注入即销，保证"每次探索完全新的话题"）
-const EXPLORE_LEDGER_FILE = path.join(__dirname, '..', '.explore_ledger.json');
+// 2026-09-20 品牌隔离：台账按品牌存放在 .state/<brand>/，与关键词统计等状态文件同级；
+// 旧版根目录 .explore_ledger.json 在品牌文件缺失时自动继承（度小满历史进度不丢）
+const EXPLORE_LEDGER_FILE = path.join(__dirname, '..', '.state', BRAND, '.explore_ledger.json');
+const LEGACY_EXPLORE_LEDGER_FILE = path.join(__dirname, '..', '.explore_ledger.json');
 
 // 坐标系种子：人群轴 × 时刻轴（三大类），格子扫过即销
 // 时刻轴刻意不含看病/上学/彩礼等禁止方向（红线）与公检法方向
-const POPULATION_AXIS = [
+// 2026-09-20 配置化：优先读品牌配置 explore 段（populationAxis/momentAxis/adjacentDomains），缺失时退回度小满默认轴
+const POPULATION_AXIS = (BRAND_CONFIG.explore.populationAxis && BRAND_CONFIG.explore.populationAxis.length > 0)
+  ? BRAND_CONFIG.explore.populationAxis
+  : [
   '小餐馆老板', '奶茶店店主', '便利店老板', '批发档口老板', '民宿主', '网约车司机',
   '货车司机', '代驾司机', '外卖骑手站长', '快递驿站老板', '水果摊主', '夜市摊主',
   '烘焙私房店主', '美容美发店老板', '健身房教练', '装修队包工头', '工程垫资老板',
@@ -553,13 +684,17 @@ const POPULATION_AXIS = [
   '婚庆从业者', '培训机构老师', '工厂小老板', '农产品种植户', '养殖户', '出租车司机',
   '房产中介', '保险代理人', '小微电商卖家'
 ];
-const MOMENT_AXIS = [
+const MOMENT_AXIS = (BRAND_CONFIG.explore.momentAxis && BRAND_CONFIG.explore.momentAxis.length > 0)
+  ? BRAND_CONFIG.explore.momentAxis
+  : [
   { group: '收入断裂', moments: ['工资被拖欠', '生意亏了', '客户跑单', '货款收不回', '降薪裁员'] },
   { group: '支出突增', moments: ['房租到期涨租', '押一付三', '设备坏了要修', '进货要压钱', '旺季前备货'] },
   { group: '现金流错配', moments: ['账期错配下游欠款上游要现款', '旺季前垫资', '淡季硬撑', '月底工资日缺口'] }
 ];
 // 邻接域清单：「缺钱但没借钱的人怎么办」的反推域（不缺钱的人不会卖金镯子——话题自带缺钱语境）
-const ADJACENT_DOMAINS = [
+const ADJACENT_DOMAINS = (BRAND_CONFIG.explore.adjacentDomains && BRAND_CONFIG.explore.adjacentDomains.length > 0)
+  ? BRAND_CONFIG.explore.adjacentDomains
+  : [
   '卖黄金首饰回血', '典当行典当', '二手平台卖闲置', '信用卡分期还款', '花呗白条额度',
   '找亲戚朋友开口借钱', '银行理财赎回', '基金割肉离场', '省钱攻略极简生活', '直播薅羊毛',
   '花呗白条被关', '信用卡降额'
@@ -570,6 +705,13 @@ function loadExploreLedger() {
     if (fs.existsSync(EXPLORE_LEDGER_FILE)) {
       return JSON.parse(fs.readFileSync(EXPLORE_LEDGER_FILE, 'utf-8'));
     }
+    // 品牌台账不存在 → 继承旧版根目录台账（老品牌无缝接管历史进度；
+    // 新品牌继承到的旧格子/旧邻接词不在本品牌坐标池内，不会被匹配，无害）
+    if (fs.existsSync(LEGACY_EXPLORE_LEDGER_FILE)) {
+      const inherited = JSON.parse(fs.readFileSync(LEGACY_EXPLORE_LEDGER_FILE, 'utf-8'));
+      log(`   📦 从根目录旧台账继承探索进度（${(inherited.scanned_cells || []).length} 格 / ${(inherited.adjacent_used || []).length} 话题），本品牌后续写入 .state/${BRAND}/`);
+      return inherited;
+    }
   } catch (error) {
     log(`   ⚠️ 探索登记表读取失败，按空表处理: ${error.message.substring(0, 80)}`);
   }
@@ -578,6 +720,7 @@ function loadExploreLedger() {
 
 function saveExploreLedger(ledger) {
   ledger.updated_at = new Date().toISOString();
+  fs.mkdirSync(path.dirname(EXPLORE_LEDGER_FILE), { recursive: true });
   fs.writeFileSync(EXPLORE_LEDGER_FILE, JSON.stringify(ledger, null, 2));
 }
 
@@ -873,22 +1016,46 @@ const VIDEO_SCRIPT_PROMPT = `你是专业的视频脚本转录助手。请将视
 // 饱和方向（素材数 ≥ SATURATED_DIR_MATERIALS）注入"切入角度实质不同时优先新建二级方向"指令。
 // 策略表读取失败时用内置兜底枚举（即原硬编码清单）。
 const SATURATED_DIR_MATERIALS = 5;
+// 两级定义的注入上限（防极端长文本撑爆 prompt；当前最长一级 129 字、二级 403 字，均在限内）
+const L1_DEF_LIMIT = 300;
+const L2_DEF_LIMIT = 500;
+const clipDef = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s);
 let _directionSnapshot = null; // 进程级缓存（策略表只在本轮 Step 6 末尾写入，运行期间不变）
 
 function getDirectionSnapshot() {
   if (_directionSnapshot) return _directionSnapshot;
   try {
-    const existing = fetchStrategyRecords();
-    const groups = new Map(); // dir1 -> Map(dir2 -> 素材数)
-    for (const [key, val] of existing) {
-      const [dir1, dir2] = key.split('|');
-      const count = (val.素材链接ids || '').split('、').filter(Boolean).length;
+    // 2026-09-21：改为直接读 fetchStrategyRows，把两级「判定依据」一并带出。
+    // 一级定义（definition）用来判断素材该归哪个一级、以及要不要新建一级；
+    // 二级定义（l2Definition）用来在同一级里选或新建二级。
+    // 旧实现只有方向名 + 素材数，导致 AI 只能靠方向名猜归属
+    // （实测「花呗额度降了」被挂到「揭秘自己-生意赚多少钱」，仅因两者都含"平台/生意"字面）。
+    const rows = fetchStrategyRows();
+    const groups = new Map(); // dir1 -> { defs: Set, definition, subs: Map(dir2 -> { count, definition }) }
+    let total = 0;
+    for (const r of rows) {
+      const dir1 = r.l1, dir2 = r.l2;
       if (!dir1 || !dir2) continue;
-      if (!groups.has(dir1)) groups.set(dir1, new Map());
-      groups.get(dir1).set(dir2, count);
+      const count = (r.素材链接ids || '').split('、').filter(Boolean).length;
+      const l1Def = (r.definition || '').replace(/\s+/g, ' ').trim();
+      const l2Def = (r.l2Definition || '').replace(/\s+/g, ' ').trim();
+      if (!groups.has(dir1)) groups.set(dir1, { defs: new Set(), definition: '', subs: new Map() });
+      const g = groups.get(dir1);
+      if (l1Def) g.defs.add(l1Def);
+      g.subs.set(dir2, { count, definition: l2Def });
+      total++;
     }
-    _directionSnapshot = { groups, total: existing.size };
-    log(`   📋 方向枚举动态拉取：策略表 ${existing.size} 个方向组合已注入分析 prompt`);
+    const inconsistent = [];
+    for (const [dir1, g] of groups) {
+      if (g.defs.size > 1) inconsistent.push(dir1);
+      g.definition = [...g.defs][0] || '';
+      delete g.defs;
+    }
+    _directionSnapshot = { groups, total };
+    log(`   📋 方向枚举动态拉取：策略表 ${total} 个方向组合（含一级／二级判定依据）已注入分析 prompt`);
+    if (inconsistent.length > 0) {
+      log(`   ⚠️ 一级定义在同一级下不一致（「内容一方向定义」应逐字相同，请核对）：${inconsistent.join('、')}`);
+    }
   } catch (error) {
     log(`   ⚠️ 策略表方向拉取失败，方向枚举使用内置兜底: ${error.message.substring(0, 120)}`);
     _directionSnapshot = null;
@@ -896,23 +1063,60 @@ function getDirectionSnapshot() {
   return _directionSnapshot;
 }
 
-// 内置兜底枚举（策略表读取失败时用，与策略表初始方向保持一致；来自 config/<brand>/config.json）
-const FALLBACK_DIRECTION_ENUMS = BRAND_CONFIG.strategy.fallbackDirectionEnums || '';
+// 内置兜底枚举（策略表读取失败时用）：由 FALLBACK_STRATEGIES 现场拼装，与正常路径同一数据源、
+// 同一两级格式，避免两处枚举各自维护而漂移（旧版是一段手写文本，曾混入另一品牌的二级方向）。
+const FALLBACK_DIRECTION_ENUMS = buildFallbackDirectionEnums();
+
+function buildFallbackDirectionEnums() {
+  const list = FALLBACK_STRATEGIES;
+  if (list.length === 0) return BRAND_CONFIG.strategy.fallbackDirectionEnums || '';
+  const groups = new Map(); // dir1 -> { definition, subs: [] }
+  for (const s of list) {
+    if (!s.l1 || !s.l2) continue;
+    if (!groups.has(s.l1)) groups.set(s.l1, { definition: s.definition || '', subs: [] });
+    const g = groups.get(s.l1);
+    if (!g.definition && s.definition) g.definition = s.definition;
+    g.subs.push(s);
+  }
+  const lines = [];
+  for (const [dir1, g] of groups) {
+    const l1Def = g.definition ? `一级判定依据：${clipDef(g.definition, L1_DEF_LIMIT)}` : '一级判定依据未填';
+    lines.push(`- 一级方向「${dir1}」（${l1Def}）`);
+    for (const s of g.subs) {
+      const def = s.l2Definition ? `二级判定依据：${clipDef(s.l2Definition, L2_DEF_LIMIT)}` : '二级判定依据未填';
+      lines.push(`  - ${dir1}-${s.l2}（素材数未知）　${def}`);
+    }
+  }
+  return `## 内容方向一/二（策略表读取失败，以下为内置快照，共 ${list.length} 个组合）
+
+**归属分两步判，判据只有「判定依据」原文，方向名只是简称。** ① 先用一级判定依据确定素材属于哪个一级；② 在选定的这个一级里，用各二级的二级判定依据选最贴合的一个（都不贴合就新建二级）。
+
+${lines.join('\n')}`;
+}
 
 function buildDirectionEnumSection() {
   const snap = getDirectionSnapshot();
   if (!snap) return FALLBACK_DIRECTION_ENUMS;
   const lines = [];
   const saturated = [];
-  for (const [dir1, subs] of snap.groups) {
-    lines.push(`- ${dir1}：${[...subs.entries()].map(([d2, n]) => `${d2}（${n}条素材）`).join('、')}`);
-    for (const [d2, n] of subs) {
-      if (n >= SATURATED_DIR_MATERIALS) saturated.push(`${dir1}-${d2}`);
+  for (const [dir1, g] of snap.groups) {
+    const l1Def = g.definition
+      ? `一级判定依据：${clipDef(g.definition, L1_DEF_LIMIT)}`
+      : '一级判定依据未填（请按方向名理解，并在产出时提醒补写）';
+    lines.push(`- 一级方向「${dir1}」（${l1Def}）`);
+    for (const [d2, info] of g.subs) {
+      const def = info.definition
+        ? `二级判定依据：${clipDef(info.definition, L2_DEF_LIMIT)}`
+        : '二级判定依据未填';
+      lines.push(`  - ${dir1}-${d2}（已沉淀 ${info.count} 条素材）　${def}`);
+      if (info.count >= SATURATED_DIR_MATERIALS) saturated.push(`${dir1}-${d2}`);
     }
   }
   let text = `## 内容方向一/二（下方为策略表现有方向组合，括号内为已沉淀素材数，共 ${snap.total} 个组合）
-${lines.join('\n')}
-方向选取原则：优先复用现有方向；新建判断标准见下方判断规则。`;
+
+**归属分两步判，判据只有「判定依据」原文，方向名只是简称。** ① 先用每个一级方向的「一级判定依据」确定素材属于哪个一级（都不符合才考虑新建一级）；② 在选定的这个一级里，用各二级的「二级判定依据」选最贴合的一个（都不贴合就新建二级、挂在这个一级下）。素材里出现某个词面（如"生意""揭秘""借钱"）不等于属于同名方向。
+
+${lines.join('\n')}`;
   if (saturated.length > 0) {
     text += `
 
@@ -940,6 +1144,8 @@ function log(msg) {
 
 // Step 1: 生成搜索关键词（返回 [{keyword, direction, source}]）
 async function generateKeywords(existingIds) {
+  const directionRenames = new Set(); // 方向名归一化记录（改写了哪些自由文本方向名）
+  const unroutedDirs = new Set(); // 归一化后仍不在策略表里的策略类方向（AI 编造的方向组合）
   // 反内循环配额（2026-09-15）：常规 直搜1+衍生1+探索2；连续零新策略 → 加强 直搜1+探索3（衍生暂停）
   const growth = loadStrategyGrowth();
   const boost = (growth.droughtStreak || 0) >= STRATEGY_DROUGHT_BOOST_THRESHOLD;
@@ -950,10 +1156,20 @@ async function generateKeywords(existingIds) {
   log(`🔹 Step 1: 生成搜索关键词（${boost ? `加强探索模式：直搜${directQuota} + 探索${exploreQuota}，策略衍生暂停` : `直搜${directQuota} + 衍生${deriveQuota} + 探索${exploreQuota}`}）${boost ? `——已连续 ${growth.droughtStreak} 轮零新策略，自动提升探索配额` : ''}`);
 
   // 来源1/2：策略清单（实时读策略表，失败退静态快照）
+  // 2026-09-21：清单按覆盖度排序，并给每个方向标注「已有素材数／已搜次数」，
+  // 让「从未搜过」与「素材为空」的方向排在最前（直搜配额只有 1 个词，靠排序保证覆盖率）
   const strategies = fetchStrategyList();
-  const strategyListText = strategies
-    .map(s => `- ${s.l1}-${s.l2}（${s.level}级）：${s.definition}`)
+  const orderedStrategies = sortStrategiesByCoverage(strategies);
+  const strategyListText = orderedStrategies
+    .map(s => {
+      const mat = s.materialCount === null ? '素材数未知' : `已有素材 ${s.materialCount} 条`;
+      return `- ${s.l1}-${s.l2}（${s.level}级｜${mat}｜该方向已搜过 ${s.queried} 次）\n    一级：${s.definition || '（表里未填）'}\n    二级：${s.l2Definition || '（表里未填）'}`;
+    })
     .join('\n');
+  const neverSearched = orderedStrategies.filter(s => s.queried === 0);
+  if (neverSearched.length > 0) {
+    log(`   从未搜索过的方向 ${neverSearched.length} 个（策略直搜优先选这些）：${neverSearched.slice(0, 8).map(s => `${s.l1}-${s.l2}`).join('、')}${neverSearched.length > 8 ? ' 等' : ''}`);
+  }
 
   // 来源3：构建开放探索素材（热点翻译 + 处境坐标系 + 邻接域反推，多配额块）
   const explore = await buildExploreMaterial(exploreQuota);
@@ -1004,7 +1220,7 @@ async function generateKeywords(existingIds) {
         max_tokens: 2048,
         temperature: 0.7
       }),
-      signal: AbortSignal.timeout(60000)
+      signal: AbortSignal.timeout(300000) // 2026-09-20: 60s 对 deepseek 大 prompt（策略清单+探索素材）不够，与脚本提取对齐到 300s
     });
 
     if (!response.ok) {
@@ -1058,7 +1274,18 @@ async function generateKeywords(existingIds) {
     }
     log(`   查重第${attempt}轮：${rawDirs.length} 个候选，${accepted.length} 个通过${problems.length ? '；拒绝 → ' + problems.join('；') : ''}`);
 
-    keywordDirs = accepted;
+    // 方向名归一化（2026-09-21）：策略直搜/衍生类的 direction 统一成策略表「一级-二级」写法，
+    // 写入统计前就对齐，避免自由文本（如「策略衍生-网贷测评反向打脸」）造成覆盖度漏判
+    keywordDirs = accepted.map(k => {
+      const norm = canonicalDirection(k.direction, k.source, strategies);
+      if (k.direction && norm !== k.direction) directionRenames.add(`${k.direction} → ${norm}`);
+      // 未能归一化（norm 仍等于原文）且原文对不上策略表任一组合 → AI 编了不存在的方向，告警（不阻断）
+      if (/^strategy_/.test(k.source) && norm && norm === k.direction &&
+          !strategies.some(s => `${s.l1}-${s.l2}` === norm)) {
+        unroutedDirs.add(norm);
+      }
+      return { ...k, direction: norm };
+    });
     if (accepted.length === rawDirs.length && rawDirs.length > 0) break;
     lastRejections = problems;
   }
@@ -1072,6 +1299,12 @@ async function generateKeywords(existingIds) {
 
   log(`   最终采用 ${keywordDirs.length} 个关键词:`);
   keywordDirs.forEach(k => log(`     - [${k.source}] ${k.keyword}（${k.direction}）`));
+  if (directionRenames.size > 0) {
+    log(`   🔧 方向名已归一化为策略表写法：${[...directionRenames].join('；')}`);
+  }
+  if (unroutedDirs.size > 0) {
+    log(`   ⚠️ 以下方向对不上策略表任一组合（模型自创，覆盖度统计会对不上）：${[...unroutedDirs].join('、')}`);
+  }
 
   // 保存到近期关键词列表
   saveRecentKeywords(keywordDirs.map(k => k.keyword));
@@ -1729,176 +1962,8 @@ function fetchStrategyRecords({ fresh = false } = {}) {
   return map;
 }
 
-// 合并「适合达人」：把新素材里行上未覆盖的达人类型并入「达人类型：」行（幂等）
-// 粒度规则（2026-09-09 用户约定）：整个一级类型都适用只写一级（如「财经」=财经下所有二级都适合）；仅限某二级才写「一级-二级」
-// 覆盖判定：宽(一级)覆盖窄(一级-二级)；窄不覆盖宽——若行上是窄(财经-泛财经)、新素材判定为宽(财经)，需把窄收敛为宽
-// 2026-09-09 新增：此前更新已有策略行只写素材链接ids/植入策略，从不看适合达人（行14剧情类素材漏覆盖）
-function mergeSuitedInfluencers(existing, items) {
-  const existingText = (existing || '').trim();
-  const lines = existingText ? existingText.split('\n') : [];
-  const ti = lines.findIndex(l => /^达人类型[:：]/.test(l.trim()));
-  let tokens = [];
-  if (ti >= 0) {
-    tokens = lines[ti].replace(/^达人类型[:：]\s*/, '').split(/、|，|,/).map(s => s.trim()).filter(Boolean);
-  }
-  const isNarrow = t => t.includes('-');
-  const primaryOf = t => t.split('-')[0];
-  const adds = [];        // 需新增的宽/窄类型（追加行尾）
-  const replaceMap = {};  // 窄类型 -> 收敛为的宽类型（原位替换第一个，其余删除）
-  for (const r of items) {
-    const suited = r.analysis?.内容策略?.['适合达人'] || '';
-    const m = suited.match(/达人类型[:：]\s*([^\n]+)/);
-    if (!m) continue;
-    for (const seg of m[1].split(/、|，|,/)) {
-      const t = seg.trim();
-      if (!t) continue;
-      if (isNarrow(t)) {
-        // 窄类型：行上已有同款或其一级（宽覆盖窄）即视为覆盖
-        if (tokens.includes(t) || tokens.includes(primaryOf(t))) continue;
-        if (!adds.includes(t)) adds.push(t);
-      } else {
-        // 宽类型：行上已有同款即覆盖；行上有同级的窄类型 → 把窄收敛为宽；否则新增宽
-        if (tokens.includes(t)) continue;
-        const narrower = tokens.filter(tok => tok.startsWith(t + '-'));
-        if (narrower.length > 0) {
-          narrower.forEach(tok => { replaceMap[tok] = t; });
-        } else if (!adds.includes(t)) {
-          adds.push(t);
-        }
-      }
-    }
-  }
-  if (adds.length === 0 && Object.keys(replaceMap).length === 0) return existingText;
-  if (lines.length === 0) {
-    // 原字段为空：直接用第一条新素材的完整画像
-    const first = items.find(r => r.analysis?.内容策略?.['适合达人']);
-    return first ? first.analysis.内容策略['适合达人'] : existingText;
-  }
-  const keepTokens = [];
-  let replaced = false;
-  for (const tok of tokens) {
-    if (replaceMap[tok]) {
-      if (!replaced) { keepTokens.push(replaceMap[tok]); replaced = true; }
-      continue;
-    }
-    keepTokens.push(tok);
-  }
-  const finalTokens = [...keepTokens, ...adds];
-  const typeLine = '达人类型：' + finalTokens.join('、');
-  const otherLines = lines.filter(l => !/^达人类型[:：]/.test(l.trim()));
-  return [typeLine, ...otherLines].join('\n');
-}
-
-// 确保策略表 select 字段包含给定选项（新方向落表的前提：飞书不会自动创建不存在的选项）
-// fieldName: 字段名；values: 需要的选项值数组。返回实际新增的选项列表。
-function ensureSelectOptions(fieldName, values) {
-  // 归一化后再比对：避免带换行/空白的脏值绕过 existingNames 精确匹配，重复落一个脏选项
-  const needed = [...new Set(values.map(v => normalizeDirectionValue(v)).filter(Boolean))];
-  if (needed.length === 0) return [];
-
-  // 1) 读全量字段定义（field-update 是全量 PUT，必须先读后改）
-  const resp = JSON.parse(runLarkCli([
-    'base', '+field-get',
-    '--base-token', STRATEGY_BASE_TOKEN,
-    '--table-id', STRATEGY_TABLE_ID,
-    '--field-id', fieldName,
-    '--as', 'user', '--format', 'json'
-  ]));
-  const field = resp?.data?.field;
-  if (!field || field.type !== 'select') throw new Error(`字段 ${fieldName} 不存在或不是单选类型`);
-
-  const existingNames = new Set((field.options || []).map(o => o.name));
-  const toAdd = needed.filter(v => !existingNames.has(v));
-  if (toAdd.length === 0) return [];
-
-  // 2) 追加新选项（保留已有选项原样），全量 PUT 回去
-  const updated = {
-    name: field.name,
-    type: field.type,
-    multiple: field.multiple === true,
-    options: [...(field.options || []), ...toAdd.map(name => ({ name }))]
-  };
-  const updateResp = JSON.parse(runLarkCli([
-    'base', '+field-update',
-    '--base-token', STRATEGY_BASE_TOKEN,
-    '--table-id', STRATEGY_TABLE_ID,
-    '--field-id', field.id,
-    '--json', JSON.stringify(updated),
-    '--yes',
-    '--as', 'user', '--format', 'json'
-  ]));
-  if (!updateResp?.ok) throw new Error(`更新字段 ${fieldName} 失败: ${JSON.stringify(updateResp).substring(0, 200)}`);
-  log(`   🆕 策略表字段「${fieldName}」新增选项: ${toAdd.join('、')}`);
-  return toAdd;
-}
-
-// 新方向创建前，批量确保内容方向一/二的选项存在；失败时抛错由调用方决定降级
-function ensureStrategyDirections(createRecords) {
-  const dir1s = createRecords.map(r => Array.isArray(r['内容方向一']) ? r['内容方向一'][0] : r['内容方向一']);
-  const dir2s = createRecords.map(r => Array.isArray(r['内容方向二']) ? r['内容方向二'][0] : r['内容方向二']);
-  ensureSelectOptions('内容方向一', dir1s);
-  ensureSelectOptions('内容方向二', dir2s);
-}
-
-// 策略查重：判断新素材的植入策略与已有策略是否为同一套打法逻辑
-// 返回 per-item verdict 数组 ['duplicate'|'new']；LLM 失败时全部视为 new（回退旧行为，宁可多存不丢失）
-async function dedupeStrategies(existingStrategyText, items) {
-  try {
-    const verdicts = new Array(items.length).fill('new');
-    const listText = items.map((r, i) =>
-      `【素材${i + 1} dy_${r.aweme_id}】${r.analysis.内容策略['植入策略']}`
-    ).join('\n\n');
-
-    const prompt = `你在维护一张内容策略表。某个内容方向下已有一条策略（含打法概括、示例、推理链），现在新收集了一批素材，每条素材也总结了自己的植入策略。
-
-# 已有策略
-${existingStrategyText.substring(0, 1500)}
-
-# 新素材的植入策略
-${listText}
-
-# 任务
-逐条判断每个新素材的植入策略与已有策略是否为**同一个策略**。判定口径按《内容策略表字段填写指南》3.4：植入策略 = 一句话打法概括 + 具体示例（示例的价值在于展现「内容→痛点→产品」的完整推理链）。因此：
-- duplicate：打法概括相同，且示例的推理链也相同（例如都是"硬核计算揭露高息→制造恐惧→低息正规平台补位"）——只是措辞、接入锚点位置、具体数字不同。这类变体已由已有策略覆盖，重复罗列没有价值
-- new：打法概括不同，或示例展现了实质不同的推理链（不同的情绪入口、不同的论证路径、不同的植入时机，如"先共情再劝告"vs"先恐惧再解救"）——这类值得作为新示例编号补充进已有策略
-
-只输出JSON：{"verdicts": ["duplicate" 或 "new", ...]}，数组长度必须等于素材数量（${items.length}）。`;
-
-    const response = await fetch(`${AIHUBMIX_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${AIHUBMIX_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: DEEPSEEK_MODEL,
-        messages: [
-          { role: 'system', content: '你是一个内容策略分析专家，只输出JSON，不输出任何其他内容。' },
-          { role: 'user', content: prompt }
-        ],
-        max_tokens: 512,
-        temperature: 0.1
-      }),
-      signal: AbortSignal.timeout(60000)
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = await response.json();
-    const parsed = JSON.parse(data.choices[0].message.content.match(/\{[\s\S]*\}/)[0]);
-    if (Array.isArray(parsed.verdicts)) {
-      parsed.verdicts.slice(0, items.length).forEach((v, i) => {
-        verdicts[i] = v === 'duplicate' ? 'duplicate' : 'new';
-      });
-    }
-    return verdicts;
-  } catch (error) {
-    // 查重失败返回 null（区别于查重结果）：调用方只并入素材链接ids、不追加策略文字，
-    // 避免回退"全保留"在 API 故障时重新堆叠重复补充段（堆进去后是粘性的，不会自动清理）
-    log(`   ⚠️ 策略查重失败（本轮仅并入素材链接ids，策略文本不更新，下轮重试）: ${error.message.substring(0, 150)}`);
-    return null;
-  }
-}
-
-// 将本轮成功素材的「内容策略」同步到策略表（同方向聚合，去重更新）
+// 将本轮成功素材的「内容策略」经 strategy-analysis sync 子命令沉淀到策略表
+// （聚合/AI查重/select选项扩充/合并规则全部在该 skill 内实现；本函数只做输入适配与结果统计）
 async function syncStrategyTable(results) {
   // 脚本来源的策略
   const withStrategy = (results || []).filter(r => r.analysis?.内容策略?.['内容方向一'] && r.analysis?.内容策略?.['内容方向二']);
@@ -1920,143 +1985,50 @@ async function syncStrategyTable(results) {
     log(`   其中脚本来源策略 ${withStrategy.length} 条，评论洞察来源策略 ${withCommentInsight.length} 条`);
   }
 
-  let existing;
+  const input = {
+    items: allStrategyItems.map(r => ({
+      // 评论洞察来源的素材id加来源标记，便于策略表区分
+      // 2026-09-22: 素材 id 前缀语义=素材来源平台（dy_=抖音，xhs_=小红书），品牌归属由表承载；统一读品牌配置 materialIdPrefix
+      id: r._source === 'comment_insight' ? `${BRAND_CONFIG.bitable.materialIdPrefix}${r.aweme_id}（评论洞察）` : `${BRAND_CONFIG.bitable.materialIdPrefix}${r.aweme_id}`,
+      script: r.script || '',
+      source: r._source || 'material',
+      strategy: {
+        '内容方向一': r.analysis.内容策略['内容方向一'],
+        '内容方向二': r.analysis.内容策略['内容方向二'],
+        '方向定义': r.analysis.内容策略['方向定义'] || '',
+        // 只在新建一级方向时才有值；已有的一级由 strategy-analysis 自动继承该级现有定义
+        '一级方向定义': r.analysis.内容策略['一级方向定义'] || '',
+        '植入策略': r.analysis.内容策略['植入策略'] || '',
+        '适合达人': r.analysis.内容策略['适合达人'] || ''
+      }
+    }))
+  };
+  const tmpFile = path.join(os.tmpdir(), `strategy_sync_${Date.now()}_${process.pid}.json`);
+  fs.writeFileSync(tmpFile, JSON.stringify(input));
   try {
-    // 写表路径：强制实时读，避免用 Step 1 的旧快照做「素材链接ids/植入策略」合并写入
-    existing = fetchStrategyRecords({ fresh: true });
-  } catch (error) {
-    log(`   ❌ 读取策略表失败，跳过同步: ${error.message.substring(0, 200)}`);
-    return { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: allStrategyItems.length, skipped: allStrategyItems.length };
-  }
-  log(`   策略表现有 ${existing.size} 个方向组合`);
-
-  // 按方向组合聚合本轮素材（脚本来源 + 评论洞察来源合并聚合）
-  const grouped = new Map();
-  for (const r of allStrategyItems) {
-    const s = r.analysis.内容策略;
-    const key = `${s['内容方向一']}|${s['内容方向二']}`;
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key).push(r);
-  }
-
-  const createRecords = [];
-  const updateRecords = {};
-  let created = 0, updated = 0;
-  // 反内循环统计（2026-09-15）：appended = 追加的新打法条数；mergedOnly = 仅并入素材链接ids的条数
-  let appended = 0, mergedOnly = 0;
-
-  for (const [key, items] of grouped) {
-    const [dir1, dir2] = key.split('|');
-    // 评论洞察来源的素材id加来源标记，便于策略表区分
-    const newIds = items.map(r => r._source === 'comment_insight'
-      ? `dy_${r.aweme_id}（评论洞察）`
-      : `dy_${r.aweme_id}`);
-    const exist = existing.get(key);
-
-    if (exist && exist.recordId) {
-      // 已有方向：先查重——策略逻辑与已有重复的只并入素材链接ids，有实质差异的才追加【素材补充】
-      const verdicts = await dedupeStrategies(exist.植入策略, items);
-      const dedupeOk = verdicts !== null;
-      const dupCount = dedupeOk ? verdicts.filter(v => v === 'duplicate').length : items.length;
-      const newItems = dedupeOk ? items.filter((_, i) => verdicts[i] === 'new') : [];
-      appended += newItems.length;
-      mergedOnly += dedupeOk ? dupCount : items.length;
-
-      const mergedIds = [...new Set([...(exist.素材链接ids ? exist.素材链接ids.split('、') : []), ...newIds])].join('、');
-      const updateFields = { '素材链接ids': mergedIds };
-      if (newItems.length > 0) {
-        const supplements = newItems.map(r => {
-          const s = r.analysis.内容策略;
-          return `【素材补充 dy_${r.aweme_id}】${s['植入策略']}`;
-        }).join('\n\n');
-        updateFields['植入策略'] = `${exist.植入策略}\n\n${supplements}`;
-      }
-      // 合并适合达人：新素材的类型行上有未覆盖达人类型时补充（幂等，无变化则不写）
-      const mergedSuited = mergeSuitedInfluencers(exist.适合达人, items);
-      if (mergedSuited && mergedSuited !== (exist.适合达人 || '')) {
-        updateFields['适合达人'] = mergedSuited;
-      }
-      updateRecords[exist.recordId] = updateFields;
-      updated += 1;
-      log(dedupeOk
-        ? `   🔄 已有方向「${dir1}-${dir2}」：${items.length} 条中 ${dupCount} 条策略重复（仅并入素材链接ids）、${newItems.length} 条有新打法（追加素材补充），素材链接ids → ${mergedIds}`
-        : `   🔄 已有方向「${dir1}-${dir2}」：查重失败，${items.length} 条全部仅并入素材链接ids（策略文本未动），素材链接ids → ${mergedIds}`);
-    } else {
-      // 新方向：新建策略行，等级 X（创意洞察，未经业务验证）
-      // 多条素材时同样查重：以第 1 条为基准，重复的只并入 ids，有差异的追加
-      const first = items[0];
-      const s = first.analysis.内容策略;
-      let 植入策略 = s['植入策略'];
-      if (items.length > 1) {
-        const verdicts = await dedupeStrategies(植入策略, items.slice(1));
-        const dedupeOk = verdicts !== null;
-        const newItems = dedupeOk ? items.slice(1).filter((_, i) => verdicts[i] === 'new') : [];
-        appended += newItems.length;
-        mergedOnly += dedupeOk ? (items.length - 1 - newItems.length) : (items.length - 1);
-        if (newItems.length > 0) {
-          植入策略 += '\n\n' + newItems.map(r => `【素材补充 dy_${r.aweme_id}】${r.analysis.内容策略['植入策略']}`).join('\n\n');
-        }
-        const dupCount = dedupeOk ? items.length - 1 - newItems.length : items.length - 1;
-        log(dedupeOk
-          ? `   ↳ 新方向查重：${dupCount} 条重复（仅并入素材链接ids）、${newItems.length} 条追加补充`
-          : `   ↳ 新方向查重失败：${items.length - 1} 条全部仅并入素材链接ids（策略文本未动）`);
-      }
-      const ids = newIds.join('、');
-      createRecords.push({
-        // 落表前再归一化一次：写入值必须与飞书已有选项精确匹配，否则会分裂出新选项
-        '内容方向一': [normalizeDirectionValue(dir1)],
-        '内容方向二': [normalizeDirectionValue(dir2)],
-        '内容一方向定义': s['方向定义'] || '',
-        '植入策略': 植入策略,
-        '策略等级': ['X'],
-        '适合达人': s['适合达人'] || '',
-        '素材链接ids': ids,
-        '正向案例': first.script || ''
-      });
-      created += 1;
-      log(`   ➕ 新方向「${dir1}-${dir2}」：新建策略行（等级 X），素材链接ids → ${ids}`);
+    let out;
+    try {
+      out = JSON.parse(callStrategySyncCli(['sync', '--input', tmpFile]));
+    } catch (error) {
+      log(`   ❌ 策略表写入失败: ${error.message.substring(0, 300)}`);
+      return { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: allStrategyItems.length, skipped: allStrategyItems.length };
     }
+    if (!out.ok) {
+      log(`   ❌ 策略表同步失败（${out.error || 'unknown'}）: ${(out.detail || '').substring(0, 200)}`);
+      return { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: out.items || allStrategyItems.length, skipped: out.items || allStrategyItems.length };
+    }
+    if (out.dryRun) {
+      log('   ⚠️ sync 以 dry-run 模式执行（不落表）——请检查 STRATEGY_SYNC_CLI 环境变量或 skill 安装');
+    }
+    log(`   ✅ 内容策略同步完成：新建 ${out.created} 行，更新 ${out.updated} 行`);
+    return {
+      created: out.created, updated: out.updated,
+      appended: out.appended, mergedOnly: out.mergedOnly,
+      items: out.items, skipped: out.skipped || 0
+    };
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch { /* 清理失败不影响主流程 */ }
   }
-
-  let skipped = withStrategy.length;
-  try {
-    if (createRecords.length > 0) {
-      // 飞书 select 不会自动创建不存在的选项，新方向落表前先扩选项
-      try {
-        ensureStrategyDirections(createRecords);
-      } catch (error) {
-        log(`   ❌ 策略表选项扩充失败，跳过 ${createRecords.length} 条新方向写入: ${error.message.substring(0, 200)}`);
-        skipped += createRecords.length;
-        createRecords.length = 0;
-      }
-    }
-    if (createRecords.length > 0) {
-      const resp = JSON.parse(runLarkCli([
-        'base', '+record-batch-create',
-        '--base-token', STRATEGY_BASE_TOKEN,
-        '--table-id', STRATEGY_TABLE_ID,
-        '--json', JSON.stringify({ create_records: createRecords }),
-        '--as', 'user', '--format', 'json'
-      ]));
-      if (!resp?.ok) throw new Error(JSON.stringify(resp).substring(0, 300));
-    }
-    if (Object.keys(updateRecords).length > 0) {
-      const resp = JSON.parse(runLarkCli([
-        'base', '+record-batch-update',
-        '--base-token', STRATEGY_BASE_TOKEN,
-        '--table-id', STRATEGY_TABLE_ID,
-        '--json', JSON.stringify({ update_records: updateRecords }),
-        '--as', 'user', '--format', 'json'
-      ]));
-      if (!resp?.ok) throw new Error(JSON.stringify(resp).substring(0, 300));
-    }
-    skipped = 0;
-    log(`   ✅ 内容策略同步完成：新建 ${created} 行，更新 ${updated} 行`);
-  } catch (error) {
-    log(`   ❌ 策略表写入失败: ${error.message.substring(0, 300)}`);
-    return { created: 0, updated: 0, appended: 0, mergedOnly: 0, items: allStrategyItems.length, skipped };
-  }
-  return { created, updated, appended, mergedOnly, items: allStrategyItems.length, skipped: 0 };
 }
 
 // 发送飞书通知（每次运行结束都发，含成功/失败/放弃统计）
@@ -2210,7 +2182,7 @@ async function main() {
     keywordDirs = cp.keywordDirs || keywords.map(k => ({ keyword: k, direction: '' }));
     candidates = cp.candidates.filter(c => !cp.processed.includes(c.aweme_id));
     // 也跳过已写入飞书的（双重保险）
-    candidates = candidates.filter(c => !existingIds.includes(`dy_${c.aweme_id}`));
+    candidates = candidates.filter(c => !existingIds.includes(`${BRAND_CONFIG.bitable.materialIdPrefix}${c.aweme_id}`));
     log(`🔹 Resume 模式：从 checkpoint 恢复`);
     log(`   关键词：${keywords.join('、')}`);
     log(`   原始候选：${cp.candidates.length} 条，已处理：${cp.processed.length} 条，剩余：${candidates.length} 条\n`);
@@ -2249,7 +2221,7 @@ async function main() {
     for (const { aweme, keyword } of allAweme) {
       const awemeId = aweme.aweme_id;
       const duration = aweme.video?.duration;
-      const materialId = `dy_${awemeId}`;
+      const materialId = `${BRAND_CONFIG.bitable.materialIdPrefix}${awemeId}`;
 
       // 去重
       if (existingIds.includes(materialId)) {
